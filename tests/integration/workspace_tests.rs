@@ -8,9 +8,10 @@ use forge_core::{
 };
 use forge_profiler::{summarize_samples, GpuTelemetrySample};
 use forge_runtime::{
-    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, ref_gemm_f32, spirv_contains_opcode,
-    GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
-    SPIRV_OP_SDOT,
+    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, compile_wgsl_to_spirv_subgroup,
+    ref_gemm_f32, spirv_contains_opcode, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL,
+    GEMM_I8_DP4A_WGSL, GEMV_Q4_0_WAVE32_WGSL, GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL,
+    RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL, SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
 };
 
 fn repo_root() -> PathBuf {
@@ -54,6 +55,20 @@ fn wgsl_compute_shaders_compile_offline_to_spirv() {
         spirv_contains_opcode(&dp4a, SPIRV_OP_SDOT),
         "DP4A shader must emit native OpSDot (4450)"
     );
+
+    for src in [
+        GEMV_W8A32_WAVE32_WGSL,
+        GEMV_Q4_0_WAVE32_WGSL,
+        RMSNORM_ROPE_F32_SUBGROUP_WGSL,
+    ] {
+        let words =
+            compile_wgsl_to_spirv_subgroup(src).expect("subgroup shader must compile to SPIR-V");
+        assert_eq!(words[0], 0x0723_0203);
+        assert!(
+            spirv_contains_opcode(&words, SPIRV_OP_GROUP_NON_UNIFORM_FADD),
+            "subgroup shader must emit OpGroupNonUniformFAdd (350)"
+        );
+    }
 }
 
 #[test]

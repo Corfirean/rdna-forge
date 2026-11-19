@@ -8,8 +8,9 @@ use forge_profiler::{
 };
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32,
-    ref_rmsnorm_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
+    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4,
+    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
+    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
 };
 
 #[test]
@@ -298,4 +299,126 @@ fn adlx_live_tuning_read_only_inspects_discrete_amd_gpu() {
     let reset_dry = reset_gpu_tuning_to_factory(discrete.pci_device_id, true)
         .expect("dry-run factory reset check should succeed");
     assert!(!reset_dry.applied);
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_gemv_w8a32_wave32_edge_cases_and_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    assert!(
+        engine.supports_subgroup_arithmetic() && engine.supports_wave32_subgroup_control(),
+        "expected Vulkan 1.3 Wave32 subgroup arithmetic control on RX 6900 XT"
+    );
+
+    for (n, k) in [(1u32, 4u32), (37, 52), (129, 256), (512, 1024)] {
+        let w_i8 = deterministic_i8_data((n * k) as usize, 701 + n as u64);
+        let w_packed = pack_i8_row_major_k4(&w_i8, n as usize, k as usize).unwrap();
+        let scales = deterministic_f32_data(n as usize, 702 + n as u64);
+        let x = deterministic_f32_data(k as usize, 703 + k as u64);
+        let (actual, _timing) = engine
+            .run_gemv_w8a32_wave32(&w_packed, &scales, &x, n, k)
+            .unwrap_or_else(|e| panic!("W8A32 GEMV {n}x{k} failed: {e}"));
+        let expected = ref_gemv_w8a32_f32(&w_i8, &scales, &x, n as usize, k as usize).unwrap();
+        let acc = compare_slices(&actual, &expected, 1e-2, 1e-3).unwrap();
+        assert!(
+            acc.passed,
+            "W8A32 GEMV {n}x{k} accuracy failed: max_abs={:.3e}, rmse={:.3e}",
+            acc.max_abs_err, acc.rmse
+        );
+    }
+
+    assert!(matches!(
+        engine.run_gemv_w8a32_wave32(&[0], &[1.0], &[1.0, 2.0, 3.0], 1, 3),
+        Err(ForgeError::InvalidDimension(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_gemv_q4_0_wave32_edge_cases_and_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    assert!(
+        engine.supports_subgroup_arithmetic() && engine.supports_wave32_subgroup_control(),
+        "expected Vulkan 1.3 Wave32 subgroup arithmetic control on RX 6900 XT"
+    );
+
+    for (n, k) in [(1u32, 32u32), (37, 64), (129, 256), (512, 1024)] {
+        let (w_q4, scales) =
+            deterministic_q4_0_weights(n as usize, k as usize, 801 + n as u64).unwrap();
+        let x = deterministic_f32_data(k as usize, 802 + k as u64);
+        let (actual, _timing) = engine
+            .run_gemv_q4_0_wave32(&w_q4, &scales, &x, n, k)
+            .unwrap_or_else(|e| panic!("Q4_0 GEMV {n}x{k} failed: {e}"));
+        let expected = ref_gemv_q4_0_f32(&w_q4, &scales, &x, n as usize, k as usize).unwrap();
+        let acc = compare_slices(&actual, &expected, 1e-2, 1e-3).unwrap();
+        assert!(
+            acc.passed,
+            "Q4_0 GEMV {n}x{k} accuracy failed: max_abs={:.3e}, rmse={:.3e}",
+            acc.max_abs_err, acc.rmse
+        );
+    }
+
+    assert!(matches!(
+        engine.run_gemv_q4_0_wave32(&[0; 4], &[1.0], &[1.0; 30], 1, 30),
+        Err(ForgeError::InvalidDimension(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_rmsnorm_rope_subgroup_edge_cases_and_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    assert!(
+        engine.supports_subgroup_arithmetic(),
+        "expected Vulkan subgroup arithmetic on RX 6900 XT"
+    );
+
+    let eps = 1e-5_f32;
+    let theta = 10_000.0_f32;
+    for (seq, heads, dim, pos_offset) in [
+        (1u32, 1u32, 2u32, 0u32),
+        (1, 32, 128, 517),
+        (13, 5, 66, 19),
+        (128, 32, 128, 0),
+    ] {
+        let cols = (heads * dim) as usize;
+        let x = deterministic_f32_data((seq as usize) * cols, 901 + seq as u64 + pos_offset as u64);
+        let w = deterministic_f32_data(cols, 902 + dim as u64);
+        let (actual, _timing) = engine
+            .run_rmsnorm_rope_f32_subgroup(&x, &w, seq, heads, dim, pos_offset, eps, theta)
+            .unwrap_or_else(|e| {
+                panic!("Fused RMSNorm+RoPE {seq}x{heads}x{dim} (pos={pos_offset}) failed: {e}")
+            });
+        let expected = ref_rmsnorm_rope_f32(
+            &x,
+            &w,
+            seq as usize,
+            heads as usize,
+            dim as usize,
+            pos_offset as usize,
+            eps,
+            theta,
+        )
+        .unwrap();
+        let acc = compare_slices(&actual, &expected, 2e-4, 2e-4).unwrap();
+        assert!(
+            acc.passed,
+            "Fused RMSNorm+RoPE {seq}x{heads}x{dim} (pos={pos_offset}) failed: max_abs={:.3e}, rmse={:.3e}",
+            acc.max_abs_err, acc.rmse
+        );
+    }
+
+    assert!(matches!(
+        engine.run_rmsnorm_rope_f32_subgroup(
+            &[1.0, 2.0, 3.0],
+            &[1.0, 1.0, 1.0],
+            1,
+            1,
+            3,
+            0,
+            eps,
+            theta
+        ),
+        Err(ForgeError::InvalidDimension(_))
+    ));
 }
