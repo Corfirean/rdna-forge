@@ -9,6 +9,14 @@ license.workspace = true
 name = "forge"
 path = "src/main.rs"
 
+[[test]]
+name = "workspace_integration"
+path = "../../tests/integration/workspace_tests.rs"
+
+[[test]]
+name = "gpu_correctness"
+path = "../../tests/gpu/gpu_correctness.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
