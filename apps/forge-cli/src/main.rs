@@ -18,8 +18,9 @@ use forge_profiler::{
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
     deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4, probe_all_backends,
-    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
-    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
+    probe_amf_capabilities, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32,
+    ref_gemv_w8a32_f32, ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer,
+    AmfAcceleration, VulkanComputeEngine,
 };
 mod monitor_tune;
 
@@ -55,6 +56,11 @@ enum Commands {
     Tune {
         #[command(subcommand)]
         action: TuneSubcommand,
+    },
+    /// Inspect hardware video encode/decode capabilities via AMD AMF.
+    Video {
+        #[command(subcommand)]
+        action: VideoSubcommand,
     },
     /// Inspect and validate hardware target profiles.
     Profile {
@@ -135,12 +141,25 @@ struct VulkanBenchArgs {
     iters: usize,
     #[arg(long, default_value_t = 50)]
     stability_runs: usize,
+    /// Number of consecutive dispatches batched per command buffer submit for decode/elementwise kernels (1..=256, default 16).
+    #[arg(long)]
+    batch_dispatches: Option<usize>,
     #[arg(long, default_value_t = 0)]
     device: usize,
     #[arg(long)]
     json: bool,
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum VideoSubcommand {
+    /// Inspect AMD AMF (amfrt64.dll) hardware video encode/decode codec capabilities.
+    Caps {
+        /// Emit machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -238,6 +257,9 @@ fn main() -> Result<()> {
                 apply,
                 json,
             } => cmd_tune_reset(device_id.as_deref(), apply, json),
+        },
+        Commands::Video { action } => match action {
+            VideoSubcommand::Caps { json } => cmd_video_caps(json),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -758,6 +780,7 @@ fn cmd_bench_vulkan(args: &VulkanBenchArgs) -> Result<()> {
         warmup_iters: args.warmup,
         measured_iters: args.iters,
         stability_runs: args.stability_runs,
+        batch_dispatches: args.batch_dispatches,
     };
 
     let report = run_vulkan_suite(&config).context("Vulkan benchmark suite failed")?;
@@ -1060,6 +1083,60 @@ pub(crate) fn print_telemetry_summary_to(
     Ok(())
 }
 
+fn cmd_video_caps(json: bool) -> Result<()> {
+    let report =
+        probe_amf_capabilities().context("failed to probe AMD AMF hardware video capabilities")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("RDNA FORGE AMF VIDEO CAPABILITIES");
+    println!(
+        "  AMF Runtime: {} | DX11 Context: {}",
+        report.runtime_version,
+        if report.dx11_initialized {
+            "ready"
+        } else {
+            "not initialized"
+        }
+    );
+    println!();
+    println!("  Codec        Dir     Accel         Resolution Range      10bit  Interlaced Native Formats");
+    for c in &report.codecs {
+        let res = match (c.min_width, c.min_height, c.max_width, c.max_height) {
+            (Some(w0), Some(h0), Some(w1), Some(h1)) => format!("{w0}x{h0}..{w1}x{h1}"),
+            _ => "n/a".to_string(),
+        };
+        let ten_bit = if c
+            .supported_formats
+            .iter()
+            .any(|f| matches!(f.as_str(), "P010" | "P012" | "P016" | "Y210" | "Y410"))
+        {
+            "yes"
+        } else {
+            "no"
+        };
+        let interlaced = c
+            .interlaced_supported
+            .map(|b| if b { "yes" } else { "no" })
+            .unwrap_or("n/a");
+        let extra = if c.acceleration == AmfAcceleration::NotSupported {
+            c.detail.as_deref().unwrap_or("unsupported").to_string()
+        } else if c.native_formats.is_empty() {
+            "none".to_string()
+        } else {
+            c.native_formats.join(", ")
+        };
+        println!(
+            "  {:<12} {:<7} {:<13} {:<21} {:<6} {:<10} {}",
+            c.codec, c.direction, c.acceleration, res, ten_bit, interlaced, extra
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {
     let profile = HardwareProfile::from_file(path)
         .with_context(|| format!("failed to load profile '{}'", path.display()))?;
@@ -1168,6 +1245,32 @@ mod tests {
                 assert_eq!(args.interval_ms, 250);
                 assert_eq!(args.device_id.as_deref(), Some("0x73AF"));
             }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let vid = Cli::try_parse_from(["forge", "video", "caps", "--json"])
+            .expect("video caps args must parse");
+        match vid.command {
+            Commands::Video {
+                action: VideoSubcommand::Caps { json },
+            } => assert!(json),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let bat = Cli::try_parse_from([
+            "forge",
+            "bench",
+            "vulkan",
+            "--kernel",
+            "gemv-q4",
+            "--batch-dispatches",
+            "16",
+        ])
+        .expect("vulkan bench batch-dispatches args must parse");
+        match bat.command {
+            Commands::Bench {
+                target: BenchSubcommand::Vulkan(args),
+            } => assert_eq!(args.batch_dispatches, Some(16)),
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }

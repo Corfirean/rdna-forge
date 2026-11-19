@@ -39,6 +39,8 @@ pub struct VulkanBenchConfig {
     pub warmup_iters: usize,
     pub measured_iters: usize,
     pub stability_runs: usize,
+    #[serde(default)]
+    pub batch_dispatches: Option<usize>,
 }
 
 impl Default for VulkanBenchConfig {
@@ -50,6 +52,7 @@ impl Default for VulkanBenchConfig {
             warmup_iters: 10,
             measured_iters: 50,
             stability_runs: 50,
+            batch_dispatches: None,
         }
     }
 }
@@ -72,6 +75,13 @@ pub fn run_vulkan_suite(config: &VulkanBenchConfig) -> ForgeResult<VulkanBenchRe
         return Err(ForgeError::InvalidDimension(
             "measured_iters must be > 0".to_string(),
         ));
+    }
+    if let Some(batch) = config.batch_dispatches {
+        if !(1..=256).contains(&batch) {
+            return Err(ForgeError::InvalidParameter(format!(
+                "batch_dispatches must be in 1..=256, got {batch}"
+            )));
+        }
     }
 
     let system = discover_system();
@@ -411,8 +421,9 @@ fn bench_rmsnorm_case(
     let x = deterministic_f32_data(elems, 0x3003);
     let w = deterministic_f32_data(cols as usize, 0x4004);
     let eps = 1e-5_f32;
+    let batch = config.batch_dispatches.unwrap_or(16);
 
-    let (actual, timings) = engine.bench_rmsnorm_f32(
+    let (actual, timings) = engine.bench_rmsnorm_f32_batched(
         &x,
         &w,
         rows,
@@ -420,6 +431,7 @@ fn bench_rmsnorm_case(
         eps,
         config.warmup_iters,
         config.measured_iters,
+        batch,
     )?;
 
     let (timing_source, samples_ms) = extract_timing_samples(&timings);
@@ -447,7 +459,7 @@ fn bench_rmsnorm_case(
         throughput_median: gb_s,
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
-        notes: Some("full exact FP64 CPU reference".to_string()),
+        notes: Some(format!("batch={batch}; full exact FP64 CPU reference")),
     })
 }
 
@@ -464,8 +476,9 @@ fn bench_rope_case(
         .ok_or_else(|| ForgeError::InvalidDimension("RoPE size overflow".to_string()))?;
     let input = deterministic_f32_data(elems, 0x5005);
     let theta_base = 10_000.0_f32;
+    let batch = config.batch_dispatches.unwrap_or(16);
 
-    let (actual, timings) = engine.bench_rope_f32(
+    let (actual, timings) = engine.bench_rope_f32_batched(
         &input,
         seq_len,
         n_heads,
@@ -473,6 +486,7 @@ fn bench_rope_case(
         theta_base,
         config.warmup_iters,
         config.measured_iters,
+        batch,
     )?;
 
     let (timing_source, samples_ms) = extract_timing_samples(&timings);
@@ -505,7 +519,7 @@ fn bench_rope_case(
         throughput_median: gb_s,
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
-        notes: Some("full exact FP64 CPU reference".to_string()),
+        notes: Some(format!("batch={batch}; full exact FP64 CPU reference")),
     })
 }
 
@@ -525,8 +539,9 @@ fn bench_gemv_w8_case(
     let w_packed = pack_i8_row_major_k4(&w_i8, n_us, k_us)?;
     let scales = deterministic_f32_data(n_us, 0x9002);
     let x = deterministic_f32_data(k_us, 0x9003);
+    let batch = config.batch_dispatches.unwrap_or(16);
 
-    let (actual, timings) = engine.bench_gemv_w8a32_wave32(
+    let (actual, timings) = engine.bench_gemv_w8a32_wave32_batched(
         &w_packed,
         &scales,
         &x,
@@ -534,6 +549,7 @@ fn bench_gemv_w8_case(
         k,
         config.warmup_iters,
         config.measured_iters,
+        batch,
     )?;
 
     let (timing_source, samples_ms) = extract_timing_samples(&timings);
@@ -566,7 +582,7 @@ fn bench_gemv_w8_case(
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
-            "Wave32 W8A32 (4.00x weight compression vs FP32, {gflops:.2} GFLOP/s); full FP64 CPU reference"
+            "batch={batch}; Wave32 W8A32 (4.00x weight compression vs FP32, {gflops:.2} GFLOP/s); full FP64 CPU reference"
         )),
     })
 }
@@ -581,8 +597,9 @@ fn bench_gemv_q4_case(
     let k_us = k as usize;
     let (w_q4, scales) = deterministic_q4_0_weights(n_us, k_us, 0xA001)?;
     let x = deterministic_f32_data(k_us, 0xA002);
+    let batch = config.batch_dispatches.unwrap_or(16);
 
-    let (actual, timings) = engine.bench_gemv_q4_0_wave32(
+    let (actual, timings) = engine.bench_gemv_q4_0_wave32_batched(
         &w_q4,
         &scales,
         &x,
@@ -590,6 +607,7 @@ fn bench_gemv_q4_case(
         k,
         config.warmup_iters,
         config.measured_iters,
+        batch,
     )?;
 
     let (timing_source, samples_ms) = extract_timing_samples(&timings);
@@ -625,7 +643,7 @@ fn bench_gemv_q4_case(
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
-            "Wave32 Q4_0 block-32 ({compression:.2}x compression vs FP32, {gflops:.2} GFLOP/s); full FP64 CPU reference"
+            "batch={batch}; Wave32 Q4_0 block-32 ({compression:.2}x compression vs FP32, {gflops:.2} GFLOP/s); full FP64 CPU reference"
         )),
     })
 }
@@ -647,8 +665,9 @@ fn bench_fused_rmsnorm_rope_case(
     let w = deterministic_f32_data(cols, 0xB002);
     let eps = 1e-5_f32;
     let theta_base = 10_000.0_f32;
+    let batch = config.batch_dispatches.unwrap_or(16);
 
-    let (actual, timings) = engine.bench_rmsnorm_rope_f32_subgroup(
+    let (actual, timings) = engine.bench_rmsnorm_rope_f32_subgroup_batched(
         &x,
         &w,
         seq_len,
@@ -659,6 +678,7 @@ fn bench_fused_rmsnorm_rope_case(
         theta_base,
         config.warmup_iters,
         config.measured_iters,
+        batch,
     )?;
 
     let (timing_source, samples_ms) = extract_timing_samples(&timings);
@@ -694,10 +714,9 @@ fn bench_fused_rmsnorm_rope_case(
         throughput_median: gb_s,
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
-        notes: Some(
-            "Wave32 fused subgroup single-pass (eliminates intermediate HBM round-trip); full FP64 CPU reference"
-                .to_string(),
-        ),
+        notes: Some(format!(
+            "batch={batch}; Wave32 fused subgroup single-pass (eliminates intermediate HBM round-trip); full FP64 CPU reference"
+        )),
     })
 }
 
