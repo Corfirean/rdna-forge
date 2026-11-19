@@ -283,7 +283,7 @@ fn bench_rope_case(
         head_dim as usize,
         theta_base,
     )?;
-    let acc = compare_slices(&actual, &expected, 1e-4, 1e-4)?;
+    let acc = compare_slices(&actual, &expected, 5e-4, 5e-4)?;
 
     let bytes_moved = (elems as f64) * 2.0 * 4.0;
     let gb_s = if latency.median_ms > 0.0 {

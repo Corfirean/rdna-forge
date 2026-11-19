@@ -153,7 +153,7 @@ pub fn probe_all_backends(
     // 3. Triton (Windows)
     let triton_status = probe_triton_python(python_override);
     if triton_status.status == SupportStatus::Unsupported {
-        missing.push(triton_status.summary.clone());
+        missing.push(format!("Triton: {}", triton_status.summary));
     }
     backends.push(triton_status);
 
