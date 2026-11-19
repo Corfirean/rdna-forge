@@ -3,6 +3,7 @@ pub mod hip_verify;
 pub mod probe;
 pub mod reference;
 pub mod shaders;
+pub mod verify;
 pub mod vulkan_compute;
 
 pub use amf::{
@@ -22,6 +23,9 @@ pub use shaders::{
     spirv_contains_opcode, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL,
     GEMV_Q4_0_WAVE32_WGSL, GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL,
     RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL, SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
+};
+pub use verify::{
+    default_untested_capabilities, run_live_capability_checks, VULKAN_VERIFY_CAPABILITIES,
 };
 pub use vulkan_compute::{GpuTiming, VulkanComputeEngine};
 
@@ -257,5 +261,18 @@ mod tests {
         let parsed: AmfCapabilitiesReport =
             serde_json::from_str(&json).expect("deserialize AMF report");
         assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn default_untested_capabilities_covers_hip_and_vulkan_checks() {
+        let caps = default_untested_capabilities();
+        assert_eq!(caps.len(), 1 + VULKAN_VERIFY_CAPABILITIES.len());
+        assert_eq!(caps[0].name, "HIP transfer");
+        assert!(caps
+            .iter()
+            .all(|cap| cap.status == forge_core::SupportStatus::NotTested));
+        for (cap, expected_name) in caps[1..].iter().zip(VULKAN_VERIFY_CAPABILITIES.iter()) {
+            assert_eq!(cap.name, *expected_name);
+        }
     }
 }
