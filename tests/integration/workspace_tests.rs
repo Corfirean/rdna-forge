@@ -75,7 +75,7 @@ fn profiler_summary_detects_wddm_vram_pressure_and_competing_load() {
         vram_used_mib: Some(14000),
         voltage_mv: Some(900),
     };
-    let summary = summarize_samples(&[pre.clone()], 250, Some(&pre)).unwrap();
+    let summary = summarize_samples(std::slice::from_ref(&pre), 250, Some(&pre)).unwrap();
     assert_eq!(summary.warnings.len(), 2);
     assert!(summary
         .warnings
