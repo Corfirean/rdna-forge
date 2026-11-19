@@ -5,7 +5,8 @@
 RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contributors on Windows 11 accurately detect `gfx` targets, audit broken vs working compute backends, and measure kernels and LLM inference against strict numerical correctness and statistical standards—starting with RDNA2 (`gfx1030`, RX 6900 XT).
 
 ### What Works Today
-- **Multi-source Windows GPU, runtime & live ADLX telemetry (`forge doctor`)**: Correlates `RtlGetVersion`, Windows Display Registry (`qwMemorySize`, Adrenalin version), Vulkan (`ash`), AMD HIP (`amdhip64_*.dll` `R0600` ABI), Python ROCm/`triton-windows`, and live ADLX telemetry (`forge-profiler` dynamically loading `amdadlx64.dll`: clocks, temperatures/hotspot, power, fan RPM, voltage, and WDDM VRAM pressure warnings).
+- **Multi-source Windows GPU, runtime & live ADLX telemetry (`forge doctor`, `forge monitor`)**: Correlates `RtlGetVersion`, Windows Display Registry (`qwMemorySize`, Adrenalin version), Vulkan (`ash`), AMD HIP (`amdhip64_*.dll` `R0600` ABI), Python ROCm/`triton-windows`, and pure-Rust ADLX `V1.4` live streaming (`table`, `jsonl`, `csv`) with WDDM VRAM pressure alerts.
+- **Read-only ADLX tuning inspection & safe power-limit validation (`forge tune`)**: Inspects hardware tuning capabilities, presets, power limits (`%`), GFX clocks/voltage, VRAM clock/memory timing modes, fan curves, and Zero-RPM state (`tune show`); validates `power-limit <PCT>` and `reset` in safe dry-run mode by default (explicit `--apply` required to commit).
 - **Live GPU capability verification (`forge doctor --verify`)**: Executes bit-exact HIP 4 MiB H2D/D2H transfers and pure-Rust WGSL->SPIR-V (`naga`) Vulkan compute kernels (baseline FP32 GEMM, register-blocked `128x64 vec4` FP32 GEMM, `OpSDot` INT8 DP4A GEMM, RMSNorm, RoPE) validated against exact FP64/`i64` CPU references.
 - **Reproducible benchmark harnesses (`forge bench`)**: Statistical median/IQR/MAD/p95 timing + numerical accuracy + peak RSS + ADLX telemetry across Vulkan compute (`--kernel all|gemm|gemm-opt|gemm-i8|rmsnorm|rope`), PyTorch ROCm + `triton-windows` (`--smoke`, opt-in `--telemetry`), and `llama.cpp` (`--flash-attn`, `--hip-disable-graphs`).
 
@@ -22,7 +23,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 2 complete (`forge-profiler` ADLX live telemetry + WDDM contention alerts, `9.50x` faster Vulkan FP32 GEMM via register-blocked `vec4`, `30.29 TOPS` bit-exact INT8 `OpSDot` GEMM, `llama.cpp` Windows WDDM root-cause diagnosis & clean back-to-back comparison, and `256x256` smoke-verified Triton W8A16/W4A16/fused/causal kernels).
+**Current Project Status:** Milestone 3A complete (`forge monitor` live ADLX streaming + `forge tune` ADLX `V1.4` tuning inspector & range-validated dry-run power-limit control), building on Milestone 2 (`forge-profiler`, `9.50x` Vulkan FP32 GEMM speedup, `30.29 TOPS` bit-exact INT8 `OpSDot`, `llama.cpp` WDDM root-cause analysis, and smoke-verified Triton kernels).
 
 ---
 
@@ -46,7 +47,7 @@ RDNA Forge provides an evidence-driven engineering foundation before building cu
 | **ROCm / TheRock + PyTorch** | `rocm==10.2.0`, `torch==2.15.0+rocm10.2.0` | **Verified** (FP32/FP16) / **Unsupported** (INT8, Flash SDPA) | `torch._int_mm` fails (`hipBLASLt` excludes `gfx10XX`); Flash/Efficient SDPA unavailable |
 | **Triton (`triton-windows`)** | `3.9.0.post30` | **Partially verified** | Community RDNA2 support (`triton-windows#41`); M1 suite verified; M2 W8A16/W4A16/swizzled/fused/causal kernels verified in `--smoke` mode (full-size stress omitted due to host `Kernel-Power 41` resets) |
 | **llama.cpp (`Vulkan` & `ROCm`)** | `b12532` (`rocm-10.0`) | **Verified** (Vulkan) / **Partially verified** (ROCm) | Uncontended `ROCm0`: `7369.46` `pp512` / `233.50` `tg128` (`Vulkan0`: `5227.71` / `240.21` default, `6211.14` `pp512` with `-fa 0`); ROCm drops 4.3x to `53.71` under WDDM VRAM contention |
-| **ADLX** (`amdadlx64.dll`) | `1.4.1.122` (`V1.4` COM) | **Verified** (live telemetry) | Pure-Rust COM vtable sampling for clocks, temps, power, fan, voltage, and WDDM VRAM occupancy without vendoring proprietary SDK headers |
+| **ADLX** (`amdadlx64.dll`) | `1.4.1.122` (`V1.4` COM) | **Verified** (telemetry + read-only tuning) | Pure-Rust COM vtables for live monitoring (`monitor`), tuning inspection (`tune show`), and range-validated dry-run power control without vendoring proprietary SDK headers |
 | **DirectML** / **AMF** | `DirectML.dll` / `amfrt64.dll` | **Partially verified** | Present in Windows `System32`; DirectML is in upstream maintenance mode |
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete 11-repository upstream feasibility audit, licenses, and technical blockers.
@@ -136,7 +137,20 @@ CAPABILITIES
   RoPE (Vulkan FP32): VERIFIED (64x8x64 passed (max_abs_err=6.35e-6, 0.010 ms))
 ```
 
-Machine-readable output is supported via `forge doctor --json` and `--output <path>` on benchmark commands.
+Machine-readable output is supported via `forge doctor --json`, `forge tune show --json`, `forge monitor --format jsonl|csv --output <path>`, and `--output <path>` on benchmark commands.
+
+### Live Monitor & ADLX Tuning (`forge monitor`, `forge tune`)
+
+```powershell
+# Stream real-time telemetry (table, jsonl, or csv) with Ctrl+C graceful exit
+.\target\release\forge.exe monitor --count 3 --interval-ms 200
+
+# Read-only ADLX tuning inspection and safe dry-run power limit check
+.\target\release\forge.exe tune show
+.\target\release\forge.exe tune power-limit 5
+# Pass --apply only when intentionally modifying GPU tuning:
+# .\target\release\forge.exe tune power-limit 5 --apply
+```
 
 ---
 
@@ -168,10 +182,10 @@ RDNA Forge separates Rust orchestration and safety policy from GPU compute backe
 
 - [`crates/forge-core`](crates/forge-core): Target parser (`GfxTarget`), PCI ID table, capability policy, hardware profile schema ([rx6900xt.toml](profiles/gfx1030/rx6900xt.toml)).
 - [`crates/forge-device`](crates/forge-device): Windows OS, Registry, Vulkan (`ash`), HIP `R0600` ABI, and dynamic ADLX device correlation.
-- [`crates/forge-profiler`](crates/forge-profiler): Dynamic ADLX `V1.4` COM telemetry sampler (clocks, temps, power, fan, voltage, WDDM VRAM contention checks).
+- [`crates/forge-profiler`](crates/forge-profiler): Dynamic ADLX `V1.4` COM telemetry & tuning (`IADLXGPUTuningServices`, clocks, temps, power, fan curves, WDDM VRAM contention checks).
 - [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine (`gemm_f32_tiled_vec4`, `gemm_i8_dp4a`), FP64/`i64` CPU references, HIP transfer verifier.
 - [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, ADLX telemetry integration, and `llama-bench` / Triton adapters.
-- [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `bench`, `profile`).
+- [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `monitor`, `tune`, `bench`, `profile`).
 - [`modules/ai/triton`](modules/ai/triton): Reproducible PyTorch ROCm + Triton kernel suite.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points.
@@ -186,7 +200,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
   - Implemented `forge-profiler` dynamic ADLX `V1.4` COM telemetry with automated WDDM VRAM pressure alerts.
   - Added register-blocked `gemm_f32_tiled_vec4` (**9.50x** Vulkan speedup to `13.61 TFLOP/s`) and native `OpSDot` INT8 DP4A (`30.29 TOPS`, bit-exact) compute shaders.
   - Added smoke-verified `gfx1030` Triton `W8A16`, `W4A16`, L2-swizzled FP16 GEMM, fused `RMSNorm+RoPE`, and causal FlashAttention kernels.
-- **Future:** Full power-budget isolation for high-TDP ROCm/Triton sweeps, hardware video pipelines (`AMF`), FidelityFX SDK evaluation, optional Tauri desktop UI, Linux support.
+- **Milestone 3A (Complete):**
+  - Added `forge monitor` real-time ADLX telemetry streaming (`table`, `jsonl`, `csv`, `--output`, Win32 `SetConsoleCtrlHandler` graceful exit, summary stats).
+  - Added `forge tune` pure-Rust ADLX `V1.4` tuning inspection (`show`) and hardware range-validated `power-limit` / `reset` commands with safe dry-run default (`--apply` opt-in).
+- **Future:** Vulkan compute LLM decode kernels (`Q4_0`/`W8A32` GEMV, subgroup Wave32 fused `RMSNorm+RoPE`), hardware video pipelines (`AMF`), FidelityFX SDK evaluation, RDNA3/RDNA4 verification, optional Tauri desktop UI, Linux support.
 
 ---
 

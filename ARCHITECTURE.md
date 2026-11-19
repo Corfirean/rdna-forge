@@ -9,7 +9,7 @@ RDNA Forge uses a modular Rust workspace for device discovery, runtime probing, 
 ```text
 rdna-forge/
 ├── apps/
-│   └── forge-cli/        # `forge` CLI binary (doctor, bench, profile)
+│   └── forge-cli/        # `forge` CLI binary (doctor, bench, monitor, tune, profile)
 ├── crates/
 │   ├── forge-core/       # Domain types, gfx target parser, profile schema, capability policy
 │   ├── forge-device/     # Windows OS, Registry, Vulkan, HIP ABI, and ADLX discovery
@@ -45,8 +45,9 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 4. **HIP & ADLX (`hip.rs`, `adlx.rs`)**: Dynamically loads `amdhip64_7.dll` / `amdhip64_6.dll` / `amdhip64.dll` via `libloading` and reads `HipDevicePropR0600` (`1472` bytes, `gcnArchName` at offset `1160`, verified by ABI tests). Dynamically loads `amdadlx64.dll` and invokes `ADLXQueryVersion` (`const char**`) / `ADLXQueryFullVersion`.
 
 ### `forge-profiler`
-- **`adlx_ffi`**: Pure-Rust `#[repr(C)]` COM vtable bindings matching ADLX `V1.4` C ABI (`IADLXSystem`, `IADLXGPUList`, `IADLXGPU`, `IADLXPerformanceMonitoringServices`, `IADLXGPUMetrics`), dynamically loading `amdadlx64.dll` via `libloading` without vendoring AMD SDK headers. Serializes process-global `ADLXInitialize`/`ADLXTerminate` lifecycle with a `Mutex<()>` and deterministically releases child COM pointers before `ADLXTerminate()`.
-- **`sampler` & `types`**: Exposes single-shot `snapshot_all_gpus()` / `snapshot_for_device()` plus background `TelemetryGuard` sampling (clock, VRAM clock, edge/hotspot temp, power, fan RPM, voltage, VRAM usage) and emits automatic Windows WDDM VRAM pressure (>50% dedicated VRAM) and competing-workload (>20% usage) warnings.
+- **`adlx_ffi`**: Pure-Rust `#[repr(C)]` COM vtable bindings matching ADLX `V1.4` C ABI (`IADLXSystem`, `IADLXGPUList`, `IADLXGPU`, `IADLXPerformanceMonitoringServices`, `IADLXGPUMetrics`), dynamically loading `amdadlx64.dll` via `libloading` without vendoring AMD SDK headers. Serializes process-global `ADLXInitialize`/`ADLXTerminate` lifecycle with a `Mutex<()>` and deterministically releases all child COM interfaces (including `IADLXGPUTuningServices`) before `ADLXTerminate()`.
+- **`adlx_tuning` & `tuning`**: Pure-Rust ADLX `V1.4` tuning COM bindings (`IADLXGPUTuningServices`, `IADLXGPUPresetTuning`, `IADLXManualPowerTuning(1)`, `IADLXManualGraphicsTuning2(_1)`, `IADLXManualVRAMTuning2(_1)`, `IADLXManualFanTuning(1)`, and `QueryInterface` fallback to base interfaces). Exposes strictly read-only `read_all_gpu_tuning()`, hardware-validated `IntRange` checks (`min..=max` & `step` alignment), and opt-in `set_gpu_power_limit` / `reset_gpu_tuning_to_factory` (dry-run by default; mutation gated behind explicit `dry_run = false` / `--apply`).
+- **`sampler` & `types`**: Exposes single-shot `snapshot_all_gpus()` / `snapshot_for_device()`, background `TelemetryGuard` sampling, `TELEMETRY_TABLE_HEADER` / `TELEMETRY_CSV_HEADER` / `MonitorRecord` streaming formatters, and automatic Windows WDDM VRAM pressure (>50% dedicated VRAM) and competing-workload (>20% usage) warnings.
 
 ### `forge-runtime`
 - **`probe`**: Audits Vulkan, HIP driver vs ROCm SDK tools (`rocm-sdk`/`hipcc`), Python PyTorch ROCm + `triton-windows`, ADLX, DirectML (flagging maintenance mode), AMF, and `llama-bench`.
@@ -61,7 +62,12 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 - **`vulkan_suite`**, **`llama`**, **`triton`**: Orchestrates reproducible benchmarks and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
 
 ### `forge-cli`
-Thin CLI boundary (`clap` + `anyhow`) exposing `forge doctor [--json] [--verify] [--python]`, `forge bench {vulkan,llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`, and `forge profile show`.
+Thin CLI boundary (`clap` + `anyhow`) exposing:
+- `forge doctor [--json] [--verify] [--python]`
+- `forge monitor [--interval-ms N] [--count N] [--duration-secs S] [--device-id HEX] [--format table|jsonl|csv] [--output PATH]` (with Win32 `SetConsoleCtrlHandler` graceful termination and clean `ADLXTerminate`)
+- `forge tune {show [--device-id HEX] [--json], power-limit <PCT> [--device-id HEX] [--apply], reset [--device-id HEX] [--apply]}`
+- `forge bench {vulkan,llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
+- `forge profile show`
 
 ---
 

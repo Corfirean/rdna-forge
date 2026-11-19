@@ -54,7 +54,7 @@ python -m py_compile modules/ai/triton/bench_suite.py
 ```
 
 ### Live GPU Correctness Tests
-Runs device discovery, live ADLX telemetry snapshots, HIP 4 MiB H2D/D2H verification, Vulkan baseline / tiled `vec4` / INT8 DP4A (`OpSDot`) edge-case tests (`1x1x1`, non-aligned shapes, dimension/VRAM bounds checks), and a repeated-dispatch stability check on physical AMD hardware (use `--test-threads=1` so ADLX and HIP tests run sequentially):
+Runs device discovery, live ADLX telemetry snapshots, read-only ADLX tuning inspection and dry-run range validation (never mutating GPU settings), HIP 4 MiB H2D/D2H verification, Vulkan baseline / tiled `vec4` / INT8 DP4A (`OpSDot`) edge-case tests (`1x1x1`, non-aligned shapes, dimension/VRAM bounds checks), and a repeated-dispatch stability check on physical AMD hardware (use `--test-threads=1` so ADLX and HIP tests run sequentially):
 
 ```powershell
 cargo test --workspace -- --ignored --test-threads=1 --nocapture
@@ -62,12 +62,27 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 
 ---
 
-## Running Diagnostics & Benchmarks
+## Running Diagnostics, Monitoring, Tuning & Benchmarks
 
 ```powershell
 # Read-only hardware, runtime & live ADLX telemetry audit
 .\target\release\forge.exe doctor
 .\target\release\forge.exe doctor --json
+
+# Real-time ADLX monitor (table, JSONL, or CSV stream with Ctrl+C graceful exit)
+.\target\release\forge.exe monitor --interval-ms 500 --count 10
+.\target\release\forge.exe monitor --format csv --duration-secs 5 --output ..\telemetry.csv
+.\target\release\forge.exe monitor --format jsonl --device-id 0x73AF --count 5
+
+# Read-only ADLX tuning inspector (ranges, defaults, fan curve, presets)
+.\target\release\forge.exe tune show
+.\target\release\forge.exe tune show --json
+
+# Range-validated power limit & factory reset (SAFE DRY-RUN by default; pass --apply to commit)
+.\target\release\forge.exe tune power-limit 5
+.\target\release\forge.exe tune power-limit -5 --device-id 0x73AF
+# .\target\release\forge.exe tune power-limit 5 --apply
+# .\target\release\forge.exe tune reset --apply
 
 # Live verification (HIP memory round-trip + Vulkan baseline/vec4/DP4A compute correctness)
 .\target\release\forge.exe doctor --verify --python C:\venvs\rdna-forge\Scripts\python.exe

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 3A (Forge Live Telemetry Monitor & ADLX Tuning Inspector)
+- Extended `forge-profiler` with pure-Rust ADLX `V1.4` tuning COM vtable bindings (`IADLXGPUTuningServices`, `IADLXGPUPresetTuning`, `IADLXManualPowerTuning(1)`, `IADLXManualGraphicsTuning2(_1)`, `IADLXManualVRAMTuning2(_1)`, `IADLXManualFanTuning(1)`) without vendoring proprietary SDK headers.
+- Added domain tuning types and hardware `IntRange` validation (`min..=max` and `step` alignment), `MemoryTimingMode` mapping, read-only `read_all_gpu_tuning()`, and dry-run-safe `set_gpu_power_limit()` / `reset_gpu_tuning_to_factory()`.
+- Added `ForgeError::InvalidParameter` in `forge-core` for out-of-range or ambiguous tuning parameters.
+- Added `forge monitor` CLI command supporting live ADLX polling (`--interval-ms`, `--count`, `--duration-secs`, `--device-id`, `--format table|jsonl|csv`, `--output`), Win32 `SetConsoleCtrlHandler` graceful shutdown, WDDM VRAM warnings, and end-of-run summary statistics.
+- Added `forge tune` CLI commands (`show [--device-id] [--json]`, `power-limit <PCT> [--device-id] [--apply]`, `reset [--device-id] [--apply]`) with safe dry-run execution by default.
+- Added unit, CLI parsing, integration, and strictly read-only live RX 6900 XT GPU tuning/dry-run validation tests.
+
 ### Added — Milestone 2 (ADLX Telemetry, Optimized `gfx1030` Kernels & WDDM Root-Cause Analysis)
 - New crate `forge-profiler` implementing pure-Rust ADLX `V1.4` COM vtable telemetry (`amdadlx64.dll`, zero vendored headers): live core/VRAM clocks, core/hotspot temperatures, GPU power, fan RPM, voltage, and Windows WDDM VRAM occupancy / competing-workload warnings across `forge doctor` and benchmark reports.
 - Vulkan compute optimizations in `forge-runtime`:
