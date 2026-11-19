@@ -637,3 +637,320 @@ pub fn ref_rmsnorm_rope_f32(
 
     Ok(out)
 }
+
+/// Elements per GGUF `Q4_K` super-block (`256` 4-bit weights across 8 sub-blocks of 32).
+pub const Q4_K_BLOCK_SIZE: usize = 256;
+
+/// Size in bytes of one packed GGUF `block_q4_K` (`d: f16, dmin: f16, scales[12], qs[128]`).
+pub const Q4_K_BLOCK_BYTES: usize = 144;
+
+/// Size in `u32` words of one packed GGUF `block_q4_K` (`144 / 4 = 36`).
+pub const Q4_K_BLOCK_U32S: usize = 36;
+
+/// Converts IEEE-754 binary16 bits (`u16`) to `f32` without external dependencies.
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let mant = u32::from(bits & 0x03FF);
+
+    let out_bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            // Normalize subnormal half-precision value into binary32.
+            let mut m = mant;
+            let mut e = 127i32 - 14;
+            while (m & 0x0400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03FF;
+            sign | ((e as u32) << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        sign | 0x7F80_0000 | (mant << 13)
+    } else {
+        let e = exp + (127 - 15);
+        sign | (e << 23) | (mant << 13)
+    };
+    f32::from_bits(out_bits)
+}
+
+/// Converts `f32` to nearest-even IEEE-754 binary16 bits (`u16`).
+pub fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        if mant == 0 {
+            return sign | 0x7C00;
+        }
+        let nan_mant = ((mant >> 13) as u16).max(1);
+        return sign | 0x7C00 | nan_mant;
+    }
+
+    let unbiased = exp - 127 + 15;
+    if unbiased >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign;
+        }
+        let full_mant = mant | 0x0080_0000;
+        let shift = (14 - unbiased) as u32;
+        let half_mant = full_mant >> shift;
+        let rem = full_mant & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let round_up = rem > halfway || (rem == halfway && (half_mant & 1) != 0);
+        return sign | ((half_mant + u32::from(round_up)) as u16);
+    }
+
+    let half_mant = (mant >> 13) as u16;
+    let rem = mant & 0x1FFF;
+    let round_up = rem > 0x1000 || (rem == 0x1000 && (half_mant & 1) != 0);
+    let packed = sign | ((unbiased as u16) << 10) | half_mant;
+    packed.wrapping_add(u16::from(round_up))
+}
+
+/// Packs one GGUF `block_q4_K` (`[d: f16, dmin: f16, scales[12], qs[128]]`) into 36 little-endian `u32` words.
+///
+/// `scales` and `mins` are 6-bit integers (`0..64`, masked to `& 0x3F`) matching upstream `llama.cpp`.
+pub fn pack_q4_k_block(
+    d: f32,
+    dmin: f32,
+    scales: &[u8; 8],
+    mins: &[u8; 8],
+    qs: &[u8; 128],
+) -> [u32; Q4_K_BLOCK_U32S] {
+    let mut words = [0u32; Q4_K_BLOCK_U32S];
+    let d_bits = u32::from(f32_to_f16_bits(d));
+    let dmin_bits = u32::from(f32_to_f16_bits(dmin));
+    words[0] = d_bits | (dmin_bits << 16);
+
+    let mut scale_bytes = [0u8; 12];
+    for j in 0..4 {
+        let sc_lo = scales[j] & 0x3F;
+        let sc_hi = scales[j + 4] & 0x3F;
+        let m_lo = mins[j] & 0x3F;
+        let m_hi = mins[j + 4] & 0x3F;
+        scale_bytes[j] = sc_lo | ((sc_hi >> 4) << 6);
+        scale_bytes[j + 4] = m_lo | ((m_hi >> 4) << 6);
+        scale_bytes[j + 8] = (sc_hi & 0x0F) | ((m_hi & 0x0F) << 4);
+    }
+
+    for (dst, chunk) in words[1..4].iter_mut().zip(scale_bytes.chunks_exact(4)) {
+        *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    for (dst, chunk) in words[4..36].iter_mut().zip(qs.chunks_exact(4)) {
+        *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    words
+}
+
+/// Decodes a 6-bit `(scale, min)` pair from packed 12-byte `Q4_K` scales, matching `get_scale_min_k4`.
+pub fn unpack_q4_k_scale_min(scales_bytes: &[u8; 12], j: usize) -> (u8, u8) {
+    debug_assert!(j < 8);
+    if j < 4 {
+        (scales_bytes[j] & 63, scales_bytes[j + 4] & 63)
+    } else {
+        let sc = (scales_bytes[j + 4] & 0x0F) | ((scales_bytes[j - 4] >> 6) << 4);
+        let m = (scales_bytes[j + 4] >> 4) | ((scales_bytes[j] >> 6) << 4);
+        (sc, m)
+    }
+}
+
+/// Generates deterministic GGUF `Q4_K` packed super-blocks (`k % 256 == 0`) with 6-bit scales/mins.
+pub fn deterministic_q4_k_weights(n: usize, k: usize, seed: u64) -> ForgeResult<Vec<u32>> {
+    if n == 0 || k == 0 || !k.is_multiple_of(Q4_K_BLOCK_SIZE) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "Q4_K weights require n > 0 and k divisible by {Q4_K_BLOCK_SIZE}, got ({n}, {k})"
+        )));
+    }
+    let n_blocks = k / Q4_K_BLOCK_SIZE;
+    let total_blocks = n
+        .checked_mul(n_blocks)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_K block count overflow".to_string()))?;
+    let total_words = total_blocks
+        .checked_mul(Q4_K_BLOCK_U32S)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_K word count overflow".to_string()))?;
+
+    let mut state = seed ^ 0xA076_1D64_78BD_642F;
+    let mut next_u64 = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+
+    let mut out = Vec::with_capacity(total_words);
+    for _ in 0..total_blocks {
+        let d = 0.004 + (((next_u64() >> 40) as f32) / 16_777_216.0_f32) * 0.020;
+        let dmin = 0.002 + (((next_u64() >> 40) as f32) / 16_777_216.0_f32) * 0.015;
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for i in 0..8 {
+            scales[i] = 1 + ((next_u64() >> 58) as u8 % 63);
+            mins[i] = (next_u64() >> 58) as u8 & 0x3F;
+        }
+        let mut qs = [0u8; 128];
+        for q_byte in &mut qs {
+            *q_byte = (next_u64() >> 56) as u8;
+        }
+        out.extend_from_slice(&pack_q4_k_block(d, dmin, &scales, &mins, &qs));
+    }
+
+    Ok(out)
+}
+
+/// Exact FP64 CPU reference for GGUF `Q4_K` super-block GEMV matching `gemv_q4_k_wave32.wgsl`.
+pub fn ref_gemv_q4_k_f32(w_q4k: &[u32], x: &[f32], n: usize, k: usize) -> ForgeResult<Vec<f32>> {
+    if n == 0 || k == 0 || !k.is_multiple_of(Q4_K_BLOCK_SIZE) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "Q4_K GEMV requires n > 0 and k divisible by {Q4_K_BLOCK_SIZE}, got ({n}, {k})"
+        )));
+    }
+    let n_blocks = k / Q4_K_BLOCK_SIZE;
+    let total_blocks = n
+        .checked_mul(n_blocks)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_K block count overflow".to_string()))?;
+    let expected_words = total_blocks
+        .checked_mul(Q4_K_BLOCK_U32S)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_K word count overflow".to_string()))?;
+    if w_q4k.len() != expected_words || x.len() != k {
+        return Err(ForgeError::InvalidDimension(format!(
+            "Q4_K GEMV buffer mismatch: got w_words={}, x={}, expected ({expected_words}, {k})",
+            w_q4k.len(),
+            x.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut row_acc = 0.0f64;
+        for blk in 0..n_blocks {
+            let base = (row * n_blocks + blk) * Q4_K_BLOCK_U32S;
+            let w0 = w_q4k[base];
+            let d = f64::from(f16_bits_to_f32((w0 & 0xFFFF) as u16));
+            let dmin = f64::from(f16_bits_to_f32((w0 >> 16) as u16));
+
+            let mut scale_bytes = [0u8; 12];
+            for i in 0..3 {
+                let le = w_q4k[base + 1 + i].to_le_bytes();
+                scale_bytes[i * 4..i * 4 + 4].copy_from_slice(&le);
+            }
+
+            let x_blk = blk * Q4_K_BLOCK_SIZE;
+            for chunk in 0..4 {
+                let (sc0, m0) = unpack_q4_k_scale_min(&scale_bytes, chunk * 2);
+                let (sc1, m1) = unpack_q4_k_scale_min(&scale_bytes, chunk * 2 + 1);
+                let d0 = d * f64::from(sc0);
+                let dm0 = dmin * f64::from(m0);
+                let d1 = d * f64::from(sc1);
+                let dm1 = dmin * f64::from(m1);
+
+                let q_word_off = base + 4 + chunk * 8;
+                let x_chunk = x_blk + chunk * 64;
+                for w_idx in 0..8 {
+                    let word_bytes = w_q4k[q_word_off + w_idx].to_le_bytes();
+                    for (b_sub, &byte) in word_bytes.iter().enumerate() {
+                        let elem = w_idx * 4 + b_sub;
+                        let q_lo = f64::from(byte & 0x0F);
+                        let q_hi = f64::from(byte >> 4);
+                        row_acc += (d0 * q_lo - dm0) * f64::from(x[x_chunk + elem]);
+                        row_acc += (d1 * q_hi - dm1) * f64::from(x[x_chunk + 32 + elem]);
+                    }
+                }
+            }
+        }
+        out.push(row_acc as f32);
+    }
+    Ok(out)
+}
+
+/// Exact two-pass FP64 CPU reference for scaled dot-product attention (`O = softmax(scale * Q * K^T) * V`).
+///
+/// Layout of `q`, `k`, `v`, and output is `[total_heads, seq_len, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn ref_flash_attention_f32(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    total_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    causal: bool,
+    scale: f32,
+) -> ForgeResult<Vec<f32>> {
+    if total_heads == 0 || seq_len == 0 || head_dim == 0 {
+        return Err(ForgeError::InvalidDimension(format!(
+            "attention requires non-zero dims, got ({total_heads}, {seq_len}, {head_dim})"
+        )));
+    }
+    if !scale.is_finite() {
+        return Err(ForgeError::InvalidDimension(format!(
+            "attention scale must be finite, got {scale}"
+        )));
+    }
+    let total = total_heads
+        .checked_mul(seq_len)
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| {
+            ForgeError::InvalidDimension("attention buffer size overflow".to_string())
+        })?;
+    if q.len() != total || k.len() != total || v.len() != total {
+        return Err(ForgeError::InvalidDimension(format!(
+            "attention buffer mismatch: got q={}, k={}, v={}, expected {total}",
+            q.len(),
+            k.len(),
+            v.len()
+        )));
+    }
+
+    let head_stride = seq_len * head_dim;
+    let scale_f64 = f64::from(scale);
+    let mut out = vec![0.0f32; total];
+    let mut scores = vec![0.0f64; seq_len];
+
+    for h in 0..total_heads {
+        let h_off = h * head_stride;
+        for qi in 0..seq_len {
+            let q_row = &q[h_off + qi * head_dim..h_off + (qi + 1) * head_dim];
+            let k_end = if causal { qi + 1 } else { seq_len };
+            let mut max_score = f64::NEG_INFINITY;
+            for (kj, s_slot) in scores[..k_end].iter_mut().enumerate() {
+                let k_row = &k[h_off + kj * head_dim..h_off + (kj + 1) * head_dim];
+                let dot: f64 = q_row
+                    .iter()
+                    .zip(k_row.iter())
+                    .map(|(&qv, &kv)| f64::from(qv) * f64::from(kv))
+                    .sum();
+                let sc = dot * scale_f64;
+                if sc > max_score {
+                    max_score = sc;
+                }
+                *s_slot = sc;
+            }
+
+            let mut denom = 0.0f64;
+            for s_slot in &mut scores[..k_end] {
+                let w = (*s_slot - max_score).exp();
+                *s_slot = w;
+                denom += w;
+            }
+
+            let o_row = &mut out[h_off + qi * head_dim..h_off + (qi + 1) * head_dim];
+            for (d, o_slot) in o_row.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for (kj, &w) in scores[..k_end].iter().enumerate() {
+                    acc += w * f64::from(v[h_off + kj * head_dim + d]);
+                }
+                *o_slot = (acc / denom) as f32;
+            }
+        }
+    }
+
+    Ok(out)
+}

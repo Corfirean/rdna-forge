@@ -3,9 +3,10 @@ use forge_core::{CapabilityResult, ForgeError, ForgeResult, GpuDeviceInfo, Suppo
 use crate::hip_verify::verify_hip_transfer;
 use crate::reference::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4,
-    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
-    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32,
+    deterministic_q4_0_weights, deterministic_q4_k_weights, pack_i8_b_transposed_k4,
+    pack_i8_row_major_k4, ref_flash_attention_f32, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32,
+    ref_gemv_q4_0_f32, ref_gemv_q4_k_f32, ref_gemv_w8a32_f32, ref_rmsnorm_f32,
+    ref_rmsnorm_rope_f32, ref_rope_f32,
 };
 use crate::vulkan_compute::{GpuTiming, VulkanComputeEngine};
 
@@ -16,9 +17,11 @@ pub const VULKAN_VERIFY_CAPABILITIES: &[&str] = &[
     "GEMM (Vulkan INT8 DP4A)",
     "GEMV (Vulkan Wave32 W8A32)",
     "GEMV (Vulkan Wave32 Q4_0)",
+    "GEMV (Vulkan Wave32 Q4_K)",
     "RMSNorm (Vulkan FP32)",
     "RoPE (Vulkan FP32)",
     "Fused RMSNorm+RoPE (Vulkan Subgroup)",
+    "FlashAttention Causal (Vulkan Wave32)",
 ];
 
 /// Returns placeholder `NotTested` capability rows when `--verify` was not requested yet.
@@ -197,6 +200,27 @@ pub fn run_live_capability_checks(gpus: &[GpuDeviceInfo]) -> Vec<CapabilityResul
             })();
             results.push(cap_result("GEMV (Vulkan Wave32 Q4_0)", q4_res));
 
+            let q4_k_res = (|| -> ForgeResult<String> {
+                let (n, k) = (64u32, 256u32);
+                let w_q4k = deterministic_q4_k_weights(n as usize, k as usize, 68)?;
+                let x = deterministic_f32_data(k as usize, 69);
+                let (actual, timing) = engine.run_gemv_q4_k_wave32(&w_q4k, &x, n, k)?;
+                let expected = ref_gemv_q4_k_f32(&w_q4k, &x, n as usize, k as usize)?;
+                let acc = compare_slices(&actual, &expected, 1e-3, 1e-4)?;
+                if !acc.passed {
+                    return Err(ForgeError::ExecutionFailed(format!(
+                        "numerical mismatch (max_abs_err={:.3e})",
+                        acc.max_abs_err
+                    )));
+                }
+                Ok(format!(
+                    "64x256 passed (max_abs_err={:.2e}, {:.3} ms)",
+                    acc.max_abs_err,
+                    timing.gpu_ms.unwrap_or(timing.wall_ms)
+                ))
+            })();
+            results.push(cap_result("GEMV (Vulkan Wave32 Q4_K)", q4_k_res));
+
             let fused_res = (|| -> ForgeResult<String> {
                 let (seq, heads, dim, pos_offset) = (64u32, 8u32, 64u32, 17u32);
                 let cols = (heads * dim) as usize;
@@ -232,6 +256,40 @@ pub fn run_live_capability_checks(gpus: &[GpuDeviceInfo]) -> Vec<CapabilityResul
                 "Fused RMSNorm+RoPE (Vulkan Subgroup)",
                 fused_res,
             ));
+
+            let fa_res = (|| -> ForgeResult<String> {
+                let (heads, seq, dim) = (4u32, 64u32, 64u32);
+                let elems = (heads * seq * dim) as usize;
+                let q = deterministic_f32_data(elems, 70);
+                let k_mat = deterministic_f32_data(elems, 71);
+                let v = deterministic_f32_data(elems, 72);
+                let scale = 1.0 / (dim as f32).sqrt();
+                let (actual, timing) = engine
+                    .run_flash_attention_f32_wave32(&q, &k_mat, &v, heads, seq, dim, true, scale)?;
+                let expected = ref_flash_attention_f32(
+                    &q,
+                    &k_mat,
+                    &v,
+                    heads as usize,
+                    seq as usize,
+                    dim as usize,
+                    true,
+                    scale,
+                )?;
+                let acc = compare_slices(&actual, &expected, 1e-4, 1e-4)?;
+                if !acc.passed {
+                    return Err(ForgeError::ExecutionFailed(format!(
+                        "numerical mismatch (max_abs_err={:.3e})",
+                        acc.max_abs_err
+                    )));
+                }
+                Ok(format!(
+                    "4x64x64 causal passed (max_abs_err={:.2e}, {:.3} ms)",
+                    acc.max_abs_err,
+                    timing.gpu_ms.unwrap_or(timing.wall_ms)
+                ))
+            })();
+            results.push(cap_result("FlashAttention Causal (Vulkan Wave32)", fa_res));
         }
         Err(err) => push_unsupported_vulkan_caps(&mut results, &err.to_string()),
     }

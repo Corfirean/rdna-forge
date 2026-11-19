@@ -5,10 +5,13 @@ pub const GEMM_F32_TILED_VEC4_WGSL: &str = include_str!("../shaders/gemm_f32_til
 pub const GEMM_I8_DP4A_WGSL: &str = include_str!("../shaders/gemm_i8_dp4a.wgsl");
 pub const GEMV_W8A32_WAVE32_WGSL: &str = include_str!("../shaders/gemv_w8a32_wave32.wgsl");
 pub const GEMV_Q4_0_WAVE32_WGSL: &str = include_str!("../shaders/gemv_q4_0_wave32.wgsl");
+pub const GEMV_Q4_K_WAVE32_WGSL: &str = include_str!("../shaders/gemv_q4_k_wave32.wgsl");
 pub const RMSNORM_F32_WGSL: &str = include_str!("../shaders/rmsnorm_f32.wgsl");
 pub const ROPE_F32_WGSL: &str = include_str!("../shaders/rope_f32.wgsl");
 pub const RMSNORM_ROPE_F32_SUBGROUP_WGSL: &str =
     include_str!("../shaders/rmsnorm_rope_f32_subgroup.wgsl");
+pub const FLASH_ATTENTION_F32_WAVE32_WGSL: &str =
+    include_str!("../shaders/flash_attention_f32_wave32.wgsl");
 
 /// SPIR-V opcode for `OpSDot` (`SPV_KHR_integer_dot_product` / SPIR-V 1.6).
 pub const SPIRV_OP_SDOT: u16 = 4450;
@@ -48,9 +51,12 @@ fn compile_wgsl_with_options(
                 | naga::valid::SubgroupOperationSet::ARITHMETIC,
         );
     }
-    let info = validator
-        .validate(&module)
-        .map_err(|err| ForgeError::ExecutionFailed(format!("WGSL validation failed: {err}")))?;
+    let info = validator.validate(&module).map_err(|err| {
+        ForgeError::ExecutionFailed(format!(
+            "WGSL validation failed:\n{}",
+            err.emit_to_string(source)
+        ))
+    })?;
 
     let options = naga::back::spv::Options {
         lang_version,

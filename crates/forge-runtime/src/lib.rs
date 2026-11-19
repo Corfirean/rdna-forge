@@ -14,15 +14,18 @@ pub use hip_verify::{verify_hip_transfer, HipVerificationResult};
 pub use probe::probe_all_backends;
 pub use reference::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32,
-    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
-    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, NumericalAccuracy, Q4_0_BLOCK_SIZE,
+    deterministic_q4_0_weights, deterministic_q4_k_weights, f16_bits_to_f32, f32_to_f16_bits,
+    pack_i8_b_transposed_k4, pack_i8_row_major_k4, pack_q4_k_block, ref_flash_attention_f32,
+    ref_gemm_f32, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_q4_k_f32,
+    ref_gemv_w8a32_f32, ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, unpack_q4_k_scale_min,
+    NumericalAccuracy, Q4_0_BLOCK_SIZE, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_SIZE, Q4_K_BLOCK_U32S,
 };
 pub use shaders::{
     compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, compile_wgsl_to_spirv_subgroup,
-    spirv_contains_opcode, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL,
-    GEMV_Q4_0_WAVE32_WGSL, GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL,
-    RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL, SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
+    spirv_contains_opcode, FLASH_ATTENTION_F32_WAVE32_WGSL, GEMM_F32_TILED_VEC4_WGSL,
+    GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, GEMV_Q4_0_WAVE32_WGSL, GEMV_Q4_K_WAVE32_WGSL,
+    GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL, RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL,
+    SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
 };
 pub use verify::{
     default_untested_capabilities, run_live_capability_checks, VULKAN_VERIFY_CAPABILITIES,
@@ -61,7 +64,12 @@ mod tests {
         for (name, src) in [
             ("gemv_w8a32_wave32", GEMV_W8A32_WAVE32_WGSL),
             ("gemv_q4_0_wave32", GEMV_Q4_0_WAVE32_WGSL),
+            ("gemv_q4_k_wave32", GEMV_Q4_K_WAVE32_WGSL),
             ("rmsnorm_rope_f32_subgroup", RMSNORM_ROPE_F32_SUBGROUP_WGSL),
+            (
+                "flash_attention_f32_wave32",
+                FLASH_ATTENTION_F32_WAVE32_WGSL,
+            ),
         ] {
             let sg_spv = compile_wgsl_to_spirv_subgroup(src)
                 .unwrap_or_else(|e| panic!("{name} failed subgroup SPIR-V compile: {e}"));
@@ -274,5 +282,66 @@ mod tests {
         for (cap, expected_name) in caps[1..].iter().zip(VULKAN_VERIFY_CAPABILITIES.iter()) {
             assert_eq!(cap.name, *expected_name);
         }
+    }
+
+    #[test]
+    fn q4_k_and_flash_attention_references_work() {
+        // IEEE-754 f16 exact round-trips (normal, zero, subnormal, negative)
+        for v in [0.0f32, 1.0, -2.5, 0.5, 0.125, 0.000_976_562_5] {
+            let decoded = f16_bits_to_f32(f32_to_f16_bits(v));
+            assert!((decoded - v).abs() < 1e-6, "v={v} decoded={decoded}");
+        }
+
+        // Exercise >31 6-bit scales & mins across all 8 sub-blocks (indices 4..8 use top 2 bits)
+        let scales = [1u8, 2, 17, 31, 35, 48, 61, 63];
+        let mins = [0u8, 3, 19, 32, 41, 52, 59, 62];
+        let mut qs = [0u8; 128];
+        // Set all low & high nibbles in chunk 0 to known values and check exact Q4_K dot product
+        qs[0..32].fill(0x21); // lo=1 (weights 0..31), hi=2 (weights 32..63)
+        let block = pack_q4_k_block(0.5, 0.25, &scales, &mins, &qs);
+        let mut scale_bytes = [0u8; 12];
+        for i in 0..3 {
+            scale_bytes[i * 4..i * 4 + 4].copy_from_slice(&block[1 + i].to_le_bytes());
+        }
+        for j in 0..8 {
+            assert_eq!(unpack_q4_k_scale_min(&scale_bytes, j), (scales[j], mins[j]));
+        }
+
+        // Row dot with x = 1.0:
+        // Chunk 0 lo (32 weights): 32 * (0.5 * 1 * 1 - 0.25 * 0) = 16.0
+        // Chunk 0 hi (32 weights): 32 * (0.5 * 2 * 2 - 0.25 * 3) = 40.0
+        // Chunks 1..3 have q=0, so weight = -0.25 * mins[j] for 32 elements each:
+        // 32 * (-0.25) * (19 + 32 + 41 + 52 + 59 + 62) = -8 * 265 = -2120.0
+        // Total = 56.0 - 2120.0 = -2064.0
+        let x256 = vec![1.0f32; 256];
+        let y_q4k = ref_gemv_q4_k_f32(&block, &x256, 1, 256).unwrap();
+        assert!((y_q4k[0] - (-2064.0)).abs() < 1e-4, "got {}", y_q4k[0]);
+
+        let det_q4k = deterministic_q4_k_weights(2, 512, 99).unwrap();
+        assert_eq!(det_q4k.len(), 2 * 2 * Q4_K_BLOCK_U32S);
+        assert!(matches!(
+            deterministic_q4_k_weights(1, 128, 1),
+            Err(ForgeError::InvalidDimension(_))
+        ));
+
+        // FlashAttention analytical 2-token causal vs full test:
+        // Q = [[1,0], [0,1]], K = [[1,0], [0,1]], V = [[2,3], [5,7]], scale = 1.0
+        // Row 0 causal attends only to key 0 -> out[0] = [2, 3].
+        // Row 1 causal attends to [0, 1] with logits [0, 1] -> softmax weights [1/(1+e), e/(1+e)].
+        let q = [1.0f32, 0.0, 0.0, 1.0];
+        let k = [1.0f32, 0.0, 0.0, 1.0];
+        let v = [2.0f32, 3.0, 5.0, 7.0];
+        let o_causal = ref_flash_attention_f32(&q, &k, &v, 1, 2, 2, true, 1.0).unwrap();
+        assert!((o_causal[0] - 2.0).abs() < 1e-6);
+        assert!((o_causal[1] - 3.0).abs() < 1e-6);
+        let e1 = 1.0f32.exp();
+        let w0 = 1.0 / (1.0 + e1);
+        let w1 = e1 / (1.0 + e1);
+        assert!((o_causal[2] - (w0 * 2.0 + w1 * 5.0)).abs() < 1e-5);
+        assert!((o_causal[3] - (w0 * 3.0 + w1 * 7.0)).abs() < 1e-5);
+
+        let o_full = ref_flash_attention_f32(&q, &k, &v, 1, 2, 2, false, 1.0).unwrap();
+        assert!((o_full[0] - (w1 * 2.0 + w0 * 5.0)).abs() < 1e-5);
+        assert!((o_full[1] - (w1 * 3.0 + w0 * 7.0)).abs() < 1e-5);
     }
 }

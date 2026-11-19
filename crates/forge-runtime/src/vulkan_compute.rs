@@ -9,11 +9,12 @@ use forge_core::{
 use forge_device::discover_gpus;
 use serde::{Deserialize, Serialize};
 
-use crate::reference::Q4_0_BLOCK_SIZE;
+use crate::reference::{Q4_0_BLOCK_SIZE, Q4_K_BLOCK_SIZE, Q4_K_BLOCK_U32S};
 use crate::shaders::{
     compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, compile_wgsl_to_spirv_subgroup,
-    GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, GEMV_Q4_0_WAVE32_WGSL,
-    GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL, RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL,
+    FLASH_ATTENTION_F32_WAVE32_WGSL, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL,
+    GEMV_Q4_0_WAVE32_WGSL, GEMV_Q4_K_WAVE32_WGSL, GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL,
+    RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL,
 };
 
 /// Timing measurements from a single Vulkan compute dispatch.
@@ -70,6 +71,19 @@ struct RmsRopeParams {
     theta_base: f32,
     _pad0: u32,
     _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashAttnParams {
+    total_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+    causal: u32,
+    scale: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct VulkanContext {
@@ -1273,6 +1287,296 @@ impl VulkanComputeEngine {
             dispatches_per_submit,
         )?;
         let out = self.download_device_local_vec::<f32>(&buf_y, elems)?;
+
+        Ok((out, timings))
+    }
+
+    /// Executes Wave32 GGUF `Q4_K` super-block weight-only GEMV once and returns `y` plus timing.
+    pub fn run_gemv_q4_k_wave32(
+        &self,
+        w_q4k: &[u32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+    ) -> ForgeResult<(Vec<f32>, GpuTiming)> {
+        let (out, mut timings) = self.bench_gemv_q4_k_wave32(w_q4k, x, n, k, 0, 1)?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed("missing Wave32 Q4_K GEMV timing measurement".to_string())
+        })?;
+        Ok((out, timing))
+    }
+
+    /// Benchmarks Wave32 GGUF `Q4_K` super-block GEMV across repeated runs (1 dispatch per submit).
+    pub fn bench_gemv_q4_k_wave32(
+        &self,
+        w_q4k: &[u32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_gemv_q4_k_wave32_batched(w_q4k, x, n, k, warmup_iters, measured_iters, 1)
+    }
+
+    /// Benchmarks Wave32 GGUF `Q4_K` super-block GEMV with `dispatches_per_submit` batched dispatches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemv_q4_k_wave32_batched(
+        &self,
+        w_q4k: &[u32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        validate_batch_dispatches(dispatches_per_submit)?;
+        if n == 0 || k == 0 || !k.is_multiple_of(Q4_K_BLOCK_SIZE as u32) {
+            return Err(ForgeError::InvalidDimension(format!(
+                "Q4_K GEMV requires n > 0 and k divisible by {Q4_K_BLOCK_SIZE}, got ({n}, {k})"
+            )));
+        }
+        if !self.ctx.subgroup_arithmetic_enabled || !self.ctx.wave32_subgroup_control_enabled {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan 1.3 Wave32 subgroup arithmetic control is unavailable on '{}'",
+                self.device_info.name
+            )));
+        }
+        if measured_iters == 0 {
+            return Err(ForgeError::InvalidDimension(
+                "measured_iters must be > 0".to_string(),
+            ));
+        }
+
+        let n_blocks = k / (Q4_K_BLOCK_SIZE as u32);
+        let total_blocks = (n as usize)
+            .checked_mul(n_blocks as usize)
+            .ok_or_else(|| ForgeError::InvalidDimension("Q4_K block count overflow".to_string()))?;
+        let expected_w_len = total_blocks
+            .checked_mul(Q4_K_BLOCK_U32S)
+            .ok_or_else(|| ForgeError::InvalidDimension("Q4_K word count overflow".to_string()))?;
+        if w_q4k.len() != expected_w_len || x.len() != k as usize {
+            return Err(ForgeError::InvalidDimension(format!(
+                "Q4_K GEMV buffer mismatch: got w_words={}, x={}, expected ({expected_w_len}, {k})",
+                w_q4k.len(),
+                x.len()
+            )));
+        }
+
+        let bytes_w = (w_q4k.len() as u64) * 4;
+        let bytes_x = (x.len() as u64) * 4;
+        let bytes_y = (n as u64) * 4;
+        let max_buf = bytes_w.max(bytes_x).max(bytes_y);
+        let total_vram = bytes_w.saturating_add(bytes_x).saturating_add(bytes_y);
+
+        validate_kernel_execution(
+            &self.device_info,
+            &KernelRequirements {
+                required_vram_bytes: total_vram,
+                max_single_buffer_bytes: max_buf,
+                ..Default::default()
+            },
+        )?;
+
+        let spirv = compile_wgsl_to_spirv_subgroup(GEMV_Q4_K_WAVE32_WGSL)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 3, true, Some(32))?;
+
+        let buf_w = self.upload_device_local_slice(w_q4k)?;
+        let buf_x = self.upload_device_local_slice(x)?;
+        let buf_y = self.create_device_local_buffer(bytes_y)?;
+        let params = GemvParams {
+            n,
+            inner_blocks: n_blocks,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let ubo = self.create_uniform_buffer(&params)?;
+
+        self.bind_buffers(&pipeline, &[&buf_w, &buf_x, &buf_y], Some(&ubo));
+
+        let gx = n.div_ceil(4);
+        let timings = self.execute_timed_loop(
+            &pipeline,
+            gx,
+            1,
+            1,
+            warmup_iters,
+            measured_iters,
+            dispatches_per_submit,
+        )?;
+        let out = self.download_device_local_vec::<f32>(&buf_y, n as usize)?;
+
+        Ok((out, timings))
+    }
+
+    /// Executes tiled Wave32 FlashAttention once and returns output `[total_heads, seq_len, head_dim]` plus timing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_flash_attention_f32_wave32(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        total_heads: u32,
+        seq_len: u32,
+        head_dim: u32,
+        causal: bool,
+        scale: f32,
+    ) -> ForgeResult<(Vec<f32>, GpuTiming)> {
+        let (out, mut timings) = self.bench_flash_attention_f32_wave32(
+            q,
+            k,
+            v,
+            total_heads,
+            seq_len,
+            head_dim,
+            causal,
+            scale,
+            0,
+            1,
+        )?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed(
+                "missing Wave32 FlashAttention timing measurement".to_string(),
+            )
+        })?;
+        Ok((out, timing))
+    }
+
+    /// Benchmarks tiled Wave32 FlashAttention (1 dispatch per submit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_flash_attention_f32_wave32(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        total_heads: u32,
+        seq_len: u32,
+        head_dim: u32,
+        causal: bool,
+        scale: f32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_flash_attention_f32_wave32_batched(
+            q,
+            k,
+            v,
+            total_heads,
+            seq_len,
+            head_dim,
+            causal,
+            scale,
+            warmup_iters,
+            measured_iters,
+            1,
+        )
+    }
+
+    /// Benchmarks tiled Wave32 FlashAttention with `dispatches_per_submit` batched dispatches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_flash_attention_f32_wave32_batched(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        total_heads: u32,
+        seq_len: u32,
+        head_dim: u32,
+        causal: bool,
+        scale: f32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        validate_batch_dispatches(dispatches_per_submit)?;
+        if total_heads == 0 || seq_len == 0 || head_dim == 0 || head_dim > 128 {
+            return Err(ForgeError::InvalidDimension(format!(
+                "Wave32 FlashAttention requires non-zero dims and head_dim <= 128, got ({total_heads}, {seq_len}, {head_dim})"
+            )));
+        }
+        if !scale.is_finite() {
+            return Err(ForgeError::InvalidDimension(format!(
+                "attention scale must be finite, got {scale}"
+            )));
+        }
+        if !self.ctx.subgroup_arithmetic_enabled || !self.ctx.wave32_subgroup_control_enabled {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan 1.3 Wave32 subgroup arithmetic control is unavailable on '{}'",
+                self.device_info.name
+            )));
+        }
+        if let Some(smem) = self.device_info.vulkan_shared_memory_bytes {
+            if smem < 16384 {
+                return Err(ForgeError::UnsupportedCapability(format!(
+                    "FlashAttention requires 16 KiB Vulkan shared memory, device '{}' reports {smem} bytes",
+                    self.device_info.name
+                )));
+            }
+        }
+        if measured_iters == 0 {
+            return Err(ForgeError::InvalidDimension(
+                "measured_iters must be > 0".to_string(),
+            ));
+        }
+
+        let elems = (total_heads as usize)
+            .checked_mul(seq_len as usize)
+            .and_then(|v| v.checked_mul(head_dim as usize))
+            .ok_or_else(|| {
+                ForgeError::InvalidDimension("attention buffer size overflow".to_string())
+            })?;
+        if q.len() != elems || k.len() != elems || v.len() != elems {
+            return Err(ForgeError::InvalidDimension(format!(
+                "FlashAttention buffer mismatch: got q={}, k={}, v={}, expected {elems}",
+                q.len(),
+                k.len(),
+                v.len()
+            )));
+        }
+
+        let bytes_tensor = (elems as u64) * 4;
+        validate_kernel_execution(
+            &self.device_info,
+            &KernelRequirements {
+                required_vram_bytes: bytes_tensor.saturating_mul(4),
+                max_single_buffer_bytes: bytes_tensor,
+                ..Default::default()
+            },
+        )?;
+
+        let spirv = compile_wgsl_to_spirv_subgroup(FLASH_ATTENTION_F32_WAVE32_WGSL)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 4, true, Some(32))?;
+
+        let buf_q = self.upload_device_local_slice(q)?;
+        let buf_k = self.upload_device_local_slice(k)?;
+        let buf_v = self.upload_device_local_slice(v)?;
+        let buf_o = self.create_device_local_buffer(bytes_tensor)?;
+        let params = FlashAttnParams {
+            total_heads,
+            seq_len,
+            head_dim,
+            causal: u32::from(causal),
+            scale,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let ubo = self.create_uniform_buffer(&params)?;
+
+        self.bind_buffers(&pipeline, &[&buf_q, &buf_k, &buf_v, &buf_o], Some(&ubo));
+
+        let gx = seq_len.div_ceil(4);
+        let timings = self.execute_timed_loop(
+            &pipeline,
+            gx,
+            total_heads,
+            1,
+            warmup_iters,
+            measured_iters,
+            dispatches_per_submit,
+        )?;
+        let out = self.download_device_local_vec::<f32>(&buf_o, elems)?;
 
         Ok((out, timings))
     }
