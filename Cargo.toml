@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/forge-core",
     "crates/forge-device",
+    "crates/forge-profiler",
     "crates/forge-runtime",
     "crates/forge-benchmark",
     "apps/forge-cli",
@@ -37,5 +38,6 @@ windows-sys = { version = "0.61", features = [
 
 forge-core = { path = "crates/forge-core" }
 forge-device = { path = "crates/forge-device" }
+forge-profiler = { path = "crates/forge-profiler" }
 forge-runtime = { path = "crates/forge-runtime" }
 forge-benchmark = { path = "crates/forge-benchmark" }

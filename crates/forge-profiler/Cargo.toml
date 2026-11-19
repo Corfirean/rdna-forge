@@ -1,0 +1,12 @@
+[package]
+name = "forge-profiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+libloading.workspace = true
+serde.workspace = true
+tracing.workspace = true

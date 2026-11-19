@@ -247,6 +247,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-profiler"
+version = "0.1.0"
+dependencies = [
+ "forge-core",
+ "libloading 0.9.1",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "forge-runtime"
 version = "0.1.0"
 dependencies = [
