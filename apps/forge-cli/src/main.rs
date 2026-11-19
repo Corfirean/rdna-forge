@@ -20,6 +20,11 @@ use forge_runtime::{
     pack_i8_b_transposed_k4, pack_i8_row_major_k4, probe_all_backends, ref_gemm_f32_exact_f64,
     ref_gemm_i8_to_i32, ref_rmsnorm_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
 };
+mod monitor_tune;
+
+use monitor_tune::{
+    cmd_monitor, cmd_tune_power_limit, cmd_tune_reset, cmd_tune_show, MonitorArgs, TuneSubcommand,
+};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
@@ -42,6 +47,13 @@ enum Commands {
     Bench {
         #[command(subcommand)]
         target: BenchSubcommand,
+    },
+    /// Stream real-time ADLX GPU telemetry and WDDM VRAM alerts.
+    Monitor(MonitorArgs),
+    /// Inspect and safely adjust supported ADLX GPU tuning settings.
+    Tune {
+        #[command(subcommand)]
+        action: TuneSubcommand,
     },
     /// Inspect and validate hardware target profiles.
     Profile {
@@ -204,6 +216,21 @@ fn main() -> Result<()> {
             BenchSubcommand::Vulkan(args) => cmd_bench_vulkan(&args),
             BenchSubcommand::Llama(args) => cmd_bench_llama(&args),
             BenchSubcommand::Triton(args) => cmd_bench_triton(&args),
+        },
+        Commands::Monitor(args) => cmd_monitor(&args),
+        Commands::Tune { action } => match action {
+            TuneSubcommand::Show { device_id, json } => cmd_tune_show(device_id.as_deref(), json),
+            TuneSubcommand::PowerLimit {
+                limit_pct,
+                device_id,
+                apply,
+                json,
+            } => cmd_tune_power_limit(limit_pct, device_id.as_deref(), apply, json),
+            TuneSubcommand::Reset {
+                device_id,
+                apply,
+                json,
+            } => cmd_tune_reset(device_id.as_deref(), apply, json),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -878,10 +905,20 @@ fn fmt_opt_f64(val: Option<f64>, unit: &str) -> String {
 }
 
 fn print_telemetry_summary(label: &str, t: &TelemetrySummary) {
-    println!(
+    let mut stdout = std::io::stdout().lock();
+    let _ = print_telemetry_summary_to(&mut stdout, label, t);
+}
+
+pub(crate) fn print_telemetry_summary_to(
+    w: &mut dyn std::io::Write,
+    label: &str,
+    t: &TelemetrySummary,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "  {label}: {} ({} samples @ {} ms)",
         t.gpu_name, t.sample_count, t.interval_ms
-    );
+    )?;
     let mut parts = Vec::new();
     if let Some(ref m) = t.gpu_clock_mhz {
         parts.push(format!(
@@ -915,11 +952,12 @@ fn print_telemetry_summary(label: &str, t: &TelemetrySummary) {
         parts.push(format!("vram={:.0}-{:.0}{tot} MiB", m.min, m.max));
     }
     if !parts.is_empty() {
-        println!("    {}", parts.join(" | "));
+        writeln!(w, "    {}", parts.join(" | "))?;
     }
     for warn in &t.warnings {
-        println!("    WARNING: {warn}");
+        writeln!(w, "    WARNING: {warn}")?;
     }
+    Ok(())
 }
 
 fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {
@@ -981,9 +1019,56 @@ fn gib(bytes: u64) -> f64 {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use monitor_tune::MonitorFormat;
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_parses_negative_power_limit_and_monitor_formats() {
+        let neg = Cli::try_parse_from(["forge", "tune", "power-limit", "-5"])
+            .expect("negative power-limit must parse without '--'");
+        match neg.command {
+            Commands::Tune {
+                action:
+                    TuneSubcommand::PowerLimit {
+                        limit_pct,
+                        device_id,
+                        apply,
+                        json,
+                    },
+            } => {
+                assert_eq!(limit_pct, -5);
+                assert!(device_id.is_none());
+                assert!(!apply);
+                assert!(!json);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let mon = Cli::try_parse_from([
+            "forge",
+            "monitor",
+            "--format",
+            "jsonl",
+            "--count",
+            "3",
+            "--interval-ms",
+            "250",
+            "--device-id",
+            "0x73AF",
+        ])
+        .expect("monitor args must parse");
+        match mon.command {
+            Commands::Monitor(args) => {
+                assert_eq!(args.format, MonitorFormat::Jsonl);
+                assert_eq!(args.count, Some(3));
+                assert_eq!(args.interval_ms, 250);
+                assert_eq!(args.device_id.as_deref(), Some("0x73AF"));
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
     }
 }

@@ -224,6 +224,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
@@ -256,6 +257,7 @@ dependencies = [
  "forge-core",
  "libloading 0.9.1",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
