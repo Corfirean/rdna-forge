@@ -17,8 +17,9 @@ use forge_profiler::{
 };
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    pack_i8_b_transposed_k4, pack_i8_row_major_k4, probe_all_backends, ref_gemm_f32_exact_f64,
-    ref_gemm_i8_to_i32, ref_rmsnorm_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
+    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4, probe_all_backends,
+    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
+    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
 };
 mod monitor_tune;
 
@@ -91,8 +92,11 @@ enum KernelChoice {
     Gemm,
     GemmOpt,
     GemmI8,
+    GemvW8,
+    GemvQ4,
     Rmsnorm,
     Rope,
+    FusedRmsRope,
 }
 
 impl From<KernelChoice> for VulkanKernelSelection {
@@ -102,8 +106,11 @@ impl From<KernelChoice> for VulkanKernelSelection {
             KernelChoice::Gemm => Self::Gemm,
             KernelChoice::GemmOpt => Self::GemmOpt,
             KernelChoice::GemmI8 => Self::GemmI8,
+            KernelChoice::GemvW8 => Self::GemvW8,
+            KernelChoice::GemvQ4 => Self::GemvQ4,
             KernelChoice::Rmsnorm => Self::RmsNorm,
             KernelChoice::Rope => Self::Rope,
+            KernelChoice::FusedRmsRope => Self::FusedRmsRope,
         }
     }
 }
@@ -250,8 +257,11 @@ const VULKAN_VERIFY_CAPABILITIES: &[&str] = &[
     "GEMM (Vulkan FP32)",
     "GEMM (Vulkan FP32 tiled vec4)",
     "GEMM (Vulkan INT8 DP4A)",
+    "GEMV (Vulkan Wave32 W8A32)",
+    "GEMV (Vulkan Wave32 Q4_0)",
     "RMSNorm (Vulkan FP32)",
     "RoPE (Vulkan FP32)",
+    "Fused RMSNorm+RoPE (Vulkan Subgroup)",
 ];
 
 fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
@@ -305,6 +315,21 @@ fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cap_result(name: &str, res: Result<String>) -> CapabilityResult {
+    match res {
+        Ok(detail) => CapabilityResult {
+            name: name.to_string(),
+            status: SupportStatus::Verified,
+            detail: Some(detail),
+        },
+        Err(err) => CapabilityResult {
+            name: name.to_string(),
+            status: SupportStatus::Unsupported,
+            detail: Some(err.to_string()),
+        },
+    }
 }
 
 fn push_unsupported_vulkan_caps(results: &mut Vec<CapabilityResult>, reason: &str) {
@@ -496,6 +521,81 @@ fn run_live_capability_checks(gpus: &[GpuDeviceInfo]) -> Vec<CapabilityResult> {
                     detail: Some(err.to_string()),
                 },
             });
+
+            // GEMV Wave32 W8A32 (64x64)
+            let w8_res = (|| -> Result<String> {
+                let (n, k) = (64u32, 64u32);
+                let w_i8 = deterministic_i8_data((n * k) as usize, 61);
+                let w_packed = pack_i8_row_major_k4(&w_i8, n as usize, k as usize)?;
+                let scales = deterministic_f32_data(n as usize, 62);
+                let x = deterministic_f32_data(k as usize, 63);
+                let (actual, timing) =
+                    engine.run_gemv_w8a32_wave32(&w_packed, &scales, &x, n, k)?;
+                let expected = ref_gemv_w8a32_f32(&w_i8, &scales, &x, n as usize, k as usize)?;
+                let acc = compare_slices(&actual, &expected, 1e-3, 1e-4)?;
+                if !acc.passed {
+                    anyhow::bail!("numerical mismatch (max_abs_err={:.3e})", acc.max_abs_err);
+                }
+                Ok(format!(
+                    "64x64 passed (max_abs_err={:.2e}, {:.3} ms)",
+                    acc.max_abs_err,
+                    timing.gpu_ms.unwrap_or(timing.wall_ms)
+                ))
+            })();
+            results.push(cap_result("GEMV (Vulkan Wave32 W8A32)", w8_res));
+
+            // GEMV Wave32 Q4_0 (64x64)
+            let q4_res = (|| -> Result<String> {
+                let (n, k) = (64u32, 64u32);
+                let (w_q4, scales) = deterministic_q4_0_weights(n as usize, k as usize, 64)?;
+                let x = deterministic_f32_data(k as usize, 65);
+                let (actual, timing) = engine.run_gemv_q4_0_wave32(&w_q4, &scales, &x, n, k)?;
+                let expected = ref_gemv_q4_0_f32(&w_q4, &scales, &x, n as usize, k as usize)?;
+                let acc = compare_slices(&actual, &expected, 1e-3, 1e-4)?;
+                if !acc.passed {
+                    anyhow::bail!("numerical mismatch (max_abs_err={:.3e})", acc.max_abs_err);
+                }
+                Ok(format!(
+                    "64x64 passed (max_abs_err={:.2e}, {:.3} ms)",
+                    acc.max_abs_err,
+                    timing.gpu_ms.unwrap_or(timing.wall_ms)
+                ))
+            })();
+            results.push(cap_result("GEMV (Vulkan Wave32 Q4_0)", q4_res));
+
+            // Fused subgroup RMSNorm+RoPE (64x8x64, pos_offset=17)
+            let fused_res = (|| -> Result<String> {
+                let (seq, heads, dim, pos_offset) = (64u32, 8u32, 64u32, 17u32);
+                let cols = (heads * dim) as usize;
+                let x = deterministic_f32_data((seq as usize) * cols, 66);
+                let w = deterministic_f32_data(cols, 67);
+                let (actual, timing) = engine.run_rmsnorm_rope_f32_subgroup(
+                    &x, &w, seq, heads, dim, pos_offset, 1e-5, 10_000.0,
+                )?;
+                let expected = ref_rmsnorm_rope_f32(
+                    &x,
+                    &w,
+                    seq as usize,
+                    heads as usize,
+                    dim as usize,
+                    pos_offset as usize,
+                    1e-5,
+                    10_000.0,
+                )?;
+                let acc = compare_slices(&actual, &expected, 1e-4, 1e-4)?;
+                if !acc.passed {
+                    anyhow::bail!("numerical mismatch (max_abs_err={:.3e})", acc.max_abs_err);
+                }
+                Ok(format!(
+                    "64x8x64 passed (max_abs_err={:.2e}, {:.3} ms)",
+                    acc.max_abs_err,
+                    timing.gpu_ms.unwrap_or(timing.wall_ms)
+                ))
+            })();
+            results.push(cap_result(
+                "Fused RMSNorm+RoPE (Vulkan Subgroup)",
+                fused_res,
+            ));
         }
         Err(err) => push_unsupported_vulkan_caps(&mut results, &err.to_string()),
     }
