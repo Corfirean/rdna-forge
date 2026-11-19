@@ -7,8 +7,10 @@ pub mod verify;
 pub mod vulkan_compute;
 
 pub use amf::{
-    amf_surface_format_name, format_amf_version, probe_amf_capabilities, AmfAcceleration,
-    AmfCapabilitiesReport, AmfCodecCapability, AmfCodecDirection,
+    amf_surface_format_name, format_amf_version, has_annex_b_start_code, probe_amf_capabilities,
+    run_amf_encode_benchmark, AmfAcceleration, AmfCapabilitiesReport, AmfCodecCapability,
+    AmfCodecDirection, AmfEncodeBenchConfig, AmfEncodeBenchResult, AmfEncodeCodec,
+    AmfQualityPreset, AmfVariantStruct,
 };
 pub use hip_verify::{verify_hip_transfer, HipVerificationResult};
 pub use probe::probe_all_backends;
@@ -343,5 +345,80 @@ mod tests {
         let o_full = ref_flash_attention_f32(&q, &k, &v, 1, 2, 2, false, 1.0).unwrap();
         assert!((o_full[0] - (w1 * 2.0 + w0 * 5.0)).abs() < 1e-5);
         assert!((o_full[1] - (w1 * 3.0 + w0 * 7.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn amf_variant_struct_layout_and_annex_b_detector_work() {
+        assert_eq!(std::mem::size_of::<AmfVariantStruct>(), 24);
+        assert_eq!(std::mem::align_of::<AmfVariantStruct>(), 8);
+
+        let v_i64 = AmfVariantStruct::from_i64(12_000_000);
+        assert_eq!(v_i64.ty, AmfVariantStruct::TYPE_INT64);
+        assert_eq!(v_i64.data0, 12_000_000);
+        assert_eq!(v_i64.data1, 0);
+
+        let v_size = AmfVariantStruct::from_size(1920, 1080);
+        assert_eq!(v_size.ty, AmfVariantStruct::TYPE_SIZE);
+        assert_eq!((v_size.data0 & 0xffff_ffff) as i32, 1920);
+        assert_eq!(((v_size.data0 >> 32) & 0xffff_ffff) as i32, 1080);
+
+        let v_rate = AmfVariantStruct::from_rate(60, 1);
+        assert_eq!(v_rate.ty, AmfVariantStruct::TYPE_RATE);
+        assert_eq!((v_rate.data0 & 0xffff_ffff) as u32, 60);
+        assert_eq!(((v_rate.data0 >> 32) & 0xffff_ffff) as u32, 1);
+
+        assert!(has_annex_b_start_code(&[
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64
+        ]));
+        assert!(has_annex_b_start_code(&[0x00, 0x00, 0x01, 0x40, 0x01]));
+        assert!(!has_annex_b_start_code(&[0x01, 0x02, 0x03, 0x04]));
+        assert!(!has_annex_b_start_code(&[]));
+    }
+
+    #[test]
+    fn amf_encode_config_validation_rejects_invalid_params() {
+        let valid = AmfEncodeBenchConfig {
+            codec: AmfEncodeCodec::H264Avc,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            target_bitrate_bps: 12_000_000,
+            preset: AmfQualityPreset::Speed,
+            warmup_frames: 15,
+            measured_frames: 120,
+        };
+        assert!(valid.validate().is_ok());
+
+        // Odd width
+        assert!(AmfEncodeBenchConfig {
+            width: 1921,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err());
+
+        // Odd height
+        assert!(AmfEncodeBenchConfig {
+            height: 1081,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err());
+
+        // Zero FPS
+        assert!(AmfEncodeBenchConfig {
+            fps: 0,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err());
+
+        // Zero measured frames
+        assert!(AmfEncodeBenchConfig {
+            measured_frames: 0,
+            ..valid
+        }
+        .validate()
+        .is_err());
     }
 }
