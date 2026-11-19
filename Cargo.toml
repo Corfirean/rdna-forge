@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/forge-core",
     "crates/forge-device",
+    "crates/forge-runtime",
 ]
 
 [workspace.package]
