@@ -5,9 +5,9 @@
 RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contributors on Windows 11 accurately detect `gfx` targets, audit broken vs working compute backends, and measure kernels and LLM inference against strict numerical correctness and statistical standards—starting with RDNA2 (`gfx1030`, RX 6900 XT).
 
 ### What Works Today
-- **Multi-source Windows GPU & runtime diagnostics (`forge doctor`)**: Correlates `RtlGetVersion`, Windows Display Registry (`qwMemorySize`, Adrenalin version), Vulkan (`ash`), AMD HIP (`amdhip64_*.dll` `R0600` ABI), ADLX (`amdadlx64.dll`), and Python ROCm/`triton-windows` without relying on broken 32-bit WMI VRAM fields.
-- **Live GPU capability verification (`forge doctor --verify`)**: Executes bit-exact HIP 4 MiB H2D/D2H transfers and pure-Rust WGSL->SPIR-V (`naga`) Vulkan compute kernels (`GEMM`, `RMSNorm`, `RoPE`) validated against FP64 CPU references.
-- **Reproducible benchmark harnesses (`forge bench`)**: Statistical median/IQR/MAD/p95 timing + numerical accuracy + peak memory across Vulkan compute, PyTorch ROCm + `triton-windows`, and `llama.cpp` (`Vulkan` vs `ROCm/HIP`).
+- **Multi-source Windows GPU, runtime & live ADLX telemetry (`forge doctor`)**: Correlates `RtlGetVersion`, Windows Display Registry (`qwMemorySize`, Adrenalin version), Vulkan (`ash`), AMD HIP (`amdhip64_*.dll` `R0600` ABI), Python ROCm/`triton-windows`, and live ADLX telemetry (`forge-profiler` dynamically loading `amdadlx64.dll`: clocks, temperatures/hotspot, power, fan RPM, voltage, and WDDM VRAM pressure warnings).
+- **Live GPU capability verification (`forge doctor --verify`)**: Executes bit-exact HIP 4 MiB H2D/D2H transfers and pure-Rust WGSL->SPIR-V (`naga`) Vulkan compute kernels (baseline FP32 GEMM, register-blocked `128x64 vec4` FP32 GEMM, `OpSDot` INT8 DP4A GEMM, RMSNorm, RoPE) validated against exact FP64/`i64` CPU references.
+- **Reproducible benchmark harnesses (`forge bench`)**: Statistical median/IQR/MAD/p95 timing + numerical accuracy + peak RSS + ADLX telemetry across Vulkan compute (`--kernel all|gemm|gemm-opt|gemm-i8|rmsnorm|rope`), PyTorch ROCm + `triton-windows` (`--smoke`, opt-in `--telemetry`), and `llama.cpp` (`--flash-attn`, `--hip-disable-graphs`).
 
 ### Currently Verified Hardware
 - **Primary verified target**: AMD Radeon RX 6900 XT (`gfx1030`, RDNA2, 16 GiB VRAM) on Windows 11 Build `26300` with Adrenalin `26.11.2`.
@@ -22,7 +22,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 1 complete (`Forge Core`, `forge doctor`, live Vulkan/HIP verification, and reproducible Vulkan, PyTorch/Triton, and `llama.cpp` baselines verified on RX 6900 XT).
+**Current Project Status:** Milestone 2 complete (`forge-profiler` ADLX live telemetry + WDDM contention alerts, `9.50x` faster Vulkan FP32 GEMM via register-blocked `vec4`, `30.29 TOPS` bit-exact INT8 `OpSDot` GEMM, `llama.cpp` Windows WDDM root-cause diagnosis & clean back-to-back comparison, and `256x256` smoke-verified Triton W8A16/W4A16/fused/causal kernels).
 
 ---
 
@@ -44,10 +44,9 @@ RDNA Forge provides an evidence-driven engineering foundation before building cu
 | **Vulkan Compute** (`ash` + `naga`) | API `1.4.315` / Loader `1.4.309` | **Verified** | Zero external SDK needed (`naga` compiles WGSL->SPIR-V in Rust) |
 | **AMD HIP Driver DLL** (`amdhip64_6.dll`) | HIP `6.4.50101` (`10.0.3652.0`) | **Partially verified** | Ships with Adrenalin `26.11.2`; `hipMalloc`/`hipMemcpy`/events work; SDK compiler absent unless TheRock installed |
 | **ROCm / TheRock + PyTorch** | `rocm==10.2.0`, `torch==2.15.0+rocm10.2.0` | **Verified** (FP32/FP16) / **Unsupported** (INT8, Flash SDPA) | `torch._int_mm` fails (`hipBLASLt` excludes `gfx10XX`); Flash/Efficient SDPA unavailable |
-| **Triton (`triton-windows`)** | `3.9.0.post30` | **Partially verified** | Community RDNA2 support (`triton-windows#41`); FP16 GEMM, RMSNorm, RoPE, tiled Attention verified |
-| **llama.cpp (`Vulkan`)** | `b12532` | **Verified** | Runs out of the box; `213.17 tok/s` `tg128` on Qwen2.5-1.5B Q4_K_M |
-| **llama.cpp (`ROCm/HIP`)** | `b12532` (`rocm-10.0`) | **Partially verified** | Zip omits `hipblas.dll`/`rocblas.dll` (requires ROCm `bin` on `PATH`); `53.71 tok/s` `tg128` |
-| **ADLX** (`amdadlx64.dll`) | `1.4.1.122` | **Verified** (version probe) | Dynamically loaded at runtime without vendoring proprietary SDK headers |
+| **Triton (`triton-windows`)** | `3.9.0.post30` | **Partially verified** | Community RDNA2 support (`triton-windows#41`); M1 suite verified; M2 W8A16/W4A16/swizzled/fused/causal kernels verified in `--smoke` mode (full-size stress omitted due to host `Kernel-Power 41` resets) |
+| **llama.cpp (`Vulkan` & `ROCm`)** | `b12532` (`rocm-10.0`) | **Verified** (Vulkan) / **Partially verified** (ROCm) | Uncontended `ROCm0`: `7369.46` `pp512` / `233.50` `tg128` (`Vulkan0`: `5227.71` / `240.21` default, `6211.14` `pp512` with `-fa 0`); ROCm drops 4.3x to `53.71` under WDDM VRAM contention |
+| **ADLX** (`amdadlx64.dll`) | `1.4.1.122` (`V1.4` COM) | **Verified** (live telemetry) | Pure-Rust COM vtable sampling for clocks, temps, power, fan, voltage, and WDDM VRAM occupancy without vendoring proprietary SDK headers |
 | **DirectML** / **AMF** | `DirectML.dll` / `amfrt64.dll` | **Partially verified** | Present in Windows `System32`; DirectML is in upstream maintenance mode |
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete 11-repository upstream feasibility audit, licenses, and technical blockers.
@@ -70,10 +69,10 @@ cargo build --release -p forge-cli
 cargo test --workspace
 ```
 
-Run live GPU correctness tests on physical AMD hardware:
+Run live GPU correctness tests serially on physical AMD hardware:
 
 ```powershell
-cargo test --workspace -- --ignored --nocapture
+cargo test --workspace -- --ignored --test-threads=1 --nocapture
 ```
 
 ---
@@ -141,25 +140,25 @@ Machine-readable output is supported via `forge doctor --json` and `--output <pa
 
 ---
 
-## 6. Benchmark Methodology & Verified Baseline Summary
+## 6. Verified Benchmark Summary (`gfx1030`, RX 6900 XT)
 
-All benchmarks use explicit warmups (`10` kernel / `1` `llama-bench` warmup), repeated runs (`50` kernel / `5` `llama-bench` reps), median and dispersion (`min`, `p95`, `IQR`, `MAD`, `stddev`), and CPU FP64/FP32 accuracy verification.
+All benchmarks use warmups, repeated runs, median and dispersion (`min`, `p95`, `IQR`, `MAD`, `stddev`), and CPU FP64/FP32/`i64` verification.
 
-| Workload | Backend | Shape / Model | Median Latency | Median Throughput | Status |
+| Workload | Backend | Shape / Model | Median Latency | Median Throughput | Notes / Status |
 | :--- | :--- | :--- | ---: | ---: | :--- |
-| GEMM FP32 (baseline WGSL) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | 12.743 ms | 1348.18 GFLOP/s | Verified |
+| GEMM FP32 (baseline vs `tiled_vec4`) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | 11.990 ms vs **1.262 ms** | 1432.90 vs **13610.84 GFLOP/s** | Verified (**9.50x speedup**, `max_abs=9.54e-5`) |
+| GEMM INT8 (`dot4I8Packed` -> `OpSDot`) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | **0.567 ms** | **30.29 TOPS** | Verified (**bit-exact**, `max_abs=0`) |
 | GEMM FP32 (`rocBLAS`) | PyTorch ROCm 10.2 | `2048x2048x2048` | 0.828 ms | 20.75 TFLOP/s | Verified |
 | GEMM FP16 (`rocBLAS`) | PyTorch ROCm 10.2 | `4096x4096x4096` | 3.975 ms | 34.58 TFLOP/s | Verified |
 | GEMM FP16 (Triton) | `triton-windows` 3.9 | `2048x2048x2048` | 0.884 ms | 19.43 TFLOP/s | Verified |
-| GEMM INT8 (`torch._int_mm`) | PyTorch / `hipBLASLt` | `2048x2048x2048` | — | — | Unsupported (`gfx1030`) |
+| GEMM INT8 (`torch._int_mm`) vs Triton `W8A16`/`W4A16` | `hipBLASLt` vs `triton-windows` | `256^3` smoke (`W8/W4`) | — | — | `_int_mm` **Unsupported** (`gfx1030`); Triton `W8A16`/`W4A16` **Smoke-verified** (`passed=true`) |
 | RMSNorm FP16 | PyTorch eager vs Triton | `4096x4096` | 1.038 ms vs **0.093 ms** | 64.66 vs **723.24 GB/s** | Verified (11.2x Triton speedup) |
 | RoPE FP16 | PyTorch eager vs Triton | `1x2048x32x128` | 0.589 ms vs **0.082 ms** | 56.94 vs **411.21 GB/s** | Verified (7.2x Triton speedup) |
-| Attention FP16 (Flash/Efficient SDPA) | PyTorch SDPA | `1x16x1024x128` | — | — | Unsupported (No kernel) |
-| Attention FP16 (Tiled Triton) | `triton-windows` 3.9 | `1x16x1024x64` | 0.657 ms | 6.54 TFLOP/s | Verified |
-| LLM Prefill (`pp512`) | `llama.cpp` `b12532` Vulkan vs ROCm | Qwen2.5-1.5B Q4_K_M | 107.01 ms vs 139.27 ms | **4784.47** vs 3676.34 tok/s | Verified |
-| LLM Decode (`tg128`) | `llama.cpp` `b12532` Vulkan vs ROCm | Qwen2.5-1.5B Q4_K_M | 600.47 ms vs 2383.07 ms | **213.17** vs 53.71 tok/s | Verified (Vulkan 3.97x faster) |
+| Attention FP16 (Tiled Triton) | `triton-windows` 3.9 | `1x16x1024x64` | 0.657 ms | 6.54 TFLOP/s | Verified (Flash/Efficient SDPA unavailable); causal smoke uses 70x less VRAM than Math SDPA |
+| LLM Prefill (`pp512`, uncontended) | `llama.cpp` `b12532` ROCm vs Vulkan | Qwen2.5-1.5B Q4_K_M | **69.48 ms** vs 97.94 ms | **7369.46** vs 5227.71 tok/s | Verified (**ROCm +41.0% faster** prefill; Vulkan `-fa 0`: `6211.14 tok/s`) |
+| LLM Decode (`tg128`, uncontended) | `llama.cpp` `b12532` Vulkan vs ROCm | Qwen2.5-1.5B Q4_K_M | **532.87 ms** vs 548.17 ms | **240.21** vs 233.50 tok/s | Verified (note: ROCm drops to `53.71 tok/s` under WDDM VRAM contention) |
 
-Full dispersion metrics, VRAM/RSS usage, model SHA-256, stability results (`50/50` Vulkan, `100/100` Triton), and exact reproduction steps are in [BENCHMARKS.md](BENCHMARKS.md).
+Full dispersion metrics, WDDM VRAM diagnosis, ADLX telemetry, model SHA-256, and reproduction steps are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -169,8 +168,9 @@ RDNA Forge separates Rust orchestration and safety policy from GPU compute backe
 
 - [`crates/forge-core`](crates/forge-core): Target parser (`GfxTarget`), PCI ID table, capability policy, hardware profile schema ([rx6900xt.toml](profiles/gfx1030/rx6900xt.toml)).
 - [`crates/forge-device`](crates/forge-device): Windows OS, Registry, Vulkan (`ash`), HIP `R0600` ABI, and dynamic ADLX device correlation.
-- [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine, FP64 CPU references, HIP transfer verifier.
-- [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, and `llama-bench` / Triton adapters.
+- [`crates/forge-profiler`](crates/forge-profiler): Dynamic ADLX `V1.4` COM telemetry sampler (clocks, temps, power, fan, voltage, WDDM VRAM contention checks).
+- [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine (`gemm_f32_tiled_vec4`, `gemm_i8_dp4a`), FP64/`i64` CPU references, HIP transfer verifier.
+- [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, ADLX telemetry integration, and `llama-bench` / Triton adapters.
 - [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `bench`, `profile`).
 - [`modules/ai/triton`](modules/ai/triton): Reproducible PyTorch ROCm + Triton kernel suite.
 
@@ -181,11 +181,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
 ## 8. Project Roadmap
 
 - **Milestone 1 (Complete):** Feasibility audit, clean repository foundation, multi-source Windows discovery, `forge doctor [--verify]`, Vulkan/PyTorch/Triton/`llama.cpp` baseline harness, and RX 6900 XT verification.
-- **Milestone 2 (Proposed Next):**
-  - Profile and diagnose the `3.97x` `llama.cpp` Windows WDDM `ROCm0` vs `Vulkan0` `tg128` decode gap.
-  - Add optimized Vulkan subgroup/coop-matrix GEMM & DP4A quantized dot-product shaders plus Triton fused RMSNorm+RoPE / FlashAttention tuning for `gfx1030`.
-  - Add live ADLX power/clock/temperature sampling (`forge-profiler` / `forge-tuning`) during benchmark runs.
-- **Future (Deferred Until Core Compute & Tuning Mature):** Hardware video pipelines (`AMF`), FidelityFX graphics research, optional Tauri desktop UI, Linux support.
+- **Milestone 2 (Complete):**
+  - Diagnosed `llama.cpp` `ROCm0` decode gap (`hipMemGetInfo` blindness to non-HIP Windows WDDM VRAM pressure vs `7369` `pp512` / `233.5` `tg128` uncontended, HIP graphs confirmed active).
+  - Implemented `forge-profiler` dynamic ADLX `V1.4` COM telemetry with automated WDDM VRAM pressure alerts.
+  - Added register-blocked `gemm_f32_tiled_vec4` (**9.50x** Vulkan speedup to `13.61 TFLOP/s`) and native `OpSDot` INT8 DP4A (`30.29 TOPS`, bit-exact) compute shaders.
+  - Added smoke-verified `gfx1030` Triton `W8A16`, `W4A16`, L2-swizzled FP16 GEMM, fused `RMSNorm+RoPE`, and causal FlashAttention kernels.
+- **Future:** Full power-budget isolation for high-TDP ROCm/Triton sweeps, hardware video pipelines (`AMF`), FidelityFX SDK evaluation, optional Tauri desktop UI, Linux support.
 
 ---
 

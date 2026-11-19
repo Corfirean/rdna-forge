@@ -105,25 +105,86 @@ Empirical observations:
 
 ---
 
-## 6. Reproduction Commands
+## 6. Milestone 2 Optimizations & Root-Cause Findings (Verified on RX 6900 XT)
+
+### 6.1 Vulkan Compute (`gemm_f32_tiled_vec4` & INT8 `DP4A` `OpSDot`)
+
+Measured on AMD Radeon RX 6900 XT (`gfx1030`, Adrenalin `26.11.2`, Vulkan `1.4.315`), `forge bench vulkan --size 2048 --warmup 5 --iters 20 --stability-runs 0`:
+
+| Kernel | Backend / Shader Strategy | Shape | Dtype | Median (ms) | Min / P95 (ms) | IQR / MAD (ms) | Median Throughput | Speedup vs Baseline | Max Abs Err | RMSE | Accuracy |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `gemm_f32_baseline_2048` | Naive `16x16` LDS tile | `2048x2048x2048` | `f32` | 11.990 | 11.764 / 12.197 | 0.398 / 0.208 | 1432.90 GFLOP/s | 1.00x | 9.54e-5 | 1.21e-5 | Pass |
+| `gemm_f32_tiled_vec4_2048` | `128x64x16` tile, `8x4` reg block (`vec4` FMA, bank-padded LDS) | `2048x2048x2048` | `f32` | **1.262** | 1.256 / 1.286 | 0.008 / 0.004 | **13610.84 GFLOP/s** | **9.50x** | 9.54e-5 | 1.21e-5 | Pass |
+| `gemm_i8_dp4a_2048` | SPIR-V 1.6 `OpSDot` (`dot4I8Packed` / `V_DOT4_I32_I8`), `64x64x64` | `2048x2048x2048` | `i8->i32` | **0.567** | 0.519 / 1.485 | 0.130 / 0.026 | **30.29 TOPS** | — (INT8) | **0.00e0** | **0.00e0** | Pass (Bit-Exact) |
+
+- **Live ADLX Telemetry Captured During Run**: `13` samples @ `100 ms` — `VRAMClk=1978 MHz`, `Temp=42.0 C` (`42.0-43.0 C`), `Hotspot=48.0 C` (`max 49.0 C`), `Power=39.0 W` (`max 46.0 W`), `VRAM=14473-14537/16368 MiB` (automatic warning emitted by `forge-profiler` for `88.8%` WDDM VRAM occupancy from pre-existing desktop/compute allocations).
+
+---
+
+### 6.2 `llama.cpp` (`b12532`) Windows WDDM Decode Root Cause & Clean Back-to-Back Comparison
+
+#### Root Cause of Milestone 1's `53.71 tok/s` `ROCm0` Decode Outlier
+Diagnostic testing (`llama-bench` `-fa 0/1`, `GGML_CUDA_DISABLE_GRAPHS=1`, `HIP_VISIBLE_DEVICES=0`, ADLX `IADLXGPUMetrics::GPUVRAM`, and Windows `\GPU Process Memory(*)\Dedicated Usage`) established why Milestone 1 recorded `ROCm0 tg128 = 53.71 tok/s`:
+1. **`hipMemGetInfo` blindness to non-HIP WDDM VRAM on Windows**: During the contention window, `llama-bench` (`ggml_cuda_init`) reported `16227 MiB free` via HIP, while ADLX `GPUVRAM` (`14330–14470 MiB`, `88%`) and Windows Performance Counters showed `~12.4 GiB` of dedicated VRAM already held by another desktop/compute process.
+2. **Silent WDDM oversubscription / host-memory paging**: With insufficient contiguous physical VRAM remaining, HIP allocations migrated into WDDM shared system memory without failing initialization, collapsing `tg128` memory-bandwidth-bound decode from `233.5 tok/s` to `53.71 tok/s` (`4.3x` penalty).
+3. **`forge-profiler` Mitigation**: RDNA Forge's ADLX telemetry layer automatically flags >50% dedicated VRAM occupancy prior to benchmark runs so WDDM eviction artifacts are caught immediately.
+
+#### Clean Back-to-Back Comparison & Flag Sensitivity (`Qwen2.5-1.5B-Instruct-Q4_K_M`, `-p 512 -n 128 -r 3 -ngl 99`)
+
+| Comparison Run | Backend / Config | Test | Throughput (tok/s) | Notes |
+| :--- | :--- | :--- | ---: | :--- |
+| Clean `forge bench llama` (default `-fa`) | `Vulkan0` | `pp512` | 5227.71 median (`97.94 ms`) | `stddev=68.78` |
+| Clean `forge bench llama` (default `-fa`) | `Vulkan0` | `tg128` | **240.21** median (`532.87 ms`) | `stddev=2.17` |
+| Clean `forge bench llama` (default `-fa`) | `ROCm0` | `pp512` | **7369.46** median (`69.48 ms`) | **+41.0% faster** prefill vs `Vulkan0` |
+| Clean `forge bench llama` (default `-fa`) | `ROCm0` | `tg128` | 233.50 median (`548.17 ms`) | `stddev=0.20` |
+| Direct `llama-bench` (`Vulkan0`, `-fa 0` vs `1`) | `Vulkan0` (`-fa 0` / `-fa 1`) | `pp512` | **6211.14** / 5198.30 (avg) | `-fa 0` yields +19.5% faster prefill on `Vulkan0` |
+| Direct `llama-bench` (`Vulkan0`, `-fa 0` vs `1`) | `Vulkan0` (`-fa 0` / `-fa 1`) | `tg128` | 236.55 / **239.15** (avg) | Decode virtually unchanged (~1%) |
+| Direct `llama-bench` (`ROCm0`, `HIP_VISIBLE_DEVICES=0`) | `ROCm0` (`-fa 0` / `-fa 1`) | `pp512` | 6630.27 / **7352.69** (avg) | `-fa 1` improves `ROCm0` prefill by +10.9% |
+| Direct `llama-bench` (`ROCm0`, `HIP_VISIBLE_DEVICES=0`) | `ROCm0` (`-fa 0` / `-fa 1`) | `tg128` | 223.29 / **234.72** (avg) | `-fa 1` improves `ROCm0` decode by +5.1% |
+| `GGML_CUDA_DISABLE_GRAPHS=1` (`HIP_VISIBLE_DEVICES=0`, `-fa 1`) | `ROCm0` (graphs OFF) | `tg128` | 228.78 ± 1.74 (avg) | Confirms HIP graphs ARE active on Windows (+2.6% decode vs disabled) |
+
+---
+
+### 6.3 Milestone 2 Triton Kernels & Hardware Stability Constraint
+
+Five new `gfx1030` Triton kernels were added to `modules/ai/triton/bench_suite.py` and correctness-verified on physical RX 6900 XT hardware via `python modules/ai/triton/bench_suite.py --smoke` (`0` warmup, `1` measured iteration, conservative `BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_stages=1, num_warps=4` geometry):
+
+| Kernel | Shape | Dtype | Smoke Verification Status | Max Abs Err | RMSE | Peak VRAM Alloc | Reference & Purpose |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: | :--- |
+| `triton_gemm_f16_swizzled_256` | `256x256x256` | `f16` | **Verified** | 1.56e-2 | 3.32e-3 | 384 KiB | L2/Infinity-Cache `GROUP_SIZE_M=8` swizzled FP16 GEMM |
+| `triton_w8a16_gemm_256` | `256x256x256` | `f16xint8->f16` | **Verified** | 3.15e-2 | 4.55e-3 | 320.5 KiB | Per-channel INT8 weight-only dequant GEMM (fills `hipBLASLt` gap) |
+| `triton_w8a16_gemm_unaligned` | `259x131x261` | `f16xint8->f16` | **Verified** | 2.50e-2 | 3.18e-3 | — | Arbitrary bounds-masked W8A16 dequant GEMM |
+| `triton_w4a16_gemm_256` | `256x256x256` | `f16xint4->f16` | **Verified** | 9.00e-3 | 1.39e-3 | 290 KiB | Group-128 packed 4-bit `uint8` weight-only dequant GEMM |
+| `triton_fused_rmsnorm_rope_f16_256x8x128` | `256x8x128` | `f16` | **Verified** | 3.78e-3 | 1.99e-4 | 1.00 MiB | Single-pass RMSNorm + RoPE (vs PyTorch `4.63 MiB` / `2.65e-3` max err) |
+| `triton_causal_attention_f16_256` | `1x4x256x64` | `f16` | **Verified** | 9.94e-4 | 5.32e-5 | **512 KiB** | Causal tiled online-softmax FlashAttention (**70x** less VRAM than PyTorch SDPA's `35.38 MiB` / `9.71e-4` max err) |
+
+> [!WARNING]
+> **Observed Stability Limit on Full-Size ROCm/Triton Sweeps:** Full-size (`2048³` / `4096³`) consecutive Triton/ROCm benchmark sweeps triggered hard system resets (`Windows Kernel-Power Event ID 41, BugcheckCode = 0x0`, without BSOD or dump) on this Navi 21 host, consistent with high-TDP transient power spikes / PSU OCP or WDDM reset during back-to-back ROCm bursts. Accordingly, steady-state `2048³` throughput numbers for the Milestone 2 Triton kernels are **intentionally omitted** until verified on a power-limited or higher-headroom PSU configuration, and `forge bench triton` provides `--smoke` for safe low-power verification with ADLX telemetry opt-in (`--telemetry`).
+
+---
+
+## 7. Reproduction Commands
 
 ```powershell
 # 1. Build release CLI
 cargo build --release -p forge-cli
 
-# 2. Vulkan compute benchmark & stability check
-.\target\release\forge.exe bench vulkan --kernel all --warmup 10 --iters 50 --stability-runs 50 --output vulkan_bench.json
+# 2. Diagnostics + live ADLX telemetry + Vulkan/HIP verification
+.\target\release\forge.exe doctor --verify --python <venv>\Scripts\python.exe
 
-# 3. PyTorch ROCm 10.2 + triton-windows benchmark suite
-.\target\release\forge.exe bench triton --python <venv>\Scripts\python.exe --warmup 10 --iters 50 --output triton_bench.json
+# 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + stability)
+.\target\release\forge.exe bench vulkan --kernel all --warmup 5 --iters 20 --stability-runs 30 --output ..\vulkan_bench.json
 
-# 4. llama.cpp Vulkan vs ROCm/HIP comparison (ensure TheRock ROCm bin dirs are on PATH for HIP)
+# 4. Safe 256x256 Triton verification pass (smoke mode)
+.\target\release\forge.exe bench triton --python <venv>\Scripts\python.exe --smoke --output ..\triton_smoke.json
+
+# 5. llama.cpp Vulkan vs ROCm/HIP comparison (ensure TheRock ROCm bin dirs are on PATH for HIP)
 $env:PATH = "<venv>\Lib\site-packages\_rocm_sdk_libraries\bin;<venv>\Lib\site-packages\_rocm_sdk_core\bin;" + $env:PATH
 .\target\release\forge.exe bench llama `
   --model <models>\qwen2.5-1.5b-instruct-q4_k_m.gguf `
   --vulkan-bin <llama-vk>\llama-bench.exe `
   --hip-bin <llama-hip>\llama-bench.exe `
   --prompt-tokens 512 --gen-tokens 128 --reps 5 --ngl 99 `
-  --vulkan-device Vulkan0 --hip-device ROCm0 `
-  --output llama_bench.json
+  --vulkan-device Vulkan0 --hip-device ROCm0 --flash-attn 1 `
+  --output ..\llama_bench.json
 ```

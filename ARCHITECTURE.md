@@ -13,8 +13,9 @@ rdna-forge/
 ├── crates/
 │   ├── forge-core/       # Domain types, gfx target parser, profile schema, capability policy
 │   ├── forge-device/     # Windows OS, Registry, Vulkan, HIP ABI, and ADLX discovery
-│   ├── forge-runtime/    # Backend probing, naga WGSL->SPIR-V, RAII Vulkan compute, HIP transfer check
-│   └── forge-benchmark/  # Statistical harness, RSS memory tracking, Vulkan/Triton/llama-bench runners
+│   ├── forge-profiler/   # Dynamic ADLX COM telemetry sampler & WDDM VRAM pressure checks
+│   ├── forge-runtime/    # Backend probing, naga WGSL->SPIR-V (1.3/1.6), RAII Vulkan compute, HIP transfer check
+│   └── forge-benchmark/  # Statistical harness, RSS memory tracking, ADLX/Vulkan/Triton/llama-bench runners
 ├── modules/
 │   └── ai/triton/        # Reproducible PyTorch ROCm + Triton kernel suite (bench_suite.py)
 ├── profiles/
@@ -24,7 +25,7 @@ rdna-forge/
     └── gpu/              # Ignored live-GPU correctness and stability tests
 ```
 
-Crate dependency flow (`forge-cli` -> `forge-benchmark` -> `forge-runtime` -> `forge-device` -> `forge-core`). No circular dependencies exist.
+Crate dependency flow (`forge-cli` -> `forge-benchmark` -> {`forge-runtime`, `forge-profiler`} -> `forge-device` -> `forge-core`). No circular dependencies exist.
 
 ---
 
@@ -43,20 +44,24 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 3. **Vulkan (`vulkan.rs`)**: Loads `vulkan-1.dll` dynamically via `ash` and inspects `PhysicalDeviceProperties2` / `Features2`, `SubgroupProperties`, `Vulkan13Properties` (`maxBufferSize`), `CooperativeMatrixFeaturesKHR`, `ShaderCorePropertiesAMD`, `PCIBusInfoPropertiesEXT`, and memory heaps (identifying Resizable BAR via `DEVICE_LOCAL | HOST_VISIBLE` heap size).
 4. **HIP & ADLX (`hip.rs`, `adlx.rs`)**: Dynamically loads `amdhip64_7.dll` / `amdhip64_6.dll` / `amdhip64.dll` via `libloading` and reads `HipDevicePropR0600` (`1472` bytes, `gcnArchName` at offset `1160`, verified by ABI tests). Dynamically loads `amdadlx64.dll` and invokes `ADLXQueryVersion` (`const char**`) / `ADLXQueryFullVersion`.
 
+### `forge-profiler`
+- **`adlx_ffi`**: Pure-Rust `#[repr(C)]` COM vtable bindings matching ADLX `V1.4` C ABI (`IADLXSystem`, `IADLXGPUList`, `IADLXGPU`, `IADLXPerformanceMonitoringServices`, `IADLXGPUMetrics`), dynamically loading `amdadlx64.dll` via `libloading` without vendoring AMD SDK headers. Serializes process-global `ADLXInitialize`/`ADLXTerminate` lifecycle with a `Mutex<()>` and deterministically releases child COM pointers before `ADLXTerminate()`.
+- **`sampler` & `types`**: Exposes single-shot `snapshot_all_gpus()` / `snapshot_for_device()` plus background `TelemetryGuard` sampling (clock, VRAM clock, edge/hotspot temp, power, fan RPM, voltage, VRAM usage) and emits automatic Windows WDDM VRAM pressure (>50% dedicated VRAM) and competing-workload (>20% usage) warnings.
+
 ### `forge-runtime`
 - **`probe`**: Audits Vulkan, HIP driver vs ROCm SDK tools (`rocm-sdk`/`hipcc`), Python PyTorch ROCm + `triton-windows`, ADLX, DirectML (flagging maintenance mode), AMF, and `llama-bench`.
-- **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`) and compiles them offline/in-memory to SPIR-V 1.3 via pure-Rust `naga` (no `glslc` prerequisite).
-- **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device, queue, command pool, timestamp `QueryPool`, `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
-- **`reference`**: FP64-accumulated CPU reference implementations and `compare_slices` accuracy evaluator (`abs_tol + rel_tol * |expected|`, checking `is_finite()`).
+- **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `gemm_f32_tiled_vec4.wgsl`, `gemm_i8_dp4a.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`) and compiles them purely in Rust via `naga` to SPIR-V 1.3 or SPIR-V 1.6 (`OpSDot` / `V_DOT4_I32_I8` when `shader_integer_dot_product` is supported by the device).
+- **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::shader_integer_dot_product` when accelerated), queue, command pool, timestamp `QueryPool`, `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
+- **`reference`**: FP64-accumulated FP32 and exact `i64` INT8 CPU reference implementations plus `compare_slices` / `compare_i32_exact` evaluators and `k4` byte packing helpers.
 - **`hip_verify`**: RAII-guarded `hipMalloc` / `hipMemcpy` / `hipEvent*` 4 MiB bit-exact H2D+D2H verification against `amdhip64_*.dll`.
 
 ### `forge-benchmark`
 - **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs.
 - **`memory`**: Captures process peak working set via Win32 `GetProcessMemoryInfo`.
-- **`vulkan_suite`**, **`llama`**, **`triton`**: Orchestrates reproducible benchmarks and parses structured JSON from `llama-bench -o json` and `modules/ai/triton/bench_suite.py`.
+- **`vulkan_suite`**, **`llama`**, **`triton`**: Orchestrates reproducible benchmarks and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
 
 ### `forge-cli`
-Thin CLI boundary (`clap` + `anyhow`) exposing `forge doctor [--json] [--verify] [--python]`, `forge bench {vulkan,llama,triton}`, and `forge profile show`.
+Thin CLI boundary (`clap` + `anyhow`) exposing `forge doctor [--json] [--verify] [--python]`, `forge bench {vulkan,llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`, and `forge profile show`.
 
 ---
 
@@ -73,5 +78,5 @@ RDNA Forge keeps all core Rust crates MIT-licensed and avoids vendoring external
 
 The current architecture provides clean seams for future milestones without premature plugin abstractions:
 1. **HIP C++ / Composable Kernel modules** under `modules/ai/hip/` invoked through `forge-runtime` and benchmarked via `forge-benchmark`.
-2. **ADLX telemetry & tuning (`forge-tuning`)** expanding `forge-device::adlx` into clock, temperature, power, and fan sampling during benchmark runs.
+2. **FidelityFX & Hardware Video (`AMF`)** integration gated cleanly above `forge-device` / `forge-profiler`.
 3. **Subgroup / Cooperative Matrix Vulkan shaders** (`mul_mat` / quantized dot-product WGSL or GLSL/SPIR-V kernels) gated behind `GpuDeviceInfo` capability checks.
