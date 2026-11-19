@@ -23,7 +23,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 3B complete (Wave32 subgroup `W8A32` & `Q4_0` LLM decode GEMV kernels and single-pass fused `RMSNorm+RoPE` in pure Rust WGSL->SPIR-V), building on Milestone 3A (`forge monitor` + `forge tune` ADLX `V1.4` live telemetry/tuning) and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
+**Current Project Status:** Milestone 3C complete (batched Vulkan command buffer dispatches delivering **438–937 GB/s** on decode/elementwise kernels, plus pure-Rust dynamic AMD AMF `amfrt64.dll` hardware video codec probing via `forge video caps`), building on Milestone 3B (Wave32 subgroup `W8A32` & `Q4_0` LLM decode GEMV kernels and single-pass fused `RMSNorm+RoPE`), Milestone 3A (`forge monitor` + `forge tune` ADLX `V1.4` live telemetry/tuning), and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
 
 ---
 
@@ -48,7 +48,8 @@ RDNA Forge provides an evidence-driven engineering foundation before building cu
 | **Triton (`triton-windows`)** | `3.9.0.post30` | **Partially verified** | Community RDNA2 support (`triton-windows#41`); M1 suite verified; M2 W8A16/W4A16/swizzled/fused/causal kernels verified in `--smoke` mode (full-size stress omitted due to host `Kernel-Power 41` resets) |
 | **llama.cpp (`Vulkan` & `ROCm`)** | `b12532` (`rocm-10.0`) | **Verified** (Vulkan) / **Partially verified** (ROCm) | Uncontended `ROCm0`: `7369.46` `pp512` / `233.50` `tg128` (`Vulkan0`: `5227.71` / `240.21` default, `6211.14` `pp512` with `-fa 0`); ROCm drops 4.3x to `53.71` under WDDM VRAM contention |
 | **ADLX** (`amdadlx64.dll`) | `1.4.1.122` (`V1.4` COM) | **Verified** (telemetry + read-only tuning) | Pure-Rust COM vtables for live monitoring (`monitor`), tuning inspection (`tune show`), and range-validated dry-run power control without vendoring proprietary SDK headers |
-| **DirectML** / **AMF** | `DirectML.dll` / `amfrt64.dll` | **Partially verified** | Present in Windows `System32`; DirectML is in upstream maintenance mode |
+| **DirectML** | `DirectML.dll` | **Partially verified** | Present in Windows `System32`; upstream is in maintenance mode |
+| **AMF** (`amfrt64.dll`) | `1.4.37.0` (COM DX11 probe) | **Verified** (`2 HW enc / 5 HW dec`) | Pure-Rust COM vtable DX11 probe (`forge video caps`); H.264/HEVC enc + H.264/HEVC/VP9/AV1/MJPEG dec (AV1 enc unsupported on VCN 3.0) |
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete 11-repository upstream feasibility audit, licenses, and technical blockers.
 
@@ -126,7 +127,10 @@ BACKENDS
   ADLX: [VERIFIED] Detected (ADLX 1.4.1.122)
     - amdadlx64.dll dynamically loaded
   DirectML: [PARTIALLY VERIFIED] Present (DirectML.dll; upstream in maintenance mode)
-  AMF: [PARTIALLY VERIFIED] Detected (amfrt64.dll present)
+  AMF: [VERIFIED] Detected (AMF 1.4.37.0, 2 HW encoders / 5 HW decoders)
+    - amfrt64.dll DX11 probe OK; HW Encoders: [H.264/AVC, HEVC/H.265]
+    - HW Decoders: [H.264/AVC, HEVC/H.265, VP9, AV1, MJPEG]
+    - Unsupported: [AV1 Encode]
   llama.cpp: [NOT TESTED] Not in PATH (external binary)
 
 CAPABILITIES
@@ -137,9 +141,9 @@ CAPABILITIES
   RoPE (Vulkan FP32): VERIFIED (64x8x64 passed (max_abs_err=6.35e-6, 0.010 ms))
 ```
 
-Machine-readable output is supported via `forge doctor --json`, `forge tune show --json`, `forge monitor --format jsonl|csv --output <path>`, and `--output <path>` on benchmark commands.
+Machine-readable output is supported via `forge doctor --json`, `forge video caps --json`, `forge tune show --json`, `forge monitor --format jsonl|csv --output <path>`, and `--output <path>` on benchmark commands.
 
-### Live Monitor & ADLX Tuning (`forge monitor`, `forge tune`)
+### Live Monitor, Tuning & Video Capabilities (`forge monitor`, `forge tune`, `forge video`)
 
 ```powershell
 # Stream real-time telemetry (table, jsonl, or csv) with Ctrl+C graceful exit
@@ -150,6 +154,9 @@ Machine-readable output is supported via `forge doctor --json`, `forge tune show
 .\target\release\forge.exe tune power-limit 5
 # Pass --apply only when intentionally modifying GPU tuning:
 # .\target\release\forge.exe tune power-limit 5 --apply
+
+# Probe AMD AMF hardware video encode/decode codec support via DX11 COM
+.\target\release\forge.exe video caps
 ```
 
 ---
@@ -162,9 +169,9 @@ All benchmarks use warmups, repeated runs, median and dispersion (`min`, `p95`, 
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | GEMM FP32 (baseline vs `tiled_vec4`) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | 11.990 ms vs **1.262 ms** | 1432.90 vs **13610.84 GFLOP/s** | Verified (**9.50x speedup**, `max_abs=9.54e-5`) |
 | GEMM INT8 (`dot4I8Packed` -> `OpSDot`) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | **0.567 ms** | **30.29 TOPS** | Verified (**bit-exact**, `max_abs=0`) |
-| GEMV `W8A32` (Wave32 subgroup, 0 LDS) | Vulkan 1.3 Wave32 | `11008x4096` (`4096^2`) | **0.218 ms** (`0.124 ms`) | **207.35 GB/s** (`135.87 GB/s`) | Verified (`4.00x` wt compression, `max_abs=9.77e-4`) |
-| GEMV `Q4_0` (Wave32 subgroup, block-32) | Vulkan 1.3 Wave32 | `11008x4096` (`4096^2`) | **0.301 ms** (`0.089` min) | **93.97 GB/s** (`317.8` peak min) | Verified (`6.40x` wt compression, `max_abs=1.14e-5`) |
-| Fused `RMSNorm+RoPE` (single-pass Wave32) | Vulkan subgroup | `1024x32x128` | **0.120 ms** | **280.55 GB/s** | Verified (`IQR=0.001 ms`, eliminates HBM round-trip) |
+| GEMV `W8A32` (Wave32 subgroup, `batch=16`) | Vulkan 1.3 Wave32 | `11008x4096` (`4096^2`) | **0.054 ms** (`0.033 ms`) | **835.67 GB/s** (`512.41 GB/s`) | Verified (**4.03x** vs single `0.218 ms`, `4.00x` wt comp, `max_abs=9.77e-4`) |
+| GEMV `Q4_0` (Wave32 subgroup, `batch=16`) | Vulkan 1.3 Wave32 | `11008x4096` (`4096^2`) | **0.064 ms** (`0.030 ms`) | **438.74 GB/s** (`353.30 GB/s`) | Verified (**4.67x** vs single `0.301 ms`, `IQR=0.0003 ms`, `6.40x` wt comp) |
+| Fused `RMSNorm+RoPE` (`batch=16`) | Vulkan subgroup | `1024x32x128` | **0.036 ms** | **936.98 GB/s** | Verified (**3.34x** vs single `0.120 ms`, `IQR=0.0002 ms`) |
 | GEMM FP32 (`rocBLAS`) | PyTorch ROCm 10.2 | `2048x2048x2048` | 0.828 ms | 20.75 TFLOP/s | Verified |
 | GEMM FP16 (`rocBLAS`) | PyTorch ROCm 10.2 | `4096x4096x4096` | 3.975 ms | 34.58 TFLOP/s | Verified |
 | GEMM FP16 (Triton) | `triton-windows` 3.9 | `2048x2048x2048` | 0.884 ms | 19.43 TFLOP/s | Verified |
@@ -186,9 +193,9 @@ RDNA Forge separates Rust orchestration and safety policy from GPU compute backe
 - [`crates/forge-core`](crates/forge-core): Target parser (`GfxTarget`), PCI ID table, capability policy, hardware profile schema ([rx6900xt.toml](profiles/gfx1030/rx6900xt.toml)).
 - [`crates/forge-device`](crates/forge-device): Windows OS, Registry, Vulkan (`ash`), HIP `R0600` ABI, and dynamic ADLX device correlation.
 - [`crates/forge-profiler`](crates/forge-profiler): Dynamic ADLX `V1.4` COM telemetry & tuning (`IADLXGPUTuningServices`, clocks, temps, power, fan curves, WDDM VRAM contention checks).
-- [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine (`gemm_f32_tiled_vec4`, `gemm_i8_dp4a`), FP64/`i64` CPU references, HIP transfer verifier.
+- [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust dynamic AMF DX11 COM video capability probing (`amfrt64.dll`), pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine with multi-dispatch batching (`gemm_f32_tiled_vec4`, `gemm_i8_dp4a`, Wave32 `gemv_w8a32` & `gemv_q4_0`, `rmsnorm_rope_f32_subgroup`), FP64/`i64` CPU references, HIP transfer verifier.
 - [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, ADLX telemetry integration, and `llama-bench` / Triton adapters.
-- [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `monitor`, `tune`, `bench`, `profile`).
+- [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `video`, `monitor`, `tune`, `bench`, `profile`).
 - [`modules/ai/triton`](modules/ai/triton): Reproducible PyTorch ROCm + Triton kernel suite.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points.
@@ -209,7 +216,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
 - **Milestone 3B (Complete):**
   - Added Vulkan 1.3 `subgroup_size_control` (`required_subgroup_size = 32`, `REQUIRE_FULL_SUBGROUPS`) and SPIR-V `OpGroupNonUniformFAdd` subgroup compilation in `forge-runtime`.
   - Implemented and live-verified Wave32 `W8A32` GEMV (`207.35 GB/s` at `11008x4096`), `Q4_0` block-32 GEMV (`6.40x` compression, `0.089 ms` min / `93.97 GB/s` median), and single-pass fused `RMSNorm+RoPE` with KV-cache `pos_offset` (`0.120 ms` / `280.55 GB/s`).
-- **Future:** Hardware video pipelines (`AMF`), FidelityFX SDK evaluation, RDNA3/RDNA4 verification, optional Tauri desktop UI, Linux support.
+- **Milestone 3C (Complete):**
+  - Added multi-dispatch Vulkan command buffer batching (`--batch-dispatches 1..=256`, default `16`) with inter-dispatch `vkCmdPipelineBarrier` synchronization, boosting RX 6900 XT decode/elementwise kernels by **3.34x–4.67x** (`W8A32` GEMV `835.67 GB/s`, `Q4_0` GEMV `438.74 GB/s` with `IQR=0.0003 ms`, fused `RMSNorm+RoPE` `936.98 GB/s`).
+  - Implemented pure-Rust dynamic AMD AMF (`amfrt64.dll`) DX11 COM capability probing via `forge video caps [--json]` and upgraded `forge doctor` (`1.4.37.0`, `2 HW enc / 5 HW dec` verified on VCN 3.0).
+- **Future:** Full AMF encode/decode transcoding pipelines, FidelityFX SDK evaluation, RDNA3/RDNA4 verification, optional Tauri desktop UI (`Forge Desktop`), Linux support.
 
 ---
 

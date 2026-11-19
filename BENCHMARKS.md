@@ -183,22 +183,51 @@ Observed hardware telemetry & behavior via `forge-profiler` ADLX:
 
 ---
 
-## 8. Reproduction Commands
+## 8. Milestone 3C — Batched Vulkan Compute (`batch=16`) & AMF Hardware Video Probe
+
+Batching `dispatches_per_submit = 16` compute dispatches into a single Vulkan command buffer separated by `SHADER_WRITE -> SHADER_WRITE | SHADER_READ` `vkCmdPipelineBarrier` barriers eliminates per-dispatch queue submission and host-fence round-trip overhead (`warmup = 10`, `iters = 50`, `--stability-runs 0`, `--batch-dispatches 16`, full FP64 CPU reference check):
+
+| Kernel | Shape | Dtype | `batch=1` Median | `batch=16` Median (ms) | `batch=16` Min / P95 / Max (ms) | `batch=16` IQR / MAD (ms) | `batch=16` Throughput | Speedup vs `batch=1` | Max Abs Err | Accuracy |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `gemv_w8a32_wave32_4096x4096` | `4096x4096` | `i8*f32->f32` | 0.124 ms (`135.87 GB/s`) | **0.0328** | 0.0314 / 0.0353 / 0.0375 | 0.0003 / 0.0002 | **512.41 GB/s** (`1021.83 GFLOP/s`) | **3.77x** | 8.545e-4 | Pass |
+| `gemv_w8a32_wave32_11008x4096` | `11008x4096` | `i8*f32->f32` | 0.218 ms (`207.35 GB/s`) | **0.0541** | 0.0505 / 0.0556 / 0.0560 | 0.0018 / 0.0009 | **835.67 GB/s** (`1667.48 GFLOP/s`) | **4.03x** | 9.766e-4 | Pass |
+| `gemv_q4_0_wave32_4096x4096` | `4096x4096` | `q4_0->f32` | 0.124 ms (`84.87 GB/s`) | **0.0298** | 0.0295 / 0.0327 / 0.0377 | 0.0003 / 0.0002 | **353.30 GB/s** (`1127.03 GFLOP/s`) | **4.16x** | 7.629e-6 | Pass |
+| `gemv_q4_0_wave32_11008x4096` | `11008x4096` | `q4_0->f32` | 0.301 ms (`93.97 GB/s`) | **0.0644** | 0.0604 / 0.0647 / 0.0648 | **0.0003** / 0.0001 | **438.74 GB/s** (`1400.98 GFLOP/s`) | **4.67x** | 1.144e-5 | Pass |
+| `rmsnorm_rope_subgroup_1024x32x128` | `1024x32x128` | `f32` | 0.120 ms (`280.55 GB/s`) | **0.0358** | 0.0353 / 0.0368 / 0.0389 | 0.0002 / 0.0001 | **936.98 GB/s** | **3.34x** | 1.626e-4 | Pass |
+| `rope_f32_1024x32x128` (ref) | `1024x32x128` | `f32` | 0.088 ms (`379.23 GB/s`) | **0.0255** | 0.0250 / 0.0302 / 0.0336 | 0.0002 / 0.0001 | **1317.99 GB/s** | **3.48x** | 1.128e-4 | Pass |
+| `rmsnorm_f32_4096x4096` (ref) | `4096x4096` | `f32` | 0.163 ms (`823.83 GB/s`) | **0.1386** | 0.1316 / 0.1422 / 0.1432 | 0.0021 / 0.0012 | **968.40 GB/s** | **1.18x** | 3.576e-7 | Pass |
+
+Observed hardware behavior via `forge-profiler` ADLX & Vulkan timestamps:
+- **Jitter elimination & Infinity Cache residency**: `gemv_q4_0_wave32_11008x4096` IQR collapses from `0.209 ms` (`batch=1`) to **`0.0003 ms`** (`batch=16`), stabilizing throughput at `438.74 GB/s`. Working sets (`~11–64 MiB`) fit inside Navi 21's `128 MiB` Infinity Cache across consecutive barriered dispatches, yielding `835–1318 GB/s` effective throughput even while sub-millisecond submissions keep sampled ADLX board telemetry at `36 C`, `36–37 W`, and `~1978–1986 MHz` VRAM clock.
+
+### 8.1 AMF Hardware Video Capability Probe (`amfrt64.dll` `1.4.37.0`)
+
+Verified live on RX 6900 XT (VCN 3.0, Windows 11 Build `26300`, Adrenalin `26.11.2`) via `forge video caps [--json]`:
+- **Hardware Encoders (2)**: `H.264/AVC` (`AMFVideoEncoderVCE_AVC`, `128x128..4096x4096`, `NV12`), `HEVC/H.265` (`AMFVideoEncoderHW_HEVC`, `128x128..8192x4352`, `10-bit`, `NV12`/`P010`). `AV1` encode (`AMFVideoEncoderHW_AV1`) cleanly reports `NOT_SUPPORTED` (`CreateComponent returned error 30`, expected for RDNA2 VCN 3.0).
+- **Hardware Decoders (5)**: `H.264/AVC` (`..4096x4096`), `HEVC/H.265`, `VP9`, `AV1` (`..8192x4320`, `10-bit`, `interlaced=yes`, `NV12`/`P010`), and `MJPEG` (`..8192x4320`, `NV12`/`YUY2`).
+
+---
+
+## 9. Reproduction Commands
 
 ```powershell
 # 1. Build release CLI
 cargo build --release -p forge-cli
 
-# 2. Diagnostics + live ADLX telemetry + Vulkan/HIP verification
+# 2. Diagnostics + live ADLX telemetry + AMF video probe + Vulkan/HIP verification
 .\target\release\forge.exe doctor --verify --python <venv>\Scripts\python.exe
+.\target\release\forge.exe video caps
 
 # 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + Wave32 decode kernels + stability)
+# Note: decode/elementwise kernels default to --batch-dispatches 16 (override with 1..=256); heavy GEMM stays at 1.
 .\target\release\forge.exe bench vulkan --kernel all --warmup 5 --iters 20 --stability-runs 30 --output ..\vulkan_bench.json
 
-# 3b. Standalone Milestone 3B decode kernel benchmarks (W8A32 GEMV, Q4_0 GEMV, fused RMSNorm+RoPE)
-.\target\release\forge.exe bench vulkan --kernel gemv-w8 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_w8.json
-.\target\release\forge.exe bench vulkan --kernel gemv-q4 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_q4.json
-.\target\release\forge.exe bench vulkan --kernel fused-rms-rope --warmup 10 --iters 50 --stability-runs 0 --output ..\fused_rms_rope.json
+# 3b. Batched Milestone 3C decode & elementwise benchmarks (default batch=16; pass --batch-dispatches 1 for single-dispatch baseline)
+.\target\release\forge.exe bench vulkan --kernel gemv-w8 --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_w8.json
+.\target\release\forge.exe bench vulkan --kernel gemv-q4 --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_q4.json
+.\target\release\forge.exe bench vulkan --kernel fused-rms-rope --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\fused_rms_rope.json
+.\target\release\forge.exe bench vulkan --kernel rmsnorm --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\rmsnorm.json
+.\target\release\forge.exe bench vulkan --kernel rope --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\rope.json
 
 # 4. Safe 256x256 Triton verification pass (smoke mode)
 .\target\release\forge.exe bench triton --python <venv>\Scripts\python.exe --smoke --output ..\triton_smoke.json

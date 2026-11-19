@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 3C (Batched Vulkan Dispatch & AMD AMF Video Capability Probing)
+- Added multi-dispatch command buffer batching (`dispatches_per_submit` `1..=256`, default `16` for sub-millisecond decode/elementwise kernels) with inter-dispatch `SHADER_WRITE -> SHADER_WRITE | SHADER_READ` `vkCmdPipelineBarrier` synchronization in `forge-runtime`, `forge-benchmark`, and `forge bench vulkan --batch-dispatches N`:
+  - Eliminated single-dispatch host-fence overhead on RX 6900 XT (`gfx1030`), delivering **`512.41–835.67 GB/s`** on Wave32 `W8A32` GEMV (**3.77x–4.03x** speedup vs `batch=1`), **`353.30–438.74 GB/s`** on `Q4_0` GEMV (**4.16x–4.67x** speedup; `11008x4096` IQR collapsed from `0.209 ms` to `0.0003 ms`), **`936.98 GB/s`** on fused Wave32 `RMSNorm+RoPE` (**3.34x**), and **`1317.99 GB/s`** on `rope_f32` (**3.48x**), all passing full FP64 CPU reference checks.
+- Implemented pure-Rust dynamic AMD AMF (`amfrt64.dll`) DX11 COM vtable probing (`crates/forge-runtime/src/amf.rs`, zero vendored headers):
+  - Upgraded `BackendKind::Amf` diagnostics in `forge doctor` and added `forge video caps [--json]`.
+  - Live-verified AMF `1.4.37.0` on RX 6900 XT (VCN 3.0): 2 HW encoders (`H.264/AVC`, `HEVC/H.265`), 5 HW decoders (`H.264/AVC`, `HEVC/H.265`, `VP9`, `AV1`, `MJPEG`), 10-bit/interlaced flags, native/supported surface formats, and clean `AV1 Encode` unsupported detection (`error 30`).
+- Added unit tests, CLI parsing tests, integration tests, and live GPU tests (`vulkan_batched_decode_dispatch_matches_single_dispatch` and `amf_live_video_capabilities_probe_verifies_vcn_codecs`).
+
 ### Added — Milestone 3B (Vulkan Compute LLM Decode Kernels for RDNA2)
 - Enabled Vulkan 1.3 `subgroup_size_control` and `compute_full_subgroups` (`requiredSubgroupSize = 32`, `REQUIRE_FULL_SUBGROUPS`) plus `naga::valid::Capabilities::SUBGROUP` SPIR-V 1.3 codegen (`OpGroupNonUniformFAdd`) in `forge-runtime`.
 - Implemented three pure-Rust WGSL->SPIR-V RDNA2 LLM decode kernels:

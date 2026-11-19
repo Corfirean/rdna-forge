@@ -50,23 +50,25 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 - **`sampler` & `types`**: Exposes single-shot `snapshot_all_gpus()` / `snapshot_for_device()`, background `TelemetryGuard` sampling, `TELEMETRY_TABLE_HEADER` / `TELEMETRY_CSV_HEADER` / `MonitorRecord` streaming formatters, and automatic Windows WDDM VRAM pressure (>50% dedicated VRAM) and competing-workload (>20% usage) warnings.
 
 ### `forge-runtime`
-- **`probe`**: Audits Vulkan, HIP driver vs ROCm SDK tools (`rocm-sdk`/`hipcc`), Python PyTorch ROCm + `triton-windows`, ADLX, DirectML (flagging maintenance mode), AMF, and `llama-bench`.
+- **`probe`**: Audits Vulkan, HIP driver vs ROCm SDK tools (`rocm-sdk`/`hipcc`), Python PyTorch ROCm + `triton-windows`, ADLX, DirectML (flagging maintenance mode), AMF (upgraded with live codec counts from `amf`), and `llama-bench`.
+- **`amf`**: Pure-Rust dynamic COM vtable probe (`amfrt64.dll`, zero vendored headers) initializing a DX11 AMF context under a `Mutex` guard and querying VCN encode/decode codec capabilities (`H.264/AVC`, `HEVC/H.265`, `VP9`, `AV1`, `MJPEG`, resolution bounds, 10-bit/interlaced support, native/supported surface formats).
 - **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `gemm_f32_tiled_vec4.wgsl`, `gemm_i8_dp4a.wgsl`, `gemv_w8a32_wave32.wgsl`, `gemv_q4_0_wave32.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`, `rmsnorm_rope_f32_subgroup.wgsl`) and compiles them purely in Rust via `naga` to SPIR-V 1.3 (`OpGroupNonUniformFAdd` subgroups + `OpBitFieldSExtract` unpacks) or SPIR-V 1.6 (`OpSDot` / `V_DOT4_I32_I8` when `shader_integer_dot_product` is supported by the device).
-- **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::{shader_integer_dot_product, subgroup_size_control, compute_full_subgroups}` when supported, with `requiredSubgroupSize = 32` for Wave32 kernels), queue, command pool, timestamp `QueryPool`, `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
+- **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::{shader_integer_dot_product, subgroup_size_control, compute_full_subgroups}` when supported, with `requiredSubgroupSize = 32` for Wave32 kernels), queue, command pool, timestamp `QueryPool`, batched multi-dispatch submissions (`dispatches_per_submit` `1..=256` with inter-dispatch `SHADER_WRITE -> SHADER_WRITE | SHADER_READ` memory barriers), `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
 - **`reference`**: FP64-accumulated FP32, quantized `Q4_0`/`W8A32`, fused `RMSNorm+RoPE`, and exact `i64` INT8 CPU reference implementations plus `compare_slices` / `compare_i32_exact` evaluators and `k4`/`Q4_0` packing helpers.
 - **`hip_verify`**: RAII-guarded `hipMalloc` / `hipMemcpy` / `hipEvent*` 4 MiB bit-exact H2D+D2H verification against `amdhip64_*.dll`.
 
 ### `forge-benchmark`
 - **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs.
 - **`memory`**: Captures process peak working set via Win32 `GetProcessMemoryInfo`.
-- **`vulkan_suite`**, **`llama`**, **`triton`**: Orchestrates reproducible benchmarks and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
+- **`vulkan_suite`**, **`llama`**, **`triton`**: Orchestrates reproducible benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
 
 ### `forge-cli`
 Thin CLI boundary (`clap` + `anyhow`) exposing:
 - `forge doctor [--json] [--verify] [--python]`
+- `forge video caps [--json]`
 - `forge monitor [--interval-ms N] [--count N] [--duration-secs S] [--device-id HEX] [--format table|jsonl|csv] [--output PATH]` (with Win32 `SetConsoleCtrlHandler` graceful termination and clean `ADLXTerminate`)
 - `forge tune {show [--device-id HEX] [--json], power-limit <PCT> [--device-id HEX] [--apply], reset [--device-id HEX] [--apply]}`
-- `forge bench {vulkan,llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
+- `forge bench {vulkan [--batch-dispatches N],llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
 - `forge profile show`
 
 ---
