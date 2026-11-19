@@ -173,3 +173,112 @@ pub fn summarize_samples(
         warnings,
     })
 }
+
+/// CSV column header emitted by `forge monitor --format csv`.
+pub const TELEMETRY_CSV_HEADER: &str = "seq,elapsed_ms,timestamp_ms,gpu_name,pci_device_id,gpu_usage_pct,gpu_clock_mhz,vram_clock_mhz,gpu_temp_c,hotspot_temp_c,gpu_power_w,board_power_w,fan_rpm,vram_used_mib,total_vram_mib,voltage_mv";
+
+/// Fixed-width table header emitted by `forge monitor --format table`.
+pub const TELEMETRY_TABLE_HEADER: &str = " SEQ  TIME(s)   UTIL%  GFX(MHz)  MEM(MHz)  EDGE(C)   HOT(C)   PWR(W)  FAN(RPM)  VOLT(mV)        VRAM(MiB)";
+
+/// Single JSONL record emitted by `forge monitor --format jsonl`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorRecord {
+    pub seq: usize,
+    pub elapsed_ms: u64,
+    #[serde(flatten)]
+    pub sample: GpuTelemetrySample,
+    pub warnings: Vec<String>,
+}
+
+fn escape_csv_field(raw: &str) -> String {
+    if raw.contains([',', '"', '\n', '\r']) {
+        let escaped = raw.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        raw.to_string()
+    }
+}
+
+fn csv_opt<T: std::fmt::Display>(val: Option<T>) -> String {
+    val.map(|v| v.to_string()).unwrap_or_default()
+}
+
+fn csv_opt_f64(val: Option<f64>) -> String {
+    val.map(|v| format!("{v:.1}")).unwrap_or_default()
+}
+
+/// Formats a single telemetry sample as an RFC 4180 CSV line matching `TELEMETRY_CSV_HEADER`.
+pub fn format_sample_csv_row(seq: usize, elapsed_ms: u64, sample: &GpuTelemetrySample) -> String {
+    let dev_hex = sample
+        .pci_device_id
+        .map(|id| format!("0x{id:04X}"))
+        .unwrap_or_default();
+    [
+        seq.to_string(),
+        elapsed_ms.to_string(),
+        csv_opt(sample.timestamp_ms),
+        escape_csv_field(&sample.gpu_name),
+        dev_hex,
+        csv_opt_f64(sample.gpu_usage_pct),
+        csv_opt(sample.gpu_clock_mhz),
+        csv_opt(sample.vram_clock_mhz),
+        csv_opt_f64(sample.gpu_temp_c),
+        csv_opt_f64(sample.hotspot_temp_c),
+        csv_opt_f64(sample.gpu_power_w),
+        csv_opt_f64(sample.board_power_w),
+        csv_opt(sample.fan_rpm),
+        csv_opt(sample.vram_used_mib),
+        csv_opt(sample.total_vram_mib),
+        csv_opt(sample.voltage_mv),
+    ]
+    .join(",")
+}
+
+/// Formats a single telemetry sample as a fixed-width row matching `TELEMETRY_TABLE_HEADER`.
+pub fn format_sample_table_row(
+    seq: usize,
+    elapsed_secs: f64,
+    sample: &GpuTelemetrySample,
+) -> String {
+    let util = sample
+        .gpu_usage_pct
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let gfx = sample
+        .gpu_clock_mhz
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let mem = sample
+        .vram_clock_mhz
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let edge = sample
+        .gpu_temp_c
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let hot = sample
+        .hotspot_temp_c
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let pwr = sample
+        .gpu_power_w
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let fan = sample
+        .fan_rpm
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let volt = sample
+        .voltage_mv
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let vram = match (sample.vram_used_mib, sample.total_vram_mib) {
+        (Some(u), Some(t)) => format!("{u}/{t}"),
+        (Some(u), None) => format!("{u}"),
+        _ => "n/a".to_string(),
+    };
+
+    format!(
+        "{seq:>4}  {elapsed_secs:>7.2}  {util:>6}  {gfx:>8}  {mem:>8}  {edge:>7}  {hot:>7}  {pwr:>7}  {fan:>8}  {volt:>8}  {vram:>15}"
+    )
+}

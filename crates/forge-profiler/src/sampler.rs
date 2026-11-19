@@ -6,6 +6,7 @@ use forge_core::ForgeResult;
 use tracing::debug;
 
 use crate::adlx_ffi::AdlxSession;
+use crate::tuning::{GpuTuningReport, PowerLimitChangeResult, TuningResetResult};
 use crate::types::{summarize_samples, GpuTelemetrySample, TelemetrySummary};
 
 /// Captures a single ADLX telemetry snapshot across all visible AMD GPUs.
@@ -18,6 +19,31 @@ pub fn snapshot_all_gpus() -> ForgeResult<Vec<GpuTelemetrySample>> {
 pub fn snapshot_for_device(pci_device_id: Option<u32>) -> ForgeResult<Option<GpuTelemetrySample>> {
     let session = AdlxSession::open()?;
     session.read_matching_sample(pci_device_id)
+}
+
+/// Reads complete ADLX tuning capabilities and current settings across all AMD GPUs (strictly read-only).
+pub fn read_all_gpu_tuning() -> ForgeResult<Vec<GpuTuningReport>> {
+    let session = AdlxSession::open()?;
+    session.read_all_tuning()
+}
+
+/// Validates and optionally applies an ADLX manual power limit percentage change (`dry_run = true` never mutates).
+pub fn set_gpu_power_limit(
+    pci_device_id: Option<u32>,
+    limit_pct: i32,
+    dry_run: bool,
+) -> ForgeResult<PowerLimitChangeResult> {
+    let session = AdlxSession::open()?;
+    session.set_power_limit(pci_device_id, limit_pct, dry_run)
+}
+
+/// Validates and optionally resets GPU tuning to ADLX factory defaults (`dry_run = true` never mutates).
+pub fn reset_gpu_tuning_to_factory(
+    pci_device_id: Option<u32>,
+    dry_run: bool,
+) -> ForgeResult<TuningResetResult> {
+    let session = AdlxSession::open()?;
+    session.reset_tuning_to_factory(pci_device_id, dry_run)
 }
 
 /// Background ADLX telemetry sampler active over the lifetime of a benchmark run.

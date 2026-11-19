@@ -18,6 +18,9 @@ pub enum ForgeError {
     #[error("invalid tensor or dispatch dimension: {0}")]
     InvalidDimension(String),
 
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("requested buffer size ({requested_bytes} bytes) exceeds device maxBufferSize ({max_bytes} bytes)")]
     BufferTooLarge {
         requested_bytes: u64,

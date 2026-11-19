@@ -1,12 +1,25 @@
 pub mod adlx_ffi;
+#[cfg(windows)]
+mod adlx_tuning;
 pub mod sampler;
+pub mod tuning;
 pub mod types;
 
-pub use sampler::{snapshot_all_gpus, snapshot_for_device, TelemetryGuard};
+pub use adlx_ffi::AdlxSession;
+pub use sampler::{
+    read_all_gpu_tuning, reset_gpu_tuning_to_factory, set_gpu_power_limit, snapshot_all_gpus,
+    snapshot_for_device, TelemetryGuard,
+};
+pub use tuning::{
+    FanCurvePoint, FanTuningInfo, GfxTuningInfo, GpuTuningReport, IntRange, MemoryTimingMode,
+    PowerLimitChangeResult, PowerTuningInfo, PresetTuningInfo, TuningCapabilities,
+    TuningResetResult, VramTuningInfo,
+};
 pub use types::{
-    check_competing_workload_warning, check_vram_pressure_warning, parse_pci_device_id,
-    summarize_samples, GpuTelemetrySample, MetricSummary, TelemetrySummary,
-    COMPETING_GPU_USAGE_PCT, WDDM_VRAM_PRESSURE_PCT,
+    check_competing_workload_warning, check_vram_pressure_warning, format_sample_csv_row,
+    format_sample_table_row, parse_pci_device_id, summarize_samples, GpuTelemetrySample,
+    MetricSummary, MonitorRecord, TelemetrySummary, COMPETING_GPU_USAGE_PCT, TELEMETRY_CSV_HEADER,
+    TELEMETRY_TABLE_HEADER, WDDM_VRAM_PRESSURE_PCT,
 };
 
 #[cfg(test)]
@@ -83,5 +96,160 @@ mod tests {
         assert_eq!(summary.warnings.len(), 2);
         assert!(summary.warnings[0].contains("Competing GPU workload"));
         assert!(summary.warnings[1].contains("WDDM VRAM occupancy"));
+    }
+
+    #[test]
+    fn int_range_validation_enforces_bounds_step_and_validity() {
+        assert!(IntRange::from_adlx(0, 0, 0).is_none());
+        assert!(IntRange::from_adlx(10, 5, 1).is_none());
+
+        let power_range = IntRange::from_adlx(-10, 12, 1).expect("valid power range");
+        assert!(power_range.validate(-10, "power_limit").is_ok());
+        assert!(power_range.validate(0, "power_limit").is_ok());
+        assert!(power_range.validate(12, "power_limit").is_ok());
+        assert!(matches!(
+            power_range.validate(-11, "power_limit"),
+            Err(forge_core::ForgeError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            power_range.validate(13, "power_limit"),
+            Err(forge_core::ForgeError::InvalidParameter(_))
+        ));
+
+        let vram_range = IntRange::from_adlx(2000, 2624, 2).expect("valid step-2 range");
+        assert!(vram_range.validate(2000, "vram_freq").is_ok());
+        assert!(vram_range.validate(2002, "vram_freq").is_ok());
+        assert!(vram_range.validate(2624, "vram_freq").is_ok());
+        assert!(matches!(
+            vram_range.validate(2001, "vram_freq"),
+            Err(forge_core::ForgeError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            vram_range.validate(2626, "vram_freq"),
+            Err(forge_core::ForgeError::InvalidParameter(_))
+        ));
+
+        let broken = IntRange {
+            min: 5,
+            max: 1,
+            step: 0,
+        };
+        assert!(matches!(
+            broken.validate(3, "broken"),
+            Err(forge_core::ForgeError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn memory_timing_mode_maps_all_adlx_variants() {
+        assert_eq!(MemoryTimingMode::from_adlx(0), MemoryTimingMode::Default);
+        assert_eq!(MemoryTimingMode::from_adlx(1), MemoryTimingMode::FastTiming);
+        assert_eq!(
+            MemoryTimingMode::from_adlx(2),
+            MemoryTimingMode::FastTimingLevel2
+        );
+        assert_eq!(MemoryTimingMode::from_adlx(3), MemoryTimingMode::Automatic);
+        assert_eq!(MemoryTimingMode::from_adlx(4), MemoryTimingMode::Level1);
+        assert_eq!(MemoryTimingMode::from_adlx(5), MemoryTimingMode::Level2);
+        assert_eq!(
+            MemoryTimingMode::from_adlx(99),
+            MemoryTimingMode::Unknown(99)
+        );
+        assert_eq!(MemoryTimingMode::FastTiming.to_string(), "Fast Timing");
+    }
+
+    #[test]
+    fn telemetry_csv_and_table_formatting_handles_quoting_and_none_fields() {
+        let mut s = sample_with(42.5, 2150, 1996, 61.0, 74.5, 240.2, 4096);
+        s.gpu_name = "AMD \"Radeon\", RX 6900 XT".to_string();
+        s.timestamp_ms = None;
+
+        let csv_row = format_sample_csv_row(1, 500, &s);
+        assert_eq!(TELEMETRY_CSV_HEADER.split(',').count(), 16);
+        assert!(csv_row.starts_with("1,500,,\"AMD \"\"Radeon\"\", RX 6900 XT\",0x73AF,"));
+        // Verify empty field for `board_power_w: None` between `240.2` and `1500`
+        assert!(csv_row.contains("240.2,,1500,4096,16368,1050"));
+
+        let table_row = format_sample_table_row(1, 0.5, &s);
+        assert_eq!(table_row.len(), TELEMETRY_TABLE_HEADER.len());
+        assert!(table_row.contains("42.5%"));
+        assert!(table_row.contains("4096/16368"));
+    }
+
+    #[test]
+    fn gpu_tuning_report_json_roundtrip() {
+        let report = GpuTuningReport {
+            gpu_name: "AMD Radeon RX 6900 XT".to_string(),
+            pci_device_id: Some(0x73AF),
+            discrete: true,
+            at_factory: Some(false),
+            capabilities: TuningCapabilities {
+                auto_tuning: true,
+                preset_tuning: true,
+                manual_gfx: true,
+                manual_vram: true,
+                manual_fan: true,
+                manual_power: true,
+            },
+            preset: Some(PresetTuningInfo {
+                supported_presets: vec!["Quiet".into(), "Balanced".into(), "Rage".into()],
+                current_preset: Some("Balanced".into()),
+            }),
+            power: Some(PowerTuningInfo {
+                power_limit_pct: Some(0),
+                power_limit_range: IntRange::from_adlx(-10, 12, 1),
+                power_limit_default_pct: Some(0),
+                tdc_limit_supported: false,
+                tdc_limit_a: None,
+                tdc_limit_range: None,
+                tdc_limit_default_a: None,
+            }),
+            gfx: Some(GfxTuningInfo {
+                min_freq_mhz: Some(500),
+                min_freq_range: IntRange::from_adlx(500, 4000, 1),
+                min_freq_default_mhz: Some(500),
+                max_freq_mhz: Some(2564),
+                max_freq_range: IntRange::from_adlx(500, 4000, 1),
+                max_freq_default_mhz: Some(2564),
+                voltage_mv: Some(1200),
+                voltage_range: IntRange::from_adlx(900, 1200, 1),
+                voltage_default_mv: Some(1200),
+            }),
+            vram: Some(VramTuningInfo {
+                max_freq_mhz: Some(2000),
+                max_freq_range: IntRange::from_adlx(2000, 2624, 2),
+                max_freq_default_mhz: Some(2000),
+                memory_timing_supported: true,
+                memory_timing: Some(MemoryTimingMode::Default),
+                supported_memory_timings: vec![
+                    MemoryTimingMode::Default,
+                    MemoryTimingMode::FastTiming,
+                ],
+            }),
+            fan: Some(FanTuningInfo {
+                speed_range_pct: IntRange::from_adlx(20, 100, 1),
+                temp_range_c: IntRange::from_adlx(25, 100, 1),
+                zero_rpm_supported: true,
+                zero_rpm_enabled: Some(false),
+                zero_rpm_default: Some(true),
+                min_acoustic_limit_mhz: None,
+                min_acoustic_limit_range: None,
+                min_acoustic_limit_default_mhz: None,
+                min_fan_speed_pct: None,
+                min_fan_speed_range: None,
+                min_fan_speed_default_pct: None,
+                target_fan_speed_pct: None,
+                target_fan_speed_range: None,
+                target_fan_speed_default_pct: None,
+                fan_curve: vec![FanCurvePoint {
+                    temp_c: 50,
+                    speed_pct: 20,
+                }],
+            }),
+        };
+
+        let json = serde_json::to_string_pretty(&report).expect("serialize report");
+        let parsed: GpuTuningReport = serde_json::from_str(&json).expect("deserialize report");
+        assert_eq!(parsed, report);
     }
 }

@@ -9,11 +9,24 @@ mod imp {
 
     use crate::types::{parse_pci_device_id, GpuTelemetrySample};
 
-    const ADLX_OK: i32 = 0;
+    pub(crate) const ADLX_OK: i32 = 0;
     const ADLX_GPU_TYPE_DISCRETE: i32 = 2;
 
     /// Process-wide lock serializing `ADLXInitialize` / `ADLXTerminate` because ADLX uses global DLL state.
     static ADLX_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[repr(C)]
+    pub(crate) struct IAdlxInterface {
+        pub(crate) vtbl: *const IAdlxInterfaceVtbl,
+    }
+
+    #[repr(C)]
+    pub(crate) struct IAdlxInterfaceVtbl {
+        pub(crate) acquire: unsafe extern "system" fn(*mut IAdlxInterface) -> isize, // [0]
+        pub(crate) release: unsafe extern "system" fn(*mut IAdlxInterface) -> isize, // [1]
+        pub(crate) query_interface:
+            unsafe extern "system" fn(*mut IAdlxInterface, *const u16, *mut *mut c_void) -> i32, // [2]
+    }
 
     #[repr(C)]
     struct IAdlxSystem {
@@ -31,7 +44,8 @@ mod imp {
         get_gpus_changed_handling: *const c_void, // [5]
         enable_log: *const c_void,               // [6]
         get_3d_settings_services: *const c_void, // [7]
-        get_gpu_tuning_services: *const c_void,  // [8]
+        get_gpu_tuning_services:
+            unsafe extern "system" fn(*mut IAdlxSystem, *mut *mut IAdlxInterface) -> i32, // [8]
         get_performance_monitoring_services:
             unsafe extern "system" fn(*mut IAdlxSystem, *mut *mut IAdlxPerfMon) -> i32, // [9]
         total_system_ram: *const c_void,         // [10]
@@ -39,7 +53,7 @@ mod imp {
     }
 
     #[repr(C)]
-    struct IAdlxGpuList {
+    pub(crate) struct IAdlxGpuList {
         vtbl: *const IAdlxGpuListVtbl,
     }
 
@@ -61,7 +75,7 @@ mod imp {
     }
 
     #[repr(C)]
-    struct IAdlxGpu {
+    pub(crate) struct IAdlxGpu {
         vtbl: *const IAdlxGpuVtbl,
     }
 
@@ -165,7 +179,7 @@ mod imp {
         }
     }
 
-    struct OwnedGpu(*mut IAdlxGpu);
+    pub(crate) struct OwnedGpu(pub(crate) *mut IAdlxGpu);
     impl Drop for OwnedGpu {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -183,10 +197,52 @@ mod imp {
         }
     }
 
+    /// RAII guard for any ADLX child interface inheriting `IADLXInterface`.
+    pub(crate) struct OwnedInterface(*mut IAdlxInterface);
+
+    impl OwnedInterface {
+        pub(crate) fn from_raw(ptr: *mut IAdlxInterface) -> Option<Self> {
+            (!ptr.is_null()).then_some(Self(ptr))
+        }
+
+        pub(crate) fn as_raw(&self) -> *mut IAdlxInterface {
+            self.0
+        }
+
+        pub(crate) fn query_interface(&self, iid_utf16: &[u16]) -> Option<Self> {
+            if self.0.is_null() {
+                return None;
+            }
+            let mut out: *mut c_void = ptr::null_mut();
+            let rc = unsafe {
+                ((*(*self.0).vtbl).query_interface)(self.0, iid_utf16.as_ptr(), &mut out)
+            };
+            if rc == ADLX_OK && !out.is_null() {
+                Some(Self(out.cast::<IAdlxInterface>()))
+            } else {
+                None
+            }
+        }
+
+        fn release_now(&mut self) {
+            if !self.0.is_null() {
+                unsafe { ((*(*self.0).vtbl).release)(self.0) };
+                self.0 = ptr::null_mut();
+            }
+        }
+    }
+
+    impl Drop for OwnedInterface {
+        fn drop(&mut self) {
+            self.release_now();
+        }
+    }
+
     /// Exclusive RAII ADLX session holding the global ADLX lifecycle lock until terminated.
     pub struct AdlxSession {
         _lock: MutexGuard<'static, ()>,
         // Drop order matters: release all child COM interfaces before `ADLXTerminate` and library unload.
+        tuning_svc: Option<OwnedInterface>,
         perf_mon: OwnedPerfMon,
         gpu_list: OwnedGpuList,
         terminate_fn: AdlxTerminateFn,
@@ -196,6 +252,9 @@ mod imp {
     impl Drop for AdlxSession {
         fn drop(&mut self) {
             // Manually release child COM objects BEFORE ADLXTerminate() while keeping `_lib` loaded.
+            if let Some(mut tuning) = self.tuning_svc.take() {
+                tuning.release_now();
+            }
             if !self.perf_mon.0.is_null() {
                 unsafe { ((*(*self.perf_mon.0).vtbl).release)(self.perf_mon.0) };
                 self.perf_mon.0 = ptr::null_mut();
@@ -210,7 +269,7 @@ mod imp {
     }
 
     impl AdlxSession {
-        /// Loads `amdadlx64.dll`, initializes ADLX, and acquires GPU list + performance services.
+        /// Loads `amdadlx64.dll`, initializes ADLX, and acquires GPU list + performance + tuning services.
         pub fn open() -> ForgeResult<Self> {
             let lock = ADLX_LIFECYCLE_LOCK.lock().map_err(|_| {
                 ForgeError::ExecutionFailed("ADLX lifecycle mutex poisoned".to_string())
@@ -289,8 +348,23 @@ mod imp {
                 )));
             }
 
+            let mut tuning_ptr: *mut IAdlxInterface = ptr::null_mut();
+            let tuning_rc = unsafe {
+                ((*(*system_ptr).vtbl).get_gpu_tuning_services)(system_ptr, &mut tuning_ptr)
+            };
+            let tuning_svc = if tuning_rc == ADLX_OK {
+                OwnedInterface::from_raw(tuning_ptr)
+            } else {
+                debug!(
+                    tuning_rc,
+                    "IADLXSystem::GetGPUTuningServices returned non-OK status"
+                );
+                None
+            };
+
             Ok(Self {
                 _lock: lock,
+                tuning_svc,
                 perf_mon: OwnedPerfMon(perf_mon_ptr),
                 gpu_list,
                 terminate_fn,
@@ -298,19 +372,68 @@ mod imp {
             })
         }
 
+        pub(crate) fn tuning_services_ptr(&self) -> Option<*mut IAdlxInterface> {
+            self.tuning_svc.as_ref().map(OwnedInterface::as_raw)
+        }
+
+        pub(crate) fn gpu_count(&self) -> u32 {
+            unsafe { ((*(*self.gpu_list.0).vtbl).size)(self.gpu_list.0) }
+        }
+
+        pub(crate) fn gpu_at(&self, idx: u32) -> Option<OwnedGpu> {
+            let mut gpu_ptr: *mut IAdlxGpu = ptr::null_mut();
+            let rc = unsafe {
+                ((*(*self.gpu_list.0).vtbl).at_gpu_list)(self.gpu_list.0, idx, &mut gpu_ptr)
+            };
+            if rc == ADLX_OK && !gpu_ptr.is_null() {
+                Some(OwnedGpu(gpu_ptr))
+            } else {
+                None
+            }
+        }
+
+        pub(crate) fn read_gpu_identity(
+            gpu: &OwnedGpu,
+        ) -> (String, Option<u32>, bool, Option<u32>) {
+            let gpu_name = unsafe {
+                let mut p: *const c_char = ptr::null();
+                if ((*(*gpu.0).vtbl).name)(gpu.0, &mut p) == ADLX_OK && !p.is_null() {
+                    CStr::from_ptr(p).to_string_lossy().trim().to_string()
+                } else {
+                    "Unknown AMD GPU".to_string()
+                }
+            };
+
+            let pci_device_id = unsafe {
+                let mut p: *const c_char = ptr::null();
+                if ((*(*gpu.0).vtbl).device_id)(gpu.0, &mut p) == ADLX_OK && !p.is_null() {
+                    parse_pci_device_id(&CStr::from_ptr(p).to_string_lossy())
+                } else {
+                    None
+                }
+            };
+
+            let discrete = unsafe {
+                let mut t: i32 = 0;
+                ((*(*gpu.0).vtbl).gpu_type)(gpu.0, &mut t) == ADLX_OK && t == ADLX_GPU_TYPE_DISCRETE
+            };
+
+            let total_vram_mib = unsafe {
+                let mut mb: u32 = 0;
+                (((*(*gpu.0).vtbl).total_vram)(gpu.0, &mut mb) == ADLX_OK && mb > 0).then_some(mb)
+            };
+
+            (gpu_name, pci_device_id, discrete, total_vram_mib)
+        }
+
         /// Reads a telemetry sample for every GPU exposed by ADLX.
         pub fn read_all_samples(&self) -> ForgeResult<Vec<GpuTelemetrySample>> {
-            let count = unsafe { ((*(*self.gpu_list.0).vtbl).size)(self.gpu_list.0) };
+            let count = self.gpu_count();
             let mut out = Vec::with_capacity(count as usize);
             for idx in 0..count {
-                let mut gpu_ptr: *mut IAdlxGpu = ptr::null_mut();
-                let rc = unsafe {
-                    ((*(*self.gpu_list.0).vtbl).at_gpu_list)(self.gpu_list.0, idx, &mut gpu_ptr)
-                };
-                if rc != ADLX_OK || gpu_ptr.is_null() {
+                let Some(gpu) = self.gpu_at(idx) else {
                     continue;
-                }
-                let gpu = OwnedGpu(gpu_ptr);
+                };
                 if let Some(sample) = self.read_gpu_sample(&gpu) {
                     out.push(sample);
                 }
@@ -353,34 +476,7 @@ mod imp {
                 return None;
             }
             let metrics = OwnedGpuMetrics(metrics_ptr);
-
-            let gpu_name = unsafe {
-                let mut p: *const c_char = ptr::null();
-                if ((*(*gpu.0).vtbl).name)(gpu.0, &mut p) == ADLX_OK && !p.is_null() {
-                    CStr::from_ptr(p).to_string_lossy().trim().to_string()
-                } else {
-                    "Unknown AMD GPU".to_string()
-                }
-            };
-
-            let pci_device_id = unsafe {
-                let mut p: *const c_char = ptr::null();
-                if ((*(*gpu.0).vtbl).device_id)(gpu.0, &mut p) == ADLX_OK && !p.is_null() {
-                    parse_pci_device_id(&CStr::from_ptr(p).to_string_lossy())
-                } else {
-                    None
-                }
-            };
-
-            let discrete = unsafe {
-                let mut t: i32 = 0;
-                ((*(*gpu.0).vtbl).gpu_type)(gpu.0, &mut t) == ADLX_OK && t == ADLX_GPU_TYPE_DISCRETE
-            };
-
-            let total_vram_mib = unsafe {
-                let mut mb: u32 = 0;
-                (((*(*gpu.0).vtbl).total_vram)(gpu.0, &mut mb) == ADLX_OK && mb > 0).then_some(mb)
-            };
+            let (gpu_name, pci_device_id, discrete, total_vram_mib) = Self::read_gpu_identity(gpu);
 
             unsafe {
                 let vt = &*(*metrics.0).vtbl;
@@ -433,10 +529,14 @@ mod imp {
 #[cfg(windows)]
 pub use imp::AdlxSession;
 
+#[cfg(windows)]
+pub(crate) use imp::{IAdlxGpu, IAdlxInterface, OwnedGpu, OwnedInterface, ADLX_OK};
+
 #[cfg(not(windows))]
 mod stub {
     use forge_core::{ForgeError, ForgeResult};
 
+    use crate::tuning::{GpuTuningReport, PowerLimitChangeResult, TuningResetResult};
     use crate::types::GpuTelemetrySample;
 
     pub struct AdlxSession;
@@ -458,6 +558,33 @@ mod stub {
             _pci_device_id: Option<u32>,
         ) -> ForgeResult<Option<GpuTelemetrySample>> {
             Ok(None)
+        }
+
+        pub fn read_all_tuning(&self) -> ForgeResult<Vec<GpuTuningReport>> {
+            Ok(Vec::new())
+        }
+
+        pub fn set_power_limit(
+            &self,
+            _pci_device_id: Option<u32>,
+            _limit_pct: i32,
+            _dry_run: bool,
+        ) -> ForgeResult<PowerLimitChangeResult> {
+            Err(ForgeError::RuntimeUnavailable {
+                runtime: "ADLX".to_string(),
+                reason: "ADLX tuning is Windows-only".to_string(),
+            })
+        }
+
+        pub fn reset_tuning_to_factory(
+            &self,
+            _pci_device_id: Option<u32>,
+            _dry_run: bool,
+        ) -> ForgeResult<TuningResetResult> {
+            Err(ForgeError::RuntimeUnavailable {
+                runtime: "ADLX".to_string(),
+                reason: "ADLX tuning is Windows-only".to_string(),
+            })
         }
     }
 }
