@@ -200,6 +200,7 @@ version = "0.1.0"
 dependencies = [
  "forge-core",
  "forge-device",
+ "forge-profiler",
  "forge-runtime",
  "serde",
  "serde_json",
@@ -217,7 +218,9 @@ dependencies = [
  "forge-benchmark",
  "forge-core",
  "forge-device",
+ "forge-profiler",
  "forge-runtime",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

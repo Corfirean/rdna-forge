@@ -11,10 +11,16 @@ use forge_core::{
     CapabilityResult, DiagnosticReport, GpuDeviceInfo, HardwareProfile, SupportStatus,
 };
 use forge_device::discover_all;
-use forge_runtime::{
-    compare_slices, deterministic_f32_data, probe_all_backends, ref_gemm_f32_exact_f64,
-    ref_rmsnorm_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
+use forge_profiler::{
+    check_competing_workload_warning, check_vram_pressure_warning, snapshot_all_gpus,
+    GpuTelemetrySample, TelemetrySummary,
 };
+use forge_runtime::{
+    compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
+    pack_i8_b_transposed_k4, pack_i8_row_major_k4, probe_all_backends, ref_gemm_f32_exact_f64,
+    ref_gemm_i8_to_i32, ref_rmsnorm_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
+};
+use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -71,6 +77,8 @@ enum BenchSubcommand {
 enum KernelChoice {
     All,
     Gemm,
+    GemmOpt,
+    GemmI8,
     Rmsnorm,
     Rope,
 }
@@ -80,9 +88,19 @@ impl From<KernelChoice> for VulkanKernelSelection {
         match value {
             KernelChoice::All => Self::All,
             KernelChoice::Gemm => Self::Gemm,
+            KernelChoice::GemmOpt => Self::GemmOpt,
+            KernelChoice::GemmI8 => Self::GemmI8,
             KernelChoice::Rmsnorm => Self::RmsNorm,
             KernelChoice::Rope => Self::Rope,
         }
+    }
+}
+
+fn parse_bool_flag(s: &str) -> std::result::Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        other => Err(format!("expected 0/1 or true/false, got '{other}'")),
     }
 }
 
@@ -130,6 +148,10 @@ struct LlamaBenchArgs {
     vulkan_device: Option<String>,
     #[arg(long)]
     hip_device: Option<String>,
+    #[arg(long, value_parser = parse_bool_flag)]
+    flash_attn: Option<bool>,
+    #[arg(long)]
+    hip_disable_graphs: bool,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -183,9 +205,26 @@ fn main() -> Result<()> {
     }
 }
 
+#[derive(Serialize)]
+struct DoctorCliReport<'a> {
+    #[serde(flatten)]
+    report: &'a DiagnosticReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telemetry: Option<&'a [GpuTelemetrySample]>,
+}
+
+const VULKAN_VERIFY_CAPABILITIES: &[&str] = &[
+    "GEMM (Vulkan FP32)",
+    "GEMM (Vulkan FP32 tiled vec4)",
+    "GEMM (Vulkan INT8 DP4A)",
+    "RMSNorm (Vulkan FP32)",
+    "RoPE (Vulkan FP32)",
+];
+
 fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     let snapshot = discover_all();
     let (backends, missing_dependencies) = probe_all_backends(&snapshot, args.python.as_deref());
+    let telemetry = snapshot_all_gpus().ok();
 
     let mut capabilities = vec![CapabilityResult {
         name: "Device discovery".to_string(),
@@ -200,28 +239,18 @@ fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     if args.verify {
         capabilities.extend(run_live_capability_checks(&snapshot.gpus));
     } else {
-        capabilities.extend([
-            CapabilityResult {
-                name: "HIP transfer".to_string(),
-                status: SupportStatus::NotTested,
-                detail: Some("pass --verify to run live HIP round-trip test".to_string()),
-            },
-            CapabilityResult {
-                name: "GEMM (Vulkan FP32)".to_string(),
-                status: SupportStatus::NotTested,
-                detail: Some("pass --verify to run live compute check".to_string()),
-            },
-            CapabilityResult {
-                name: "RMSNorm (Vulkan FP32)".to_string(),
+        capabilities.push(CapabilityResult {
+            name: "HIP transfer".to_string(),
+            status: SupportStatus::NotTested,
+            detail: Some("pass --verify to run live HIP round-trip test".to_string()),
+        });
+        for &name in VULKAN_VERIFY_CAPABILITIES {
+            capabilities.push(CapabilityResult {
+                name: name.to_string(),
                 status: SupportStatus::NotTested,
                 detail: Some("pass --verify to run live compute check".to_string()),
-            },
-            CapabilityResult {
-                name: "RoPE (Vulkan FP32)".to_string(),
-                status: SupportStatus::NotTested,
-                detail: Some("pass --verify to run live compute check".to_string()),
-            },
-        ]);
+            });
+        }
     }
 
     let report = DiagnosticReport {
@@ -233,12 +262,68 @@ fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let cli_report = DoctorCliReport {
+            report: &report,
+            telemetry: telemetry.as_deref(),
+        };
+        println!("{}", serde_json::to_string_pretty(&cli_report)?);
     } else {
-        print_doctor_report(&report);
+        print_doctor_report(&report, telemetry.as_deref());
     }
 
     Ok(())
+}
+
+fn push_unsupported_vulkan_caps(results: &mut Vec<CapabilityResult>, reason: &str) {
+    for &name in VULKAN_VERIFY_CAPABILITIES {
+        results.push(CapabilityResult {
+            name: name.to_string(),
+            status: SupportStatus::Unsupported,
+            detail: Some(reason.to_string()),
+        });
+    }
+}
+
+fn verify_f32_gemm_cap(
+    name: &str,
+    run_fn: impl FnOnce(
+        &[f32],
+        &[f32],
+        u32,
+    ) -> forge_core::ForgeResult<(Vec<f32>, forge_runtime::GpuTiming)>,
+) -> CapabilityResult {
+    let res = (|| -> Result<String> {
+        let n = 64u32;
+        let a = deterministic_f32_data((n * n) as usize, 11);
+        let b = deterministic_f32_data((n * n) as usize, 22);
+        let (actual, timing) = run_fn(&a, &b, n)?;
+        let expected = ref_gemm_f32_exact_f64(&a, &b, n as usize, n as usize, n as usize)?;
+        let acc = compare_slices(&actual, &expected, 1e-3, 1e-4)?;
+        if !acc.passed {
+            anyhow::bail!(
+                "numerical mismatch (max_abs_err={:.3e}, rmse={:.3e})",
+                acc.max_abs_err,
+                acc.rmse
+            );
+        }
+        Ok(format!(
+            "64x64x64 passed (max_abs_err={:.2e}, {:.3} ms)",
+            acc.max_abs_err,
+            timing.gpu_ms.unwrap_or(timing.wall_ms)
+        ))
+    })();
+    match res {
+        Ok(detail) => CapabilityResult {
+            name: name.to_string(),
+            status: SupportStatus::Verified,
+            detail: Some(detail),
+        },
+        Err(err) => CapabilityResult {
+            name: name.to_string(),
+            status: SupportStatus::Unsupported,
+            detail: Some(err.to_string()),
+        },
+    }
 }
 
 fn run_live_capability_checks(gpus: &[GpuDeviceInfo]) -> Vec<CapabilityResult> {
@@ -273,51 +358,47 @@ fn run_live_capability_checks(gpus: &[GpuDeviceInfo]) -> Vec<CapabilityResult> {
     }
 
     if gpus.is_empty() {
-        for name in [
-            "GEMM (Vulkan FP32)",
-            "RMSNorm (Vulkan FP32)",
-            "RoPE (Vulkan FP32)",
-        ] {
-            results.push(CapabilityResult {
-                name: name.to_string(),
-                status: SupportStatus::Unsupported,
-                detail: Some("no Vulkan GPU discovered".to_string()),
-            });
-        }
+        push_unsupported_vulkan_caps(&mut results, "no Vulkan GPU discovered");
         return results;
     }
 
     match VulkanComputeEngine::new(0) {
         Ok(engine) => {
-            // GEMM 64x64x64
-            let gemm_res = (|| -> Result<String> {
+            results.push(verify_f32_gemm_cap("GEMM (Vulkan FP32)", |a, b, n| {
+                engine.run_gemm_f32(a, b, n, n, n)
+            }));
+            results.push(verify_f32_gemm_cap(
+                "GEMM (Vulkan FP32 tiled vec4)",
+                |a, b, n| engine.run_gemm_f32_tiled_vec4(a, b, n, n, n),
+            ));
+
+            let i8_res = (|| -> Result<String> {
                 let n = 64u32;
-                let a = deterministic_f32_data((n * n) as usize, 11);
-                let b = deterministic_f32_data((n * n) as usize, 22);
-                let (actual, timing) = engine.run_gemm_f32(&a, &b, n, n, n)?;
-                let expected = ref_gemm_f32_exact_f64(&a, &b, n as usize, n as usize, n as usize)?;
-                let acc = compare_slices(&actual, &expected, 1e-3, 1e-4)?;
+                let n_us = n as usize;
+                let a = deterministic_i8_data(n_us * n_us, 71);
+                let b = deterministic_i8_data(n_us * n_us, 82);
+                let ap = pack_i8_row_major_k4(&a, n_us, n_us)?;
+                let bp = pack_i8_b_transposed_k4(&b, n_us, n_us)?;
+                let (actual, timing) = engine.run_gemm_i8_dp4a(&ap, &bp, n, n / 4, n)?;
+                let expected = ref_gemm_i8_to_i32(&a, &b, n_us, n_us, n_us)?;
+                let acc = compare_i32_exact(&actual, &expected)?;
                 if !acc.passed {
-                    anyhow::bail!(
-                        "numerical mismatch (max_abs_err={:.3e}, rmse={:.3e})",
-                        acc.max_abs_err,
-                        acc.rmse
-                    );
+                    anyhow::bail!("integer mismatch (max_abs_err={:.3e})", acc.max_abs_err);
                 }
                 Ok(format!(
-                    "64x64x64 passed (max_abs_err={:.2e}, {:.3} ms)",
+                    "64x64x64 exact (OpSDot, max_abs_err={:.0}, {:.3} ms)",
                     acc.max_abs_err,
                     timing.gpu_ms.unwrap_or(timing.wall_ms)
                 ))
             })();
-            results.push(match gemm_res {
+            results.push(match i8_res {
                 Ok(detail) => CapabilityResult {
-                    name: "GEMM (Vulkan FP32)".to_string(),
+                    name: "GEMM (Vulkan INT8 DP4A)".to_string(),
                     status: SupportStatus::Verified,
                     detail: Some(detail),
                 },
                 Err(err) => CapabilityResult {
-                    name: "GEMM (Vulkan FP32)".to_string(),
+                    name: "GEMM (Vulkan INT8 DP4A)".to_string(),
                     status: SupportStatus::Unsupported,
                     detail: Some(err.to_string()),
                 },
@@ -383,25 +464,13 @@ fn run_live_capability_checks(gpus: &[GpuDeviceInfo]) -> Vec<CapabilityResult> {
                 },
             });
         }
-        Err(err) => {
-            for name in [
-                "GEMM (Vulkan FP32)",
-                "RMSNorm (Vulkan FP32)",
-                "RoPE (Vulkan FP32)",
-            ] {
-                results.push(CapabilityResult {
-                    name: name.to_string(),
-                    status: SupportStatus::Unsupported,
-                    detail: Some(err.to_string()),
-                });
-            }
-        }
+        Err(err) => push_unsupported_vulkan_caps(&mut results, &err.to_string()),
     }
 
     results
 }
 
-fn print_doctor_report(report: &DiagnosticReport) {
+fn print_doctor_report(report: &DiagnosticReport, telemetry: Option<&[GpuTelemetrySample]>) {
     println!("RDNA FORGE DIAGNOSTICS");
     println!();
 
@@ -445,6 +514,48 @@ fn print_doctor_report(report: &DiagnosticReport) {
         for detail in &b.details {
             println!("    - {detail}");
         }
+    }
+
+    println!();
+    println!("TELEMETRY (ADLX)");
+    match telemetry {
+        Some(samples) if !samples.is_empty() => {
+            for s in samples {
+                let role = if s.discrete { "discrete" } else { "integrated" };
+                let dev_hex = s
+                    .pci_device_id
+                    .map(|id| format!(" (0x{id:04X})"))
+                    .unwrap_or_default();
+                let clk = fmt_opt(s.gpu_clock_mhz, "MHz");
+                let vclk = fmt_opt(s.vram_clock_mhz, "MHz");
+                let temp = fmt_opt_f64(s.gpu_temp_c, "C");
+                let hotspot = fmt_opt_f64(s.hotspot_temp_c, "C");
+                let pwr = fmt_opt_f64(s.gpu_power_w, "W");
+                let fan = fmt_opt(s.fan_rpm, "RPM");
+                let volt = fmt_opt(s.voltage_mv, "mV");
+                let vram_str = match (s.vram_used_mib, s.total_vram_mib) {
+                    (Some(u), Some(t)) if t > 0 => {
+                        let pct = (f64::from(u) / f64::from(t)) * 100.0;
+                        format!("{u}/{t} MiB ({pct:.1}%)")
+                    }
+                    (Some(u), _) => format!("{u} MiB"),
+                    _ => "n/a".to_string(),
+                };
+                println!("  {}{dev_hex} [{role}]:", s.gpu_name);
+                println!(
+                    "    Clock={clk} | VRAMClk={vclk} | Temp={temp} | Hotspot={hotspot} | Power={pwr} | Fan={fan} | Volt={volt} | VRAM={vram_str}"
+                );
+                if let (Some(u), Some(t)) = (s.vram_used_mib, s.total_vram_mib) {
+                    if let Some(warn) = check_vram_pressure_warning(f64::from(u), t) {
+                        println!("    WARNING: {warn}");
+                    }
+                }
+                if let Some(warn) = check_competing_workload_warning(s) {
+                    println!("    WARNING: {warn}");
+                }
+            }
+        }
+        _ => println!("  unavailable"),
     }
 
     println!();
@@ -592,6 +703,10 @@ fn cmd_bench_vulkan(args: &VulkanBenchArgs) -> Result<()> {
                 rss as f64 / (1024.0 * 1024.0)
             );
         }
+        if let Some(ref tel) = report.telemetry {
+            println!();
+            print_telemetry_summary("ADLX Telemetry (Vulkan suite)", tel);
+        }
     }
 
     Ok(())
@@ -610,6 +725,8 @@ fn cmd_bench_llama(args: &LlamaBenchArgs) -> Result<()> {
         hip_main_gpu: args.hip_mg,
         vulkan_device: args.vulkan_device.clone(),
         hip_device: args.hip_device.clone(),
+        flash_attn: args.flash_attn,
+        hip_disable_graphs: args.hip_disable_graphs,
     };
 
     let report = run_llama_comparison(&config).context("llama-bench comparison failed")?;
@@ -621,12 +738,20 @@ fn cmd_bench_llama(args: &LlamaBenchArgs) -> Result<()> {
     } else {
         println!("RDNA FORGE LLAMA.CPP BENCHMARK COMPARISON");
         println!(
-            "Model: {} | pp={} tg={} reps={} ngl={}",
+            "Model: {} | pp={} tg={} reps={} ngl={} fa={} hip_graphs={}",
             report.model_path,
             report.prompt_tokens,
             report.gen_tokens,
             report.reps,
-            report.n_gpu_layers
+            report.n_gpu_layers,
+            args.flash_attn
+                .map(|v| if v { "on" } else { "off" })
+                .unwrap_or("default"),
+            if args.hip_disable_graphs {
+                "disabled"
+            } else {
+                "default"
+            }
         );
         for run in &report.runs {
             println!();
@@ -636,6 +761,9 @@ fn cmd_bench_llama(args: &LlamaBenchArgs) -> Result<()> {
                     "  FAILED: {}",
                     run.error.as_deref().unwrap_or("unknown error")
                 );
+                if let Some(ref tel) = run.telemetry {
+                    print_telemetry_summary(&format!("ADLX Telemetry ({})", run.backend), tel);
+                }
                 continue;
             }
             for e in &run.entries {
@@ -649,6 +777,9 @@ fn cmd_bench_llama(args: &LlamaBenchArgs) -> Result<()> {
                     e.stddev_tok_s,
                     e.latency.median_ms
                 );
+            }
+            if let Some(ref tel) = run.telemetry {
+                print_telemetry_summary(&format!("ADLX Telemetry ({})", run.backend), tel);
             }
         }
     }
@@ -699,7 +830,7 @@ fn cmd_bench_triton(args: &TritonBenchArgs) -> Result<()> {
         for b in &report.benchmarks {
             if b.status != "verified" {
                 println!(
-                    "  {:<26} {:<16} [{}] {}",
+                    "  {:<32} {:<16} [{}] {}",
                     b.name,
                     b.shape,
                     b.status.to_uppercase(),
@@ -709,7 +840,7 @@ fn cmd_bench_triton(args: &TritonBenchArgs) -> Result<()> {
             }
             if let Some(ref lat) = b.latency {
                 println!(
-                    "  {:<26} {:<16} median={:.3} ms | {:.2} {} | pass={}",
+                    "  {:<32} {:<16} median={:.3} ms | {:.2} {} | pass={}",
                     b.name,
                     b.shape,
                     lat.median_ms,
@@ -719,9 +850,68 @@ fn cmd_bench_triton(args: &TritonBenchArgs) -> Result<()> {
                 );
             }
         }
+        if let Some(ref tel) = report.telemetry {
+            println!();
+            print_telemetry_summary("ADLX Telemetry (Triton suite)", tel);
+        }
     }
 
     Ok(())
+}
+
+fn fmt_opt<T: std::fmt::Display>(val: Option<T>, unit: &str) -> String {
+    val.map(|v| format!("{v} {unit}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn fmt_opt_f64(val: Option<f64>, unit: &str) -> String {
+    val.map(|v| format!("{v:.1} {unit}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn print_telemetry_summary(label: &str, t: &TelemetrySummary) {
+    println!(
+        "  {label}: {} ({} samples @ {} ms)",
+        t.gpu_name, t.sample_count, t.interval_ms
+    );
+    let mut parts = Vec::new();
+    if let Some(ref m) = t.gpu_clock_mhz {
+        parts.push(format!(
+            "clk={:.0} ({:.0}-{:.0}) MHz",
+            m.median, m.min, m.max
+        ));
+    }
+    if let Some(ref m) = t.vram_clock_mhz {
+        parts.push(format!("vram_clk={:.0} MHz", m.median));
+    }
+    if let Some(ref m) = t.gpu_temp_c {
+        parts.push(format!(
+            "temp={:.1} ({:.1}-{:.1}) C",
+            m.median, m.min, m.max
+        ));
+    }
+    if let Some(ref m) = t.hotspot_temp_c {
+        parts.push(format!("hotspot={:.1} (max {:.1}) C", m.median, m.max));
+    }
+    if let Some(ref m) = t.gpu_power_w {
+        parts.push(format!("pwr={:.1} (max {:.1}) W", m.median, m.max));
+    }
+    if let Some(ref m) = t.fan_rpm {
+        parts.push(format!("fan={:.0} RPM", m.median));
+    }
+    if let Some(ref m) = t.vram_used_mib {
+        let tot = t
+            .total_vram_mib
+            .map(|tot| format!("/{tot}"))
+            .unwrap_or_default();
+        parts.push(format!("vram={:.0}-{:.0}{tot} MiB", m.min, m.max));
+    }
+    if !parts.is_empty() {
+        println!("    {}", parts.join(" | "));
+    }
+    for warn in &t.warnings {
+        println!("    WARNING: {warn}");
+    }
 }
 
 fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {

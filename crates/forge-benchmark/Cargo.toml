@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 forge-core.workspace = true
 forge-device.workspace = true
+forge-profiler.workspace = true
 forge-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true

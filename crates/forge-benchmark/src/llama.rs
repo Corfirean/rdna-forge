@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use forge_core::{ForgeError, ForgeResult, SystemInfo};
-use forge_device::discover_system;
+use forge_device::{discover_gpus, discover_system};
+use forge_profiler::{TelemetryGuard, TelemetrySummary};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::peak_process_rss_bytes;
@@ -22,6 +23,10 @@ pub struct LlamaBenchConfig {
     pub hip_main_gpu: i32,
     pub vulkan_device: Option<String>,
     pub hip_device: Option<String>,
+    #[serde(default)]
+    pub flash_attn: Option<bool>,
+    #[serde(default)]
+    pub hip_disable_graphs: bool,
 }
 
 /// Raw entry emitted by `llama-bench -o json`.
@@ -101,6 +106,8 @@ pub struct BackendRunOutcome {
     pub succeeded: bool,
     pub entries: Vec<LlamaBenchEntry>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub telemetry: Option<TelemetrySummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +220,8 @@ pub fn run_llama_comparison(config: &LlamaBenchConfig) -> ForgeResult<LlamaCompa
     }
 
     let system = discover_system();
+    let gpus = discover_gpus();
+    let telemetry_device_id = gpus.first().map(|g| g.device_id);
     let mut runs = Vec::new();
 
     if let Some(ref bin) = config.vulkan_bin {
@@ -222,6 +231,7 @@ pub fn run_llama_comparison(config: &LlamaBenchConfig) -> ForgeResult<LlamaCompa
             config,
             config.vulkan_main_gpu,
             config.vulkan_device.as_deref(),
+            telemetry_device_id,
         ));
     }
 
@@ -232,6 +242,7 @@ pub fn run_llama_comparison(config: &LlamaBenchConfig) -> ForgeResult<LlamaCompa
             config,
             config.hip_main_gpu,
             config.hip_device.as_deref(),
+            telemetry_device_id,
         ));
     }
 
@@ -253,6 +264,7 @@ fn execute_single_backend(
     config: &LlamaBenchConfig,
     main_gpu: i32,
     device_selector: Option<&str>,
+    telemetry_device_id: Option<u32>,
 ) -> BackendRunOutcome {
     if !bin_path.exists() {
         return BackendRunOutcome {
@@ -261,6 +273,7 @@ fn execute_single_backend(
             succeeded: false,
             entries: Vec::new(),
             error: Some(format!("binary not found: {}", bin_path.display())),
+            telemetry: None,
         };
     }
 
@@ -286,8 +299,18 @@ fn execute_single_backend(
     if let Some(dev) = device_selector {
         cmd.arg("-dev").arg(dev);
     }
+    if let Some(fa) = config.flash_attn {
+        cmd.arg("-fa").arg(if fa { "1" } else { "0" });
+    }
+    if label == "hip" && config.hip_disable_graphs {
+        cmd.env("GGML_CUDA_DISABLE_GRAPHS", "1");
+    }
 
-    match cmd.output() {
+    let guard = TelemetryGuard::start(telemetry_device_id, std::time::Duration::from_millis(100));
+    let output_res = cmd.output();
+    let telemetry = guard.and_then(|g| g.stop_and_summarize());
+
+    match output_res {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             match parse_llama_bench_json(&stdout, label) {
@@ -297,6 +320,7 @@ fn execute_single_backend(
                     succeeded: true,
                     entries,
                     error: None,
+                    telemetry,
                 },
                 Err(err) => BackendRunOutcome {
                     backend: label.to_string(),
@@ -304,6 +328,7 @@ fn execute_single_backend(
                     succeeded: false,
                     entries: Vec::new(),
                     error: Some(err.to_string()),
+                    telemetry,
                 },
             }
         }
@@ -321,6 +346,7 @@ fn execute_single_backend(
                 succeeded: false,
                 entries: Vec::new(),
                 error: Some(format!("{code}; stderr: {stderr}; stdout: {stdout}")),
+                telemetry,
             }
         }
         Err(err) => BackendRunOutcome {
@@ -329,6 +355,7 @@ fn execute_single_backend(
             succeeded: false,
             entries: Vec::new(),
             error: Some(format!("failed to spawn {}: {err}", bin_path.display())),
+            telemetry,
         },
     }
 }

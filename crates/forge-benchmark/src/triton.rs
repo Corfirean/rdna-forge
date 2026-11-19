@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use forge_core::{ForgeError, ForgeResult};
+use forge_device::discover_gpus;
+use forge_profiler::{TelemetryGuard, TelemetrySummary};
 use serde::{Deserialize, Serialize};
 
 use crate::stats::LatencyStats;
@@ -71,6 +74,8 @@ pub struct TritonSuiteReport {
     pub provenance: TritonProvenance,
     pub benchmarks: Vec<TritonKernelOutcome>,
     pub stability: Option<TritonStabilityOutcome>,
+    #[serde(default)]
+    pub telemetry: Option<TelemetrySummary>,
 }
 
 /// Parses the JSON output produced by `modules/ai/triton/bench_suite.py`.
@@ -91,6 +96,9 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
         )));
     }
 
+    let primary_device_id = discover_gpus().first().map(|g| g.device_id);
+    let guard = TelemetryGuard::start(primary_device_id, Duration::from_millis(100));
+
     let output = Command::new(&config.python_exe)
         .arg(&config.script_path)
         .arg("--warmup")
@@ -102,6 +110,7 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
             runtime: "Python/Triton".to_string(),
             reason: format!("failed to launch '{}': {e}", config.python_exe.display()),
         })?;
+    let telemetry = guard.and_then(|g| g.stop_and_summarize());
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -113,7 +122,9 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_triton_suite_json(&stdout)
+    let mut report = parse_triton_suite_json(&stdout)?;
+    report.telemetry = telemetry;
+    Ok(report)
 }
 
 /// Locates `modules/ai/triton/bench_suite.py` relative to current working directory or repo root.
