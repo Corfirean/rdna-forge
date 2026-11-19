@@ -117,9 +117,11 @@ impl DesktopBenchRequest {
             "gemm_i8" | "gemm-i8" => VulkanKernelSelection::GemmI8,
             "gemv_w8" | "gemv-w8" => VulkanKernelSelection::GemvW8,
             "gemv_q4" | "gemv-q4" => VulkanKernelSelection::GemvQ4,
+            "gemv_q4_k" | "gemv-q4-k" => VulkanKernelSelection::GemvQ4K,
             "rmsnorm" => VulkanKernelSelection::RmsNorm,
             "rope" => VulkanKernelSelection::Rope,
             "fused_rms_rope" | "fused-rms-rope" => VulkanKernelSelection::FusedRmsRope,
+            "flash_attn" | "flash-attn" => VulkanKernelSelection::FlashAttn,
             other => return Err(format!("Unsupported Vulkan kernel selection '{other}'.")),
         };
 
@@ -380,6 +382,23 @@ mod tests {
         let cfg = valid.validate_and_build_config().expect("valid config");
         assert_eq!(cfg.kernel, VulkanKernelSelection::GemvW8);
         assert_eq!(cfg.batch_dispatches, Some(16));
+
+        let q4k = DesktopBenchRequest {
+            kernel: "gemv_q4_k".to_string(),
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .expect("q4_k config");
+        assert_eq!(q4k.kernel, VulkanKernelSelection::GemvQ4K);
+
+        let fa = DesktopBenchRequest {
+            kernel: "flash_attn".to_string(),
+            batch_dispatches: Some(1),
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .expect("flash_attn config");
+        assert_eq!(fa.kernel, VulkanKernelSelection::FlashAttn);
 
         let bad_kernel = DesktopBenchRequest {
             kernel: "unknown_kernel".to_string(),

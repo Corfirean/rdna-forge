@@ -5,10 +5,10 @@ use forge_device::discover_system;
 use forge_profiler::{TelemetryGuard, TelemetrySummary};
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4,
-    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
-    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, GpuTiming, NumericalAccuracy,
-    VulkanComputeEngine,
+    deterministic_q4_0_weights, deterministic_q4_k_weights, pack_i8_b_transposed_k4,
+    pack_i8_row_major_k4, ref_flash_attention_f32, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32,
+    ref_gemv_q4_0_f32, ref_gemv_q4_k_f32, ref_gemv_w8a32_f32, ref_rmsnorm_f32,
+    ref_rmsnorm_rope_f32, ref_rope_f32, GpuTiming, NumericalAccuracy, VulkanComputeEngine,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,9 +25,11 @@ pub enum VulkanKernelSelection {
     GemmI8,
     GemvW8,
     GemvQ4,
+    GemvQ4K,
     RmsNorm,
     Rope,
     FusedRmsRope,
+    FlashAttn,
 }
 
 /// Configuration for the Vulkan compute benchmark suite.
@@ -192,6 +194,22 @@ pub fn run_vulkan_suite(config: &VulkanBenchConfig) -> ForgeResult<VulkanBenchRe
 
     if matches!(
         config.kernel,
+        VulkanKernelSelection::All | VulkanKernelSelection::GemvQ4K
+    ) {
+        if wave32_supported {
+            for &(n, k) in &gemv_shapes {
+                benchmarks.push(bench_gemv_q4_k_case(&engine, n, k, config)?);
+            }
+        } else if matches!(config.kernel, VulkanKernelSelection::GemvQ4K) {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan Wave32 subgroup control is not supported on '{}'",
+                device.name
+            )));
+        }
+    }
+
+    if matches!(
+        config.kernel,
         VulkanKernelSelection::All | VulkanKernelSelection::FusedRmsRope
     ) {
         if engine.supports_subgroup_arithmetic() {
@@ -202,6 +220,28 @@ pub fn run_vulkan_suite(config: &VulkanBenchConfig) -> ForgeResult<VulkanBenchRe
         } else if matches!(config.kernel, VulkanKernelSelection::FusedRmsRope) {
             return Err(ForgeError::UnsupportedCapability(format!(
                 "Vulkan subgroup arithmetic is not supported on '{}'",
+                device.name
+            )));
+        }
+    }
+
+    if matches!(
+        config.kernel,
+        VulkanKernelSelection::All | VulkanKernelSelection::FlashAttn
+    ) {
+        if wave32_supported {
+            let fa_shapes: Vec<(u32, u32, u32)> = match config.size_override {
+                Some(s) => vec![(16, s, 64)],
+                None => vec![(16, 1024, 64), (8, 1024, 128)],
+            };
+            for (heads, seq, dim) in fa_shapes {
+                benchmarks.push(bench_flash_attention_case(
+                    &engine, heads, seq, dim, true, config,
+                )?);
+            }
+        } else if matches!(config.kernel, VulkanKernelSelection::FlashAttn) {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan Wave32 subgroup control is not supported on '{}'",
                 device.name
             )));
         }
@@ -716,6 +756,180 @@ fn bench_fused_rmsnorm_rope_case(
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
             "batch={batch}; Wave32 fused subgroup single-pass (eliminates intermediate HBM round-trip); full FP64 CPU reference"
+        )),
+    })
+}
+
+fn bench_gemv_q4_k_case(
+    engine: &VulkanComputeEngine,
+    n: u32,
+    k: u32,
+    config: &VulkanBenchConfig,
+) -> ForgeResult<BenchmarkResult> {
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let w_q4k = deterministic_q4_k_weights(n_us, k_us, 0xC001)?;
+    let x = deterministic_f32_data(k_us, 0xC002);
+    let batch = config.batch_dispatches.unwrap_or(16);
+
+    let (actual, timings) = engine.bench_gemv_q4_k_wave32_batched(
+        &w_q4k,
+        &x,
+        n,
+        k,
+        config.warmup_iters,
+        config.measured_iters,
+        batch,
+    )?;
+
+    let (timing_source, samples_ms) = extract_timing_samples(&timings);
+    let latency = compute_latency_stats(config.warmup_iters, &samples_ms)?;
+
+    let expected = ref_gemv_q4_k_f32(&w_q4k, &x, n_us, k_us)?;
+    let acc = compare_slices(&actual, &expected, 1e-2, 1e-3)?;
+
+    let weight_bytes = (w_q4k.len() as f64) * 4.0;
+    let fp32_weight_bytes = (n as f64) * (k as f64) * 4.0;
+    let compression = fp32_weight_bytes / weight_bytes;
+    let bytes_moved = weight_bytes + ((x.len() + n_us) as f64) * 4.0;
+    let gb_s = if latency.median_ms > 0.0 {
+        bytes_moved / (latency.median_ms / 1000.0) / 1e9
+    } else {
+        0.0
+    };
+    let gflops = if latency.median_ms > 0.0 {
+        (2.0 * (n as f64) * (k as f64)) / (latency.median_ms / 1000.0) / 1e9
+    } else {
+        0.0
+    };
+
+    Ok(BenchmarkResult {
+        name: format!("gemv_q4_k_wave32_{n}x{k}"),
+        backend: "vulkan_wgsl_wave32".to_string(),
+        shape: format!("{n}x{k}"),
+        dtype: "q4_K->f32".to_string(),
+        timing_source: timing_source.to_string(),
+        latency,
+        throughput_unit: "GB/s".to_string(),
+        throughput_median: gb_s,
+        accuracy: Some(acc),
+        peak_rss_bytes: peak_process_rss_bytes(),
+        notes: Some(format!(
+            "batch={batch}; Wave32 GGUF Q4_K super-block-256 ({compression:.2}x compression vs FP32, {gflops:.2} GFLOP/s); full FP64 CPU reference"
+        )),
+    })
+}
+
+fn bench_flash_attention_case(
+    engine: &VulkanComputeEngine,
+    total_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+    causal: bool,
+    config: &VulkanBenchConfig,
+) -> ForgeResult<BenchmarkResult> {
+    let head_elems = (seq_len as usize)
+        .checked_mul(head_dim as usize)
+        .ok_or_else(|| {
+            ForgeError::InvalidDimension("attention head stride overflow".to_string())
+        })?;
+    let elems = (total_heads as usize)
+        .checked_mul(head_elems)
+        .ok_or_else(|| ForgeError::InvalidDimension("attention tensor overflow".to_string()))?;
+
+    let q = deterministic_f32_data(elems, 0xD001);
+    let k = deterministic_f32_data(elems, 0xD002);
+    let v = deterministic_f32_data(elems, 0xD003);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let batch = config.batch_dispatches.unwrap_or(1);
+
+    let (actual, timings) = engine.bench_flash_attention_f32_wave32_batched(
+        &q,
+        &k,
+        &v,
+        total_heads,
+        seq_len,
+        head_dim,
+        causal,
+        scale,
+        config.warmup_iters,
+        config.measured_iters,
+        batch,
+    )?;
+
+    let (timing_source, samples_ms) = extract_timing_samples(&timings);
+    let latency = compute_latency_stats(config.warmup_iters, &samples_ms)?;
+
+    // Check finiteness on full output and exact FP64 accuracy on first + last head.
+    let mut head_acc = compare_slices(
+        &actual[..head_elems],
+        &ref_flash_attention_f32(
+            &q[..head_elems],
+            &k[..head_elems],
+            &v[..head_elems],
+            1,
+            seq_len as usize,
+            head_dim as usize,
+            causal,
+            scale,
+        )?,
+        5e-4,
+        1e-4,
+    )?;
+    if total_heads > 1 {
+        let last_off = ((total_heads as usize) - 1) * head_elems;
+        let last_acc = compare_slices(
+            &actual[last_off..last_off + head_elems],
+            &ref_flash_attention_f32(
+                &q[last_off..last_off + head_elems],
+                &k[last_off..last_off + head_elems],
+                &v[last_off..last_off + head_elems],
+                1,
+                seq_len as usize,
+                head_dim as usize,
+                causal,
+                scale,
+            )?,
+            5e-4,
+            1e-4,
+        )?;
+        head_acc.max_abs_err = head_acc.max_abs_err.max(last_acc.max_abs_err);
+        head_acc.max_rel_err = head_acc.max_rel_err.max(last_acc.max_rel_err);
+        head_acc.rmse = head_acc.rmse.max(last_acc.rmse);
+        head_acc.all_finite =
+            head_acc.all_finite && last_acc.all_finite && actual.iter().all(|v| v.is_finite());
+        head_acc.passed = head_acc.passed && last_acc.passed && head_acc.all_finite;
+        head_acc.element_count = actual.len();
+    }
+
+    let flops = if causal {
+        2.0 * (total_heads as f64) * (seq_len as f64) * ((seq_len + 1) as f64) * (head_dim as f64)
+    } else {
+        4.0 * (total_heads as f64) * (seq_len as f64) * (seq_len as f64) * (head_dim as f64)
+    };
+    let gflops = if latency.median_ms > 0.0 {
+        flops / (latency.median_ms / 1000.0) / 1e9
+    } else {
+        0.0
+    };
+    let saved_score_mib = ((u64::from(total_heads) * u64::from(seq_len) * u64::from(seq_len) * 4)
+        as f64)
+        / (1024.0 * 1024.0);
+
+    Ok(BenchmarkResult {
+        name: format!("flash_attn_f32_wave32_{total_heads}x{seq_len}x{head_dim}"),
+        backend: "vulkan_wgsl_wave32".to_string(),
+        shape: format!("{total_heads}x{seq_len}x{head_dim}"),
+        dtype: "f32".to_string(),
+        timing_source: timing_source.to_string(),
+        latency,
+        throughput_unit: "GFLOP/s".to_string(),
+        throughput_median: gflops,
+        accuracy: Some(head_acc),
+        peak_rss_bytes: peak_process_rss_bytes(),
+        notes: Some(format!(
+            "batch={batch}; causal={causal}, 16 KiB LDS tiled BC=16 (saves {saved_score_mib:.1} MiB naive SxS score HBM); FP64 checked on heads 0 & {}",
+            total_heads.saturating_sub(1)
         )),
     })
 }

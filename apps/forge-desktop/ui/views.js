@@ -999,7 +999,9 @@ export function renderVideo(root, state, actions) {
 const KERNEL_OPTIONS = [
   ["gemv_w8", "gemv_w8 (Wave32 W8A32 GEMV)"],
   ["gemv_q4", "gemv_q4 (Wave32 Q4_0 GEMV)"],
+  ["gemv_q4_k", "gemv_q4_k (Wave32 GGUF Q4_K GEMV)"],
   ["fused_rms_rope", "fused_rms_rope (Fused Subgroup RMSNorm+RoPE)"],
+  ["flash_attn", "flash_attn (Wave32 Tiled Causal FlashAttention)"],
   ["rmsnorm", "rmsnorm (FP32 RMSNorm)"],
   ["rope", "rope (FP32 RoPE)"],
   ["gemm_opt", "gemm_opt (Tiled vec4 FP32 GEMM)"],

@@ -97,9 +97,12 @@ enum KernelChoice {
     GemmI8,
     GemvW8,
     GemvQ4,
+    #[value(name = "gemv-q4-k", alias = "gemv-q4k")]
+    GemvQ4K,
     Rmsnorm,
     Rope,
     FusedRmsRope,
+    FlashAttn,
 }
 
 impl From<KernelChoice> for VulkanKernelSelection {
@@ -111,9 +114,11 @@ impl From<KernelChoice> for VulkanKernelSelection {
             KernelChoice::GemmI8 => Self::GemmI8,
             KernelChoice::GemvW8 => Self::GemvW8,
             KernelChoice::GemvQ4 => Self::GemvQ4,
+            KernelChoice::GemvQ4K => Self::GemvQ4K,
             KernelChoice::Rmsnorm => Self::RmsNorm,
             KernelChoice::Rope => Self::Rope,
             KernelChoice::FusedRmsRope => Self::FusedRmsRope,
+            KernelChoice::FlashAttn => Self::FlashAttn,
         }
     }
 }
@@ -962,5 +967,29 @@ mod tests {
             } => assert_eq!(args.batch_dispatches, Some(16)),
             other => panic!("unexpected command parsed: {other:?}"),
         }
+
+        let q4k = Cli::try_parse_from(["forge", "bench", "vulkan", "--kernel", "gemv-q4-k"])
+            .expect("gemv-q4-k kernel choice must parse");
+        assert!(matches!(
+            q4k.command,
+            Commands::Bench {
+                target: BenchSubcommand::Vulkan(VulkanBenchArgs {
+                    kernel: KernelChoice::GemvQ4K,
+                    ..
+                })
+            }
+        ));
+
+        let fa = Cli::try_parse_from(["forge", "bench", "vulkan", "--kernel", "flash-attn"])
+            .expect("flash-attn kernel choice must parse");
+        assert!(matches!(
+            fa.command,
+            Commands::Bench {
+                target: BenchSubcommand::Vulkan(VulkanBenchArgs {
+                    kernel: KernelChoice::FlashAttn,
+                    ..
+                })
+            }
+        ));
     }
 }

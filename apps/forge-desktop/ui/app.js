@@ -529,7 +529,7 @@ const actions = {
   updateBenchField: (key, value) => {
     state.benchForm[key] = value;
     if (key === "kernel") {
-      state.benchForm.batch_dispatches = ["gemm", "gemm_opt", "gemm_i8", "all"].includes(value) ? 1 : 16;
+      state.benchForm.batch_dispatches = ["gemm", "gemm_opt", "gemm_i8", "flash_attn", "all"].includes(value) ? 1 : 16;
       renderActiveView();
     }
   },
