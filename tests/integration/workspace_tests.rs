@@ -211,12 +211,14 @@ fn forge_cli_help_and_profile_show_succeed() {
     assert!(stdout.contains("bench"));
     assert!(stdout.contains("monitor"));
     assert!(stdout.contains("tune"));
+    assert!(stdout.contains("video"));
     assert!(stdout.contains("profile"));
 
     for args in [
         &["monitor", "--help"][..],
         &["tune", "--help"][..],
         &["tune", "power-limit", "--help"][..],
+        &["video", "caps", "--help"][..],
     ] {
         let out = Command::new(bin)
             .args(args)

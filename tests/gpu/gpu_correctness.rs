@@ -9,8 +9,9 @@ use forge_profiler::{
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
     deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4,
-    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
-    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
+    probe_amf_capabilities, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32,
+    ref_gemv_w8a32_f32, ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer,
+    AmfAcceleration, AmfCodecDirection, VulkanComputeEngine,
 };
 
 #[test]
@@ -420,5 +421,63 @@ fn vulkan_rmsnorm_rope_subgroup_edge_cases_and_validation() {
             theta
         ),
         Err(ForgeError::InvalidDimension(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn amf_live_video_capabilities_probe_verifies_vcn_codecs() {
+    let report = probe_amf_capabilities().expect("AMF live capability probe must succeed");
+    assert!(report.dx11_initialized);
+    assert!(!report.runtime_version.is_empty());
+
+    let h264_enc = report
+        .codecs
+        .iter()
+        .find(|c| c.codec == "H.264/AVC" && c.direction == AmfCodecDirection::Encode)
+        .expect("H.264/AVC encode entry");
+    assert_eq!(h264_enc.acceleration, AmfAcceleration::Hardware);
+    assert!(h264_enc.max_width.unwrap_or(0) >= 4096);
+
+    let hevc_enc = report
+        .codecs
+        .iter()
+        .find(|c| c.codec == "HEVC/H.265" && c.direction == AmfCodecDirection::Encode)
+        .expect("HEVC encode entry");
+    assert_eq!(hevc_enc.acceleration, AmfAcceleration::Hardware);
+    assert!(hevc_enc.max_width.unwrap_or(0) >= 4096);
+
+    for dec_codec in ["H.264/AVC", "HEVC/H.265", "VP9", "AV1"] {
+        let dec = report
+            .codecs
+            .iter()
+            .find(|c| c.codec == dec_codec && c.direction == AmfCodecDirection::Decode)
+            .unwrap_or_else(|| panic!("{dec_codec} decode entry missing"));
+        assert_eq!(dec.acceleration, AmfAcceleration::Hardware);
+        assert!(dec.max_width.unwrap_or(0) >= 4096);
+    }
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_batched_decode_dispatch_matches_single_dispatch() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    let (n, k) = (256u32, 256u32);
+    let (w_q4, scales) = deterministic_q4_0_weights(n as usize, k as usize, 1234).unwrap();
+    let x = deterministic_f32_data(k as usize, 5678);
+
+    let (actual, timings) = engine
+        .bench_gemv_q4_0_wave32_batched(&w_q4, &scales, &x, n, k, 2, 5, 8)
+        .expect("batched Q4_0 dispatch must succeed");
+    assert_eq!(timings.len(), 5);
+    assert!(timings.iter().all(|t| t.gpu_ms.unwrap_or(t.wall_ms) > 0.0));
+
+    let expected = ref_gemv_q4_0_f32(&w_q4, &scales, &x, n as usize, k as usize).unwrap();
+    let acc = compare_slices(&actual, &expected, 1e-2, 1e-3).unwrap();
+    assert!(acc.passed, "max_abs_err={}", acc.max_abs_err);
+
+    assert!(matches!(
+        engine.bench_gemv_q4_0_wave32_batched(&w_q4, &scales, &x, n, k, 0, 1, 0),
+        Err(ForgeError::InvalidParameter(_))
     ));
 }
