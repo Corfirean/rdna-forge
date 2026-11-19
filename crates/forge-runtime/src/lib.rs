@@ -8,13 +8,15 @@ pub use hip_verify::{verify_hip_transfer, HipVerificationResult};
 pub use probe::probe_all_backends;
 pub use reference::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32, ref_gemm_f32_exact_f64,
-    ref_gemm_i8_to_i32, ref_rmsnorm_f32, ref_rope_f32, NumericalAccuracy,
+    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32,
+    ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_w8a32_f32,
+    ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, NumericalAccuracy, Q4_0_BLOCK_SIZE,
 };
 pub use shaders::{
-    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, spirv_contains_opcode,
-    GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
-    SPIRV_OP_SDOT,
+    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, compile_wgsl_to_spirv_subgroup,
+    spirv_contains_opcode, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL,
+    GEMV_Q4_0_WAVE32_WGSL, GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL,
+    RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL, SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
 };
 pub use vulkan_compute::{GpuTiming, VulkanComputeEngine};
 
@@ -46,6 +48,73 @@ mod tests {
             spirv_contains_opcode(&dp4a_spv, SPIRV_OP_SDOT),
             "gemm_i8_dp4a SPIR-V must emit native OpSDot (4450)"
         );
+
+        for (name, src) in [
+            ("gemv_w8a32_wave32", GEMV_W8A32_WAVE32_WGSL),
+            ("gemv_q4_0_wave32", GEMV_Q4_0_WAVE32_WGSL),
+            ("rmsnorm_rope_f32_subgroup", RMSNORM_ROPE_F32_SUBGROUP_WGSL),
+        ] {
+            let sg_spv = compile_wgsl_to_spirv_subgroup(src)
+                .unwrap_or_else(|e| panic!("{name} failed subgroup SPIR-V compile: {e}"));
+            assert!(sg_spv.len() > 10 && sg_spv[0] == 0x0723_0203);
+            assert!(
+                spirv_contains_opcode(&sg_spv, SPIRV_OP_GROUP_NON_UNIFORM_FADD),
+                "{name} SPIR-V must emit OpGroupNonUniformFAdd (350)"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_reference_kernels_and_q4_packing_work() {
+        // W8A32 exact row dot check: row0=[1,2,3,4]*0.5 dot [1,1,1,1] = 5.0
+        // row1=[-1,-2,-3,-4]*0.25 dot [1,1,1,1] = -2.5
+        let w_i8 = [1i8, 2, 3, 4, -1, -2, -3, -4];
+        let scales = [0.5f32, 0.25f32];
+        let x = [1.0f32, 1.0, 1.0, 1.0];
+        let y_w8 = ref_gemv_w8a32_f32(&w_i8, &scales, &x, 2, 4).unwrap();
+        assert_eq!(y_w8, vec![5.0, -2.5]);
+
+        // Q4_0 exact single block: nibble 9 -> (9 - 8) = +1; word 0x99999999 = all +1s.
+        // Scale 0.5, x = 1.0 -> 32 * 1 * 0.5 = 16.0.
+        // Nibble 7 -> (7 - 8) = -1; word 0x77777777 = all -1s -> scale 0.25 -> -8.0.
+        let w_q4 = [
+            0x9999_9999u32,
+            0x9999_9999,
+            0x9999_9999,
+            0x9999_9999,
+            0x7777_7777,
+            0x7777_7777,
+            0x7777_7777,
+            0x7777_7777,
+        ];
+        let x32 = vec![1.0f32; 32];
+        let y_q4 = ref_gemv_q4_0_f32(&w_q4, &[0.5, 0.25], &x32, 2, 32).unwrap();
+        assert_eq!(y_q4, vec![16.0, -8.0]);
+
+        let (det_w, det_s) = deterministic_q4_0_weights(3, 64, 42).unwrap();
+        assert_eq!(det_w.len(), 3 * 2 * 4);
+        assert_eq!(det_s.len(), 3 * 2);
+
+        // Fused RMSNorm+RoPE with pos_offset > 0 must match chained CPU reference at the same positions
+        let rx = [1.0f32, -2.0, 0.5, 1.5, -1.0, 2.0, 3.0, -0.5];
+        let rw = [1.0f32, 0.5, -1.5, 2.0];
+        let fused = ref_rmsnorm_rope_f32(&rx, &rw, 2, 2, 2, 10, 1e-5, 10000.0).unwrap();
+        let norm_only = ref_rmsnorm_f32(&rx, &rw, 2, 4, 1e-5).unwrap();
+        // Position 10 + 0 vs 10 + 1: embed into 11-token identity to check row 10 & row 11
+        let mut padded = vec![0.0f32; 12 * 4];
+        padded[10 * 4..12 * 4].copy_from_slice(&norm_only);
+        let chained = ref_rope_f32(&padded, 12, 2, 2, 10000.0).unwrap();
+        let acc = compare_slices(&fused, &chained[10 * 4..12 * 4], 1e-5, 1e-5).unwrap();
+        assert!(acc.passed, "max_abs_err={}", acc.max_abs_err);
+
+        assert!(matches!(
+            deterministic_q4_0_weights(2, 30, 1),
+            Err(ForgeError::InvalidDimension(_))
+        ));
+        assert!(matches!(
+            pack_i8_row_major_k4(&[1, 2, 3], 1, 3),
+            Err(ForgeError::InvalidDimension(_))
+        ));
     }
 
     #[test]

@@ -429,3 +429,211 @@ pub fn compare_i32_exact(actual: &[i32], expected: &[i32]) -> ForgeResult<Numeri
         passed: max_abs_err == 0.0,
     })
 }
+
+/// Elements per quantized `Q4_0` block (32 4-bit weights + 1 scalar scale).
+pub const Q4_0_BLOCK_SIZE: usize = 32;
+
+/// Generates deterministic `Q4_0` packed 4-bit weights (`[0..15]` biased `-8..+7`) and positive scales.
+pub fn deterministic_q4_0_weights(
+    n: usize,
+    k: usize,
+    seed: u64,
+) -> ForgeResult<(Vec<u32>, Vec<f32>)> {
+    if n == 0 || k == 0 || !k.is_multiple_of(Q4_0_BLOCK_SIZE) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "Q4_0 weights require n > 0 and k divisible by {Q4_0_BLOCK_SIZE}, got ({n}, {k})"
+        )));
+    }
+    let n_blocks = k / Q4_0_BLOCK_SIZE;
+    let total_blocks = n
+        .checked_mul(n_blocks)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_0 block count overflow".to_string()))?;
+    let total_words = total_blocks
+        .checked_mul(4)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_0 word count overflow".to_string()))?;
+
+    let mut state = seed ^ 0x517C_C1B7_2722_0A95;
+    let mut next_u64 = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+
+    let mut packed = Vec::with_capacity(total_words);
+    for _ in 0..total_words {
+        let mut word = 0u32;
+        for nib in 0..8 {
+            let q = ((next_u64() >> 60) as u32) & 0xF;
+            word |= q << (nib * 4);
+        }
+        packed.push(word);
+    }
+
+    let mut scales = Vec::with_capacity(total_blocks);
+    for _ in 0..total_blocks {
+        let frac = ((next_u64() >> 40) as f32) / 16_777_216.0_f32;
+        scales.push(0.01 + frac * 0.24);
+    }
+
+    Ok((packed, scales))
+}
+
+/// Exact FP64 CPU reference for row-scaled INT8 weight-only GEMV: `y[n] = scales[n] * dot(W[n, k], x[k])`.
+pub fn ref_gemv_w8a32_f32(
+    w_i8: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    n: usize,
+    k: usize,
+) -> ForgeResult<Vec<f32>> {
+    if n == 0 || k == 0 {
+        return Err(ForgeError::InvalidDimension(
+            "W8A32 GEMV dimensions n and k must be > 0".to_string(),
+        ));
+    }
+    let expected_w = n
+        .checked_mul(k)
+        .ok_or_else(|| ForgeError::InvalidDimension("n * k overflow".to_string()))?;
+    if w_i8.len() != expected_w || scales.len() != n || x.len() != k {
+        return Err(ForgeError::InvalidDimension(format!(
+            "W8A32 GEMV buffer mismatch: got w={}, scales={}, x={}, expected ({expected_w}, {n}, {k})",
+            w_i8.len(),
+            scales.len(),
+            x.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let w_row = &w_i8[row * k..(row + 1) * k];
+        let mut acc = 0.0f64;
+        for (&w, &xv) in w_row.iter().zip(x.iter()) {
+            acc += f64::from(w) * f64::from(xv);
+        }
+        out.push((acc * f64::from(scales[row])) as f32);
+    }
+    Ok(out)
+}
+
+/// Exact FP64 CPU reference for block-32 `Q4_0` dequantized GEMV matching `gemv_q4_0_wave32.wgsl`.
+pub fn ref_gemv_q4_0_f32(
+    w_q4_packed: &[u32],
+    scales: &[f32],
+    x: &[f32],
+    n: usize,
+    k: usize,
+) -> ForgeResult<Vec<f32>> {
+    if n == 0 || k == 0 || !k.is_multiple_of(Q4_0_BLOCK_SIZE) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "Q4_0 GEMV requires n > 0 and k divisible by {Q4_0_BLOCK_SIZE}, got ({n}, {k})"
+        )));
+    }
+    let n_blocks = k / Q4_0_BLOCK_SIZE;
+    let total_blocks = n
+        .checked_mul(n_blocks)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_0 block count overflow".to_string()))?;
+    let expected_words = total_blocks
+        .checked_mul(4)
+        .ok_or_else(|| ForgeError::InvalidDimension("Q4_0 word count overflow".to_string()))?;
+    if w_q4_packed.len() != expected_words || scales.len() != total_blocks || x.len() != k {
+        return Err(ForgeError::InvalidDimension(format!(
+            "Q4_0 GEMV buffer mismatch: got w_words={}, scales={}, x={}, expected ({expected_words}, {total_blocks}, {k})",
+            w_q4_packed.len(),
+            scales.len(),
+            x.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut row_acc = 0.0f64;
+        for blk in 0..n_blocks {
+            let blk_idx = row * n_blocks + blk;
+            let q_base = blk_idx * 4;
+            let x_base = blk * Q4_0_BLOCK_SIZE;
+            let mut blk_acc = 0.0f64;
+            for j in 0..4 {
+                let word = w_q4_packed[q_base + j];
+                for nib in 0..8 {
+                    let qval = ((word >> (nib * 4)) & 0xF) as i32 - 8;
+                    blk_acc += f64::from(qval) * f64::from(x[x_base + j * 8 + nib]);
+                }
+            }
+            row_acc += blk_acc * f64::from(scales[blk_idx]);
+        }
+        out.push(row_acc as f32);
+    }
+    Ok(out)
+}
+
+/// Exact FP64 CPU reference for fused RMSNorm + RoPE with KV-cache position offset `pos_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn ref_rmsnorm_rope_f32(
+    x: &[f32],
+    weight: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    pos_offset: usize,
+    eps: f32,
+    theta_base: f32,
+) -> ForgeResult<Vec<f32>> {
+    if seq_len == 0 || n_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "fused RMSNorm+RoPE requires non-zero dims and even head_dim, got ({seq_len}, {n_heads}, {head_dim})"
+        )));
+    }
+    if theta_base <= 0.0 || !theta_base.is_finite() {
+        return Err(ForgeError::InvalidDimension(format!(
+            "theta_base must be positive and finite, got {theta_base}"
+        )));
+    }
+    let cols = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| ForgeError::InvalidDimension("n_heads * head_dim overflow".to_string()))?;
+    let total = seq_len
+        .checked_mul(cols)
+        .ok_or_else(|| ForgeError::InvalidDimension("seq_len * cols overflow".to_string()))?;
+    if x.len() != total || weight.len() != cols {
+        return Err(ForgeError::InvalidDimension(format!(
+            "fused RMSNorm+RoPE buffer mismatch: got x={}, w={}, expected ({total}, {cols})",
+            x.len(),
+            weight.len()
+        )));
+    }
+
+    let half_dim = head_dim / 2;
+    let mut out = vec![0.0f32; total];
+    for row in 0..seq_len {
+        let row_off = row * cols;
+        let row_slice = &x[row_off..row_off + cols];
+        let sq_sum: f64 = row_slice
+            .iter()
+            .map(|&v| {
+                let d = f64::from(v);
+                d * d
+            })
+            .sum();
+        let inv_rms = 1.0 / ((sq_sum / cols as f64) + f64::from(eps)).sqrt();
+        let pos = (row + pos_offset) as f64;
+
+        for head in 0..n_heads {
+            let head_off = head * head_dim;
+            for i in 0..half_dim {
+                let exponent = -((2 * i) as f64) / (head_dim as f64);
+                let angle = pos * f64::from(theta_base).powf(exponent);
+                let cs = angle.cos();
+                let sn = angle.sin();
+                let c0 = head_off + 2 * i;
+                let c1 = c0 + 1;
+                let n0 = f64::from(row_slice[c0]) * inv_rms * f64::from(weight[c0]);
+                let n1 = f64::from(row_slice[c1]) * inv_rms * f64::from(weight[c1]);
+                out[row_off + c0] = (n0 * cs - n1 * sn) as f32;
+                out[row_off + c1] = (n0 * sn + n1 * cs) as f32;
+            }
+        }
+    }
+
+    Ok(out)
+}

@@ -9,9 +9,11 @@ use forge_core::{
 use forge_device::discover_gpus;
 use serde::{Deserialize, Serialize};
 
+use crate::reference::Q4_0_BLOCK_SIZE;
 use crate::shaders::{
-    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL,
-    GEMM_I8_DP4A_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
+    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, compile_wgsl_to_spirv_subgroup,
+    GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, GEMV_Q4_0_WAVE32_WGSL,
+    GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL, RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL,
 };
 
 /// Timing measurements from a single Vulkan compute dispatch.
@@ -32,6 +34,15 @@ struct GemmParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct GemvParams {
+    n: u32,
+    inner_blocks: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct RmsNormParams {
     rows: u32,
     cols: u32,
@@ -48,6 +59,19 @@ struct RopeParams {
     theta_base: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RmsRopeParams {
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    pos_offset: u32,
+    eps: f32,
+    theta_base: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 struct VulkanContext {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -58,6 +82,8 @@ struct VulkanContext {
     query_pool: Option<vk::QueryPool>,
     timestamp_period_ns: f32,
     int8_dot_product_enabled: bool,
+    subgroup_arithmetic_enabled: bool,
+    wave32_subgroup_control_enabled: bool,
 }
 
 impl Drop for VulkanContext {
@@ -214,8 +240,18 @@ impl VulkanComputeEngine {
                 ))
             })?;
 
+        let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut sg_props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup_props);
+        unsafe { instance.get_physical_device_properties2(pd, &mut sg_props2) };
+        let subgroup_arithmetic_enabled = subgroup_props
+            .supported_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+            && subgroup_props
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::ARITHMETIC);
+
         let has_vk13 = props.api_version >= vk::API_VERSION_1_3;
-        let dp4a_supported = if has_vk13 {
+        let (dp4a_supported, wave32_ctrl_supported) = if has_vk13 {
             let mut vk13_props = vk::PhysicalDeviceVulkan13Properties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut vk13_props);
             unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
@@ -224,10 +260,19 @@ impl VulkanComputeEngine {
             let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vk13_feat);
             unsafe { instance.get_physical_device_features2(pd, &mut feat2) };
 
-            vk13_feat.shader_integer_dot_product == vk::TRUE
-                && vk13_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
+            let dp4a = vk13_feat.shader_integer_dot_product == vk::TRUE
+                && vk13_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE;
+            let wave32_ctrl = subgroup_arithmetic_enabled
+                && vk13_feat.subgroup_size_control == vk::TRUE
+                && vk13_feat.compute_full_subgroups == vk::TRUE
+                && vk13_props.min_subgroup_size <= 32
+                && vk13_props.max_subgroup_size >= 32
+                && vk13_props
+                    .required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE);
+            (dp4a, wave32_ctrl)
         } else {
-            false
+            (false, false)
         };
 
         let queue_priorities = [1.0f32];
@@ -235,10 +280,12 @@ impl VulkanComputeEngine {
             .queue_family_index(qf_index as u32)
             .queue_priorities(&queue_priorities);
         let mut enabled_vk13_feat = vk::PhysicalDeviceVulkan13Features::default()
-            .shader_integer_dot_product(dp4a_supported);
+            .shader_integer_dot_product(dp4a_supported)
+            .subgroup_size_control(wave32_ctrl_supported)
+            .compute_full_subgroups(wave32_ctrl_supported);
         let mut device_info =
             vk::DeviceCreateInfo::default().queue_create_infos(std::slice::from_ref(&queue_info));
-        if dp4a_supported {
+        if dp4a_supported || wave32_ctrl_supported {
             device_info = device_info.push_next(&mut enabled_vk13_feat);
         }
 
@@ -289,6 +336,8 @@ impl VulkanComputeEngine {
             query_pool,
             timestamp_period_ns: props.limits.timestamp_period,
             int8_dot_product_enabled: dp4a_supported,
+            subgroup_arithmetic_enabled,
+            wave32_subgroup_control_enabled: wave32_ctrl_supported,
         });
 
         Ok(Self {
@@ -303,6 +352,14 @@ impl VulkanComputeEngine {
 
     pub fn supports_int8_dp4a(&self) -> bool {
         self.ctx.int8_dot_product_enabled
+    }
+
+    pub fn supports_subgroup_arithmetic(&self) -> bool {
+        self.ctx.subgroup_arithmetic_enabled
+    }
+
+    pub fn supports_wave32_subgroup_control(&self) -> bool {
+        self.ctx.wave32_subgroup_control_enabled
     }
 
     /// Executes baseline `16x16` FP32 `C[m, n] = A[m, k] * B[k, n]` once and returns output plus timing.
@@ -448,7 +505,7 @@ impl VulkanComputeEngine {
         )?;
 
         let spirv = compile_wgsl_to_spirv(shader_src)?;
-        let pipeline = self.create_compute_pipeline(&spirv, 3, true)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 3, true, None)?;
 
         let buf_a = self.upload_device_local_slice(a)?;
         let buf_b = self.upload_device_local_slice(b)?;
@@ -548,7 +605,7 @@ impl VulkanComputeEngine {
         )?;
 
         let spirv = compile_wgsl_to_spirv_dp4a(GEMM_I8_DP4A_WGSL)?;
-        let pipeline = self.create_compute_pipeline(&spirv, 3, true)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 3, true, None)?;
 
         let buf_a = self.upload_device_local_slice(a_packed)?;
         let buf_b = self.upload_device_local_slice(b_t_packed)?;
@@ -633,7 +690,7 @@ impl VulkanComputeEngine {
         )?;
 
         let spirv = compile_wgsl_to_spirv(RMSNORM_F32_WGSL)?;
-        let pipeline = self.create_compute_pipeline(&spirv, 3, true)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 3, true, None)?;
 
         let buf_x = self.upload_device_local_slice(x)?;
         let buf_w = self.upload_device_local_slice(weight)?;
@@ -722,7 +779,7 @@ impl VulkanComputeEngine {
         )?;
 
         let spirv = compile_wgsl_to_spirv(ROPE_F32_WGSL)?;
-        let pipeline = self.create_compute_pipeline(&spirv, 2, true)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 2, true, None)?;
 
         let buf_in = self.upload_device_local_slice(input)?;
         let buf_out = self.create_device_local_buffer(bytes)?;
@@ -748,11 +805,316 @@ impl VulkanComputeEngine {
         Ok((out, timings))
     }
 
+    /// Executes Wave32 INT8 weight-only GEMV (`W8A32`) once and returns `y[n]` plus timing.
+    pub fn run_gemv_w8a32_wave32(
+        &self,
+        w_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+    ) -> ForgeResult<(Vec<f32>, GpuTiming)> {
+        let (out, mut timings) = self.bench_gemv_w8a32_wave32(w_packed, scales, x, n, k, 0, 1)?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed("missing W8A32 GEMV timing measurement".to_string())
+        })?;
+        Ok((out, timing))
+    }
+
+    /// Benchmarks Wave32 INT8 weight-only GEMV (`W8A32`) on device-local buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemv_w8a32_wave32(
+        &self,
+        w_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        if n == 0 || k == 0 || !k.is_multiple_of(4) {
+            return Err(ForgeError::InvalidDimension(format!(
+                "W8A32 GEMV requires n > 0 and k divisible by 4, got ({n}, {k})"
+            )));
+        }
+        let k_packed = k / 4;
+        let expected_w = (n as usize)
+            .checked_mul(k_packed as usize)
+            .ok_or_else(|| ForgeError::InvalidDimension("n * k_packed overflow".to_string()))?;
+        self.bench_quant_gemv_wave32(
+            "W8A32",
+            GEMV_W8A32_WAVE32_WGSL,
+            w_packed,
+            scales,
+            x,
+            n,
+            k,
+            k_packed,
+            expected_w,
+            n as usize,
+            warmup_iters,
+            measured_iters,
+        )
+    }
+
+    /// Executes Wave32 `Q4_0` block-32 GEMV once and returns `y[n]` plus timing.
+    pub fn run_gemv_q4_0_wave32(
+        &self,
+        w_q4_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+    ) -> ForgeResult<(Vec<f32>, GpuTiming)> {
+        let (out, mut timings) = self.bench_gemv_q4_0_wave32(w_q4_packed, scales, x, n, k, 0, 1)?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed("missing Q4_0 GEMV timing measurement".to_string())
+        })?;
+        Ok((out, timing))
+    }
+
+    /// Benchmarks Wave32 `Q4_0` block-32 GEMV on device-local buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemv_q4_0_wave32(
+        &self,
+        w_q4_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        if n == 0 || k == 0 || !k.is_multiple_of(Q4_0_BLOCK_SIZE as u32) {
+            return Err(ForgeError::InvalidDimension(format!(
+                "Q4_0 GEMV requires n > 0 and k divisible by {Q4_0_BLOCK_SIZE}, got ({n}, {k})"
+            )));
+        }
+        let n_blocks = k / (Q4_0_BLOCK_SIZE as u32);
+        let total_blocks = (n as usize)
+            .checked_mul(n_blocks as usize)
+            .ok_or_else(|| ForgeError::InvalidDimension("n * n_blocks overflow".to_string()))?;
+        let expected_w = total_blocks
+            .checked_mul(4)
+            .ok_or_else(|| ForgeError::InvalidDimension("Q4_0 word count overflow".to_string()))?;
+        self.bench_quant_gemv_wave32(
+            "Q4_0",
+            GEMV_Q4_0_WAVE32_WGSL,
+            w_q4_packed,
+            scales,
+            x,
+            n,
+            k,
+            n_blocks,
+            expected_w,
+            total_blocks,
+            warmup_iters,
+            measured_iters,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bench_quant_gemv_wave32(
+        &self,
+        label: &str,
+        shader_src: &str,
+        w_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        inner_blocks: u32,
+        expected_w_len: usize,
+        expected_scales_len: usize,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        if !self.ctx.subgroup_arithmetic_enabled || !self.ctx.wave32_subgroup_control_enabled {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan 1.3 Wave32 subgroup arithmetic control is unavailable on '{}'",
+                self.device_info.name
+            )));
+        }
+        if measured_iters == 0 {
+            return Err(ForgeError::InvalidDimension(
+                "measured_iters must be > 0".to_string(),
+            ));
+        }
+        if w_packed.len() != expected_w_len
+            || scales.len() != expected_scales_len
+            || x.len() != k as usize
+        {
+            return Err(ForgeError::InvalidDimension(format!(
+                "{label} GEMV buffer mismatch: got w={}, scales={}, x={}, expected ({expected_w_len}, {expected_scales_len}, {k})",
+                w_packed.len(),
+                scales.len(),
+                x.len()
+            )));
+        }
+
+        let bytes_w = (w_packed.len() as u64) * 4;
+        let bytes_s = (scales.len() as u64) * 4;
+        let bytes_x = (x.len() as u64) * 4;
+        let bytes_y = (n as u64) * 4;
+        let max_buf = bytes_w.max(bytes_s).max(bytes_x).max(bytes_y);
+        let total_vram = bytes_w
+            .saturating_add(bytes_s)
+            .saturating_add(bytes_x)
+            .saturating_add(bytes_y);
+
+        validate_kernel_execution(
+            &self.device_info,
+            &KernelRequirements {
+                required_vram_bytes: total_vram,
+                max_single_buffer_bytes: max_buf,
+                ..Default::default()
+            },
+        )?;
+
+        let spirv = compile_wgsl_to_spirv_subgroup(shader_src)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 4, true, Some(32))?;
+
+        let buf_w = self.upload_device_local_slice(w_packed)?;
+        let buf_s = self.upload_device_local_slice(scales)?;
+        let buf_x = self.upload_device_local_slice(x)?;
+        let buf_y = self.create_device_local_buffer(bytes_y)?;
+        let params = GemvParams {
+            n,
+            inner_blocks,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let ubo = self.create_uniform_buffer(&params)?;
+
+        self.bind_buffers(&pipeline, &[&buf_w, &buf_s, &buf_x, &buf_y], Some(&ubo));
+
+        let gx = n.div_ceil(4);
+        let timings = self.execute_timed_loop(&pipeline, gx, 1, 1, warmup_iters, measured_iters)?;
+        let out = self.download_device_local_vec::<f32>(&buf_y, n as usize)?;
+
+        Ok((out, timings))
+    }
+
+    /// Executes fused subgroup RMSNorm + RoPE once and returns output plus timing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_rmsnorm_rope_f32_subgroup(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        pos_offset: u32,
+        eps: f32,
+        theta_base: f32,
+    ) -> ForgeResult<(Vec<f32>, GpuTiming)> {
+        let (out, mut timings) = self.bench_rmsnorm_rope_f32_subgroup(
+            x, weight, seq_len, n_heads, head_dim, pos_offset, eps, theta_base, 0, 1,
+        )?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed("missing fused RMSNorm+RoPE timing measurement".to_string())
+        })?;
+        Ok((out, timing))
+    }
+
+    /// Benchmarks fused subgroup RMSNorm + RoPE (single-pass LDS/VRAM minimization) on device-local buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_rmsnorm_rope_f32_subgroup(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        pos_offset: u32,
+        eps: f32,
+        theta_base: f32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        if !self.ctx.subgroup_arithmetic_enabled {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan subgroup arithmetic operations are unavailable on '{}'",
+                self.device_info.name
+            )));
+        }
+        if seq_len == 0 || n_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
+            return Err(ForgeError::InvalidDimension(format!(
+                "fused RMSNorm+RoPE requires non-zero dims and even head_dim, got ({seq_len}, {n_heads}, {head_dim})"
+            )));
+        }
+        if theta_base <= 0.0 || !theta_base.is_finite() {
+            return Err(ForgeError::InvalidDimension(format!(
+                "theta_base must be positive and finite, got {theta_base}"
+            )));
+        }
+        if measured_iters == 0 {
+            return Err(ForgeError::InvalidDimension(
+                "measured_iters must be > 0".to_string(),
+            ));
+        }
+        let cols = (n_heads as usize)
+            .checked_mul(head_dim as usize)
+            .ok_or_else(|| {
+                ForgeError::InvalidDimension("n_heads * head_dim overflow".to_string())
+            })?;
+        let elems = (seq_len as usize)
+            .checked_mul(cols)
+            .ok_or_else(|| ForgeError::InvalidDimension("seq_len * cols overflow".to_string()))?;
+        if x.len() != elems || weight.len() != cols {
+            return Err(ForgeError::InvalidDimension(format!(
+                "fused RMSNorm+RoPE buffer mismatch: got x={}, w={}, expected ({elems}, {cols})",
+                x.len(),
+                weight.len()
+            )));
+        }
+
+        let bytes_x = (elems as u64) * 4;
+        let bytes_w = (cols as u64) * 4;
+        validate_kernel_execution(
+            &self.device_info,
+            &KernelRequirements {
+                required_vram_bytes: bytes_x.saturating_mul(2).saturating_add(bytes_w),
+                max_single_buffer_bytes: bytes_x.max(bytes_w),
+                ..Default::default()
+            },
+        )?;
+
+        let spirv = compile_wgsl_to_spirv_subgroup(RMSNORM_ROPE_F32_SUBGROUP_WGSL)?;
+        let req_sg = self.ctx.wave32_subgroup_control_enabled.then_some(32);
+        let pipeline = self.create_compute_pipeline(&spirv, 3, true, req_sg)?;
+
+        let buf_x = self.upload_device_local_slice(x)?;
+        let buf_w = self.upload_device_local_slice(weight)?;
+        let buf_y = self.create_device_local_buffer(bytes_x)?;
+        let params = RmsRopeParams {
+            seq_len,
+            n_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            theta_base,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let ubo = self.create_uniform_buffer(&params)?;
+
+        self.bind_buffers(&pipeline, &[&buf_x, &buf_w, &buf_y], Some(&ubo));
+
+        let timings =
+            self.execute_timed_loop(&pipeline, seq_len, 1, 1, warmup_iters, measured_iters)?;
+        let out = self.download_device_local_vec::<f32>(&buf_y, elems)?;
+
+        Ok((out, timings))
+    }
+
     fn create_compute_pipeline(
         &self,
         spirv: &[u32],
         storage_count: u32,
         has_uniform: bool,
+        required_subgroup_size: Option<u32>,
     ) -> ForgeResult<ComputePipeline> {
         let shader_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         let shader_module = unsafe { self.ctx.device.create_shader_module(&shader_info, None) }
@@ -803,10 +1165,19 @@ impl VulkanComputeEngine {
             })?;
 
         let entry_name = CString::new("main").expect("static string has no NUL");
-        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+        let mut req_sg_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default();
+        let mut stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
             .name(&entry_name);
+        if let Some(sg_size) = required_subgroup_size {
+            if self.ctx.wave32_subgroup_control_enabled {
+                req_sg_info = req_sg_info.required_subgroup_size(sg_size);
+                stage_info = stage_info
+                    .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                    .push_next(&mut req_sg_info);
+            }
+        }
 
         let cp_info = vk::ComputePipelineCreateInfo::default()
             .stage(stage_info)
