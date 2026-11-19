@@ -238,15 +238,36 @@ Streams `BC = 16` key/value tiles through **`16 KiB` LDS** (`head_dim <= 128`), 
 
 ---
 
-## 10. Reproduction Commands
+## 10. Milestone 4C — AMD AMF VCN 3.0 Hardware Video Encode Benchmark (`amfrt64.dll` `1.4.37.0`)
+
+Pure-Rust dynamic COM vtable hardware video encoding via `amfrt64.dll` (`1.4.37.0`) on RX 6900 XT (`gfx1030`, VCN 3.0, Windows 11 Build `26300`, Adrenalin `26.11.2`). A 16-surface ring of synthetic moving-gradient frames is pre-allocated in `AMF_MEMORY_HOST`, populated with `NV12` (8-bit 4:2:0) or `P010` (10-bit 4:2:0, MSB-aligned `u16`) Y/UV planes, and converted to `AMF_MEMORY_DX11` VRAM textures via `AMFData::Convert(AMF_MEMORY_DX11)` **before** timing so CPU host-to-device memory copies are excluded from VCN 3.0 hardware encode measurements (`--warmup 15 --frames 120 --preset speed --fps 60`):
+
+| Resolution | Codec | Component ID | Surface Format | Target Bitrate | Encode FPS | Throughput (MPix/s) | Avg Frame (ms) | Effective Bitrate | Output Packets | Annex-B NAL |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `1920x1080` (1080p) | `H.264/AVC` | `AMFVideoEncoderVCE_AVC` | `NV12` (8-bit) | 12.0 Mbps | **413.13 FPS** | **856.66 MPix/s** | **2.421 ms** | 13.00 Mbps | `120/120` | **VALID** |
+| `1920x1080` (1080p) | `HEVC/H.265` | `AMFVideoEncoderHW_HEVC` | `NV12` (8-bit) | 12.0 Mbps | **417.74 FPS** | **866.22 MPix/s** | **2.394 ms** | 12.81 Mbps | `120/120` | **VALID** |
+| `1920x1080` (1080p) | `HEVC/H.265 10-bit` | `AMFVideoEncoderHW_HEVC` | `P010` (10-bit) | 12.0 Mbps | **412.85 FPS** | **856.09 MPix/s** | **2.422 ms** | 10.77 Mbps | `120/120` | **VALID** |
+| `3840x2160` (4K UHD) | `H.264/AVC` | `AMFVideoEncoderVCE_AVC` | `NV12` (8-bit) | 35.0 Mbps | **120.30 FPS** | **997.79 MPix/s** | **8.313 ms** | 36.07 Mbps | `120/120` | **VALID** |
+| `3840x2160` (4K UHD) | `HEVC/H.265` | `AMFVideoEncoderHW_HEVC` | `NV12` (8-bit) | 35.0 Mbps | **117.94 FPS** | **978.23 MPix/s** | **8.479 ms** | 38.08 Mbps | `120/120` | **VALID** |
+| `3840x2160` (4K UHD) | `HEVC/H.265 10-bit` | `AMFVideoEncoderHW_HEVC` | `P010` (10-bit) | 35.0 Mbps | **116.46 FPS** | **965.94 MPix/s** | **8.587 ms** | 35.00 Mbps | `120/120` | **VALID** |
+
+Observed VCN 3.0 hardware characteristics via `forge-profiler` ADLX:
+- **Dedicated fixed-function VCN 3.0 media engine**: While sustaining **`412.85–417.74 FPS`** at `1080p` (`~6.9x` real-time 1080p60) and **`116.46–120.30 FPS`** at `4K UHD` (`~2.0x` real-time 4K60, approaching **`998 MPix/s`**), the 3D GFX shader core stays completely idle at **`68–73 MHz`** (`62–138 MHz` range) and total GPU ASIC power draw is only **`37.0 W`** at 1080p (max `41.0 W`) and **`44.0 W`** at 4K (max `45.0 W`, `36–37 C` core / `43–44 C` hotspot).
+- **Zero 10-bit `P010` throughput penalty**: Hardware 10-bit Main10 HEVC (`P010`) encodes within `~1.2%` of 8-bit `NV12` HEVC throughput on VCN 3.0 (`412.85` vs `417.74 FPS` at 1080p; `116.46` vs `117.94 FPS` at 4K).
+
+---
+
+## 11. Reproduction Commands
 
 ```powershell
 # 1. Build release CLI and optional desktop GUI
 cargo build --release -p forge-cli -p forge-desktop
 
-# 2. Diagnostics + live ADLX telemetry + AMF video probe + Vulkan/HIP verification (12 capabilities)
+# 2. Diagnostics + live ADLX telemetry + AMF video probe & VCN hardware encode benchmark + Vulkan/HIP verification
 .\target\release\forge.exe doctor --verify --python <venv>\Scripts\python.exe
 .\target\release\forge.exe video caps
+.\target\release\forge.exe video bench --codec all --width 1920 --height 1080 --fps 60 --bitrate-mbps 12 --preset speed --warmup 15 --frames 120 --output ..\video_bench_1080p.json
+.\target\release\forge.exe video bench --codec all --width 3840 --height 2160 --fps 60 --bitrate-mbps 35 --preset speed --warmup 15 --frames 120 --output ..\video_bench_4k.json
 
 # 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + Wave32 decode + FlashAttention + stability)
 # Note: decode/elementwise kernels default to --batch-dispatches 16 (override with 1..=256); heavy GEMM & FlashAttention stay at 1.

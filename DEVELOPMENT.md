@@ -72,9 +72,11 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 .\target\release\forge.exe doctor
 .\target\release\forge.exe doctor --json
 
-# AMD AMF hardware video encoder/decoder capability probe (VCN)
+# AMD AMF hardware video encoder/decoder capability probe & VCN hardware encode benchmark
 .\target\release\forge.exe video caps
 .\target\release\forge.exe video caps --json
+.\target\release\forge.exe video bench --codec all --width 1920 --height 1080 --fps 60 --bitrate-mbps 12 --preset speed --warmup 15 --frames 120 --output ..\video_bench_1080p.json
+.\target\release\forge.exe video bench --codec all --width 3840 --height 2160 --fps 60 --bitrate-mbps 35 --preset speed --warmup 15 --frames 120 --output ..\video_bench_4k.json
 
 # Real-time ADLX monitor (table, JSONL, or CSV stream with Ctrl+C graceful exit)
 .\target\release\forge.exe monitor --interval-ms 500 --count 10

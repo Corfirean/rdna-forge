@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 4C (AMD AMF VCN 3.0 Hardware Video Encode Benchmark)
+- Extended `crates/forge-runtime/src/amf.rs` with pure-Rust dynamic `amfrt64.dll` COM vtable bindings (`AMFVariantStruct` 24-byte x64 ABI, `AMFContext::AllocSurface`, `AMFComponent::{SetProperty,Init,Drain,SubmitInput,QueryOutput}`, `AMFData::{QueryInterface,Convert,SetPts,SetDuration}`, `AMFSurface::{GetPlanesCount,GetPlaneAt}`, `AMFPlane::{GetNative,GetWidth,GetHeight,GetHPitch}`, `AMFBuffer::{GetSize,GetNative}` with `AMFBuffer` IID `b04b7248-b6f0-4321-b691-baa4740f9fcb`) and `run_amf_encode_benchmark`:
+  - Pre-allocates a 16-surface ring in `AMF_MEMORY_HOST`, fills moving synthetic `NV12` (8-bit) or `P010` (10-bit MSB-aligned `u16`) Y/UV planes, and converts all 16 surfaces to `AMF_MEMORY_DX11` VRAM textures via `AMFData::Convert(AMF_MEMORY_DX11)` prior to timing so CPU `memcpy` is excluded from VCN hardware encode measurements.
+  - Verifies output bitstream packets (`120/120`) for valid Annex-B NAL start codes (`00 00 00 01` / `00 00 01`).
+- Added `crates/forge-benchmark/src/video.rs` (`VideoBenchSuiteConfig`, `VideoBenchReport`, `run_video_benchmark_suite`) wrapping `TelemetryGuard` ADLX sampling and `peak_process_rss_bytes()` around multi-codec VCN encode runs.
+- Added `forge video bench` CLI subcommand (`--codec all|h264|hevc|hevc10`, `--width`, `--height`, `--fps`, `--bitrate-mbps`, `--preset speed|balanced|quality`, `--warmup`, `--frames`, `--json`, `--output`) and integrated an interactive **VCN Hardware Encode Benchmark Runner** into the **Video (AMF)** tab of `Forge Desktop` (`run_video_benchmark` Tauri command synchronized by `BusyGuard`).
+- Live-verified on RX 6900 XT (VCN 3.0, AMF `1.4.37.0`, Adrenalin `26.11.2`):
+  - `1920x1080` (`1080p`, `speed`, `12 Mbps`): **`413.13 FPS`** (`856.66 MPix/s`) on `H.264/AVC NV12`, **`417.74 FPS`** (`866.22 MPix/s`) on `HEVC/H.265 NV12`, and **`412.85 FPS`** (`856.09 MPix/s`) on `HEVC/H.265 10-bit P010` at **`37.0 W`** GPU power (`68 MHz` GFX clock).
+  - `3840x2160` (`4K UHD`, `speed`, `35 Mbps`): **`120.30 FPS`** (`997.79 MPix/s`) on `H.264/AVC NV12`, **`117.94 FPS`** (`978.23 MPix/s`) on `HEVC/H.265 NV12`, and **`116.46 FPS`** (`965.94 MPix/s`) on `HEVC/H.265 10-bit P010` at **`44.0 W`** GPU power (`73 MHz` GFX clock).
+
 ### Added — Milestone 4B (RX 6900 XT Vulkan Compute Practice: GGUF `Q4_K` GEMV & Causal FlashAttention)
 - Implemented two new RDNA2 Wave32 Vulkan 1.3 WGSL->SPIR-V 1.3 compute kernels in `forge-runtime`:
   - `gemv_q4_k_wave32.wgsl`: zero-LDS, zero-barrier GGUF `Q4_K` super-block-256 (`144 B` / `7.11x` compression vs FP32) GEMV with IEEE-754 half `(d, dmin)` unpacking and 6-bit sub-block `(scale, min)` decoding, achieving **`192.73 GB/s`** (`0.0491 ms`) at `4096x4096` (**4.08x** vs `batch=1`) and **`239.14 GB/s`** (`0.1063 ms`, `IQR=0.0006 ms`, `CV=0.51%`, `max_abs=1.60e-4`) at `11008x4096` with `batch=16`.

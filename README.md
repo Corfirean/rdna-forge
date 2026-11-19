@@ -23,7 +23,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 4B complete (RX 6900 XT Vulkan compute practice adding Wave32 GGUF `Q4_K` super-block GEMV at **`239.14 GB/s`** / `7.11x` compression and `16 KiB` LDS tiled causal FlashAttention at **`1125.66 GFLOP/s`**), building on Milestone 4A (**Forge Desktop** optional Tauri v2 Windows UI), Milestone 3C (batched Vulkan dispatches + dynamic AMF `amfrt64.dll` COM probe), Milestone 3B (Wave32 `W8A32`/`Q4_0` GEMV + fused `RMSNorm+RoPE`), Milestone 3A (`forge monitor` + `forge tune`), and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
+**Current Project Status:** Milestone 4C complete (pure-Rust AMD AMF `amfrt64.dll` VCN 3.0 DX11 hardware video encode benchmark across `H.264/AVC NV12`, `HEVC/H.265 NV12`, and `HEVC/H.265 10-bit P010`, achieving **`412.85–417.74 FPS`** at `1080p` and **`116.46–120.30 FPS`** / **`966–998 MPix/s`** at `4K UHD` with `37–44 W` GPU power), building on Milestone 4B (Wave32 GGUF `Q4_K` GEMV at **`239.14 GB/s`** and `16 KiB` LDS tiled causal FlashAttention at **`1125.66 GFLOP/s`**), Milestone 4A (**Forge Desktop** optional Tauri v2 Windows UI), Milestone 3C (batched Vulkan dispatches + dynamic AMF `amfrt64.dll` COM probe), Milestone 3B (Wave32 `W8A32`/`Q4_0` GEMV + fused `RMSNorm+RoPE`), Milestone 3A (`forge monitor` + `forge tune`), and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
 
 ---
 
@@ -49,7 +49,7 @@ RDNA Forge provides an evidence-driven engineering foundation before building cu
 | **llama.cpp (`Vulkan` & `ROCm`)** | `b12532` (`rocm-10.0`) | **Verified** (Vulkan) / **Partially verified** (ROCm) | Uncontended `ROCm0`: `7369.46` `pp512` / `233.50` `tg128` (`Vulkan0`: `5227.71` / `240.21` default, `6211.14` `pp512` with `-fa 0`); ROCm drops 4.3x to `53.71` under WDDM VRAM contention |
 | **ADLX** (`amdadlx64.dll`) | `1.4.1.122` (`V1.4` COM) | **Verified** (telemetry + read-only tuning) | Pure-Rust COM vtables for live monitoring (`monitor`), tuning inspection (`tune show`), and range-validated dry-run power control without vendoring proprietary SDK headers |
 | **DirectML** | `DirectML.dll` | **Partially verified** | Present in Windows `System32`; upstream is in maintenance mode |
-| **AMF** (`amfrt64.dll`) | `1.4.37.0` (COM DX11 probe) | **Verified** (`2 HW enc / 5 HW dec`) | Pure-Rust COM vtable DX11 probe (`forge video caps`); H.264/HEVC enc + H.264/HEVC/VP9/AV1/MJPEG dec (AV1 enc unsupported on VCN 3.0) |
+| **AMF** (`amfrt64.dll`) | `1.4.37.0` (COM DX11 probe & VCN encode) | **Verified** (`2 HW enc / 5 HW dec`) | Pure-Rust COM vtable DX11 probe (`forge video caps`) & hardware encode benchmark (`forge video bench`: `412.85–417.74 FPS` 1080p, `116.46–120.30 FPS` 4K across H.264/HEVC/HEVC 10-bit P010) |
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete 11-repository upstream feasibility audit, licenses, and technical blockers.
 
@@ -155,8 +155,9 @@ Machine-readable output is supported via `forge doctor --json`, `forge video cap
 # Pass --apply only when intentionally modifying GPU tuning:
 # .\target\release\forge.exe tune power-limit 5 --apply
 
-# Probe AMD AMF hardware video encode/decode codec support via DX11 COM
+# Probe AMD AMF hardware video encode/decode codec support & run VCN 3.0 hardware encode benchmark
 .\target\release\forge.exe video caps
+.\target\release\forge.exe video bench --codec all --width 1920 --height 1080 --fps 60 --bitrate-mbps 12 --preset speed --warmup 15 --frames 120
 ```
 
 ---
@@ -183,6 +184,7 @@ All benchmarks use warmups, repeated runs, median and dispersion (`min`, `p95`, 
 | Attention FP16 (Tiled Triton) | `triton-windows` 3.9 | `1x16x1024x64` | 0.657 ms | 6.54 TFLOP/s | Verified (Flash/Efficient SDPA unavailable); causal smoke uses 70x less VRAM than Math SDPA |
 | LLM Prefill (`pp512`, uncontended) | `llama.cpp` `b12532` ROCm vs Vulkan | Qwen2.5-1.5B Q4_K_M | **69.48 ms** vs 97.94 ms | **7369.46** vs 5227.71 tok/s | Verified (**ROCm +41.0% faster** prefill; Vulkan `-fa 0`: `6211.14 tok/s`) |
 | LLM Decode (`tg128`, uncontended) | `llama.cpp` `b12532` Vulkan vs ROCm | Qwen2.5-1.5B Q4_K_M | **532.87 ms** vs 548.17 ms | **240.21** vs 233.50 tok/s | Verified (note: ROCm drops to `53.71 tok/s` under WDDM VRAM contention) |
+| VCN 3.0 Hardware Encode (`1080p` / `4K`) | AMF `amfrt64.dll` `1.4.37.0` DX11 | `H.264 NV12` / `HEVC NV12` / `HEVC 10-bit P010` | **2.39–2.42 ms** (`1080p`) / **8.31–8.59 ms** (`4K`) | **412.85–417.74 FPS** (`1080p`) / **116.46–120.30 FPS** (`4K`) | Verified (`856–998 MPix/s`, `120/120` Annex-B packets, `37–44 W` GPU power) |
 
 Full dispersion metrics, WDDM VRAM diagnosis, ADLX telemetry, model SHA-256, and reproduction steps are in [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -226,7 +228,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
   - Added `Forge Desktop` (`apps/forge-desktop`, Tauri v2 + Edge WebView2, zero `node_modules`) with real-time Canvas 2D ADLX strip charts, hardware-locked tuning validation, AMF VCN viewer, and batched Vulkan compute benchmark runner synchronized by RAII `BusyGuard`.
 - **Milestone 4B (Complete):**
   - Added pure-Rust WGSL->SPIR-V 1.3 Wave32 GGUF `Q4_K` super-block GEMV (`7.11x` compression, **`239.14 GB/s`** / `0.106 ms` at `11008x4096`, `batch=16`) and `16 KiB` LDS tiled causal FlashAttention (**`1125.66 GFLOP/s`** at `8x1024x128`, `904.26 GFLOP/s` at `16x1024x64`, `max_abs=1.42e-7` vs FP64 CPU reference), integrated into `forge doctor --verify`, `forge bench`, and `Forge Desktop`.
-- **Future:** AMF VCN 3.0 encode/decode pipeline practice (`H.264` / `HEVC 10-bit P010`), FidelityFX SDK evaluation, RDNA3/RDNA4 verification, Linux support.
+- **Milestone 4C (Complete):**
+  - Added pure-Rust dynamic AMD AMF (`amfrt64.dll` `1.4.37.0`) VCN 3.0 DX11 hardware video encode benchmarking (`forge video bench` + `Forge Desktop` **Video (AMF)** runner) across `H.264/AVC NV12`, `HEVC/H.265 NV12`, and `HEVC/H.265 10-bit P010` using a pre-uploaded 16-surface `AMF_MEMORY_DX11` VRAM ring, Annex-B NAL bitstream verification, and live ADLX telemetry (**`412.85–417.74 FPS`** at `1080p` / `37 W`; **`116.46–120.30 FPS`** / **`965.94–997.79 MPix/s`** at `4K UHD` / `44 W`).
+- **Future:** AMF VCN 3.0 hardware decode pipeline benchmarking, FidelityFX SDK evaluation, RDNA3/RDNA4 verification, Linux support.
 
 ---
 

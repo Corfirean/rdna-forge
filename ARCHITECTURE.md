@@ -52,7 +52,7 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 
 ### `forge-runtime`
 - **`probe`**: Audits Vulkan, HIP driver vs ROCm SDK tools (`rocm-sdk`/`hipcc`), Python PyTorch ROCm + `triton-windows`, ADLX, DirectML (flagging maintenance mode), AMF (upgraded with live codec counts from `amf`), and `llama-bench`.
-- **`amf`**: Pure-Rust dynamic COM vtable probe (`amfrt64.dll`, zero vendored headers) initializing a DX11 AMF context under a `Mutex` guard and querying VCN encode/decode codec capabilities (`H.264/AVC`, `HEVC/H.265`, `VP9`, `AV1`, `MJPEG`, resolution bounds, 10-bit/interlaced support, native/supported surface formats).
+- **`amf`**: Pure-Rust dynamic COM vtable probe and VCN hardware video encode engine (`amfrt64.dll`, zero vendored headers) initializing a DX11 AMF context under a `Mutex` guard, querying VCN encode/decode codec capabilities (`H.264/AVC`, `HEVC/H.265`, `VP9`, `AV1`, `MJPEG`, resolution bounds, 10-bit/interlaced support, native/supported surface formats), and benchmarking hardware VCN encoding (`run_amf_encode_benchmark` across `H.264/AVC NV12`, `HEVC/H.265 NV12`, and `HEVC/H.265 10-bit P010` using a pre-uploaded 16-surface `AMF_MEMORY_DX11` ring and Annex-B NAL start-code verification).
 - **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `gemm_f32_tiled_vec4.wgsl`, `gemm_i8_dp4a.wgsl`, `gemv_w8a32_wave32.wgsl`, `gemv_q4_0_wave32.wgsl`, `gemv_q4_k_wave32.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`, `rmsnorm_rope_f32_subgroup.wgsl`, `flash_attention_f32_wave32.wgsl`) and compiles them purely in Rust via `naga` to SPIR-V 1.3 (`OpGroupNonUniformFAdd` subgroups + `OpBitFieldSExtract` unpacks) or SPIR-V 1.6 (`OpSDot` / `V_DOT4_I32_I8` when `shader_integer_dot_product` is supported by the device).
 - **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::{shader_integer_dot_product, subgroup_size_control, compute_full_subgroups}` when supported, with `requiredSubgroupSize = 32` for Wave32 kernels), queue, command pool, timestamp `QueryPool`, batched multi-dispatch submissions (`dispatches_per_submit` `1..=256` with inter-dispatch `SHADER_WRITE -> SHADER_WRITE | SHADER_READ` memory barriers), `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
 - **`reference`**: FP64-accumulated FP32, quantized `Q4_0`/`Q4_K`/`W8A32`, fused `RMSNorm+RoPE`, exact `i64` INT8, and two-pass `ref_flash_attention_f32` CPU reference implementations plus `compare_slices` / `compare_i32_exact` evaluators and IEEE-754 half / `Q4_K` super-block packing helpers.
@@ -62,12 +62,12 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 ### `forge-benchmark`
 - **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs.
 - **`memory`**: Captures process peak working set via Win32 `GetProcessMemoryInfo`.
-- **`vulkan_suite`**, **`llama`**, **`triton`**: Orchestrates reproducible benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
+- **`vulkan_suite`**, **`video`**, **`llama`**, **`triton`**: Orchestrates reproducible compute, VCN hardware video encode (`run_video_benchmark_suite`), and LLM benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan and AMF VCN; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
 
 ### `forge-cli`
 Thin CLI boundary (`clap` + `anyhow`) exposing:
 - `forge doctor [--json] [--verify] [--python]`
-- `forge video caps [--json]`
+- `forge video {caps [--json], bench [--codec all|h264|hevc|hevc10] [--width W] [--height H] [--fps F] [--bitrate-mbps M] [--preset speed|balanced|quality] [--warmup N] [--frames N] [--json] [--output PATH]}`
 - `forge monitor [--interval-ms N] [--count N] [--duration-secs S] [--device-id HEX] [--format table|jsonl|csv] [--output PATH]` (with Win32 `SetConsoleCtrlHandler` graceful termination and clean `ADLXTerminate`)
 - `forge tune {show [--device-id HEX] [--json], power-limit <PCT> [--device-id HEX] [--apply], reset [--device-id HEX] [--apply]}`
 - `forge bench {vulkan [--batch-dispatches N],llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
@@ -75,8 +75,8 @@ Thin CLI boundary (`clap` + `anyhow`) exposing:
 
 ### `forge-desktop`
 Optional Windows-native Tauri v2 + Edge WebView2 application (`apps/forge-desktop`) serving embedded vanilla ES assets (`ui/`) with zero `node_modules` dependencies:
-- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics`, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_vulkan_benchmark`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations.
-- **`ui`**: Five views (`Overview`, `Monitor` with 4 rolling Canvas 2D strip charts, `Tuning` with fan-curve plot & explicit `Unlock Hardware Writes` confirmation gate, `Video (AMF)`, and `Benchmarks`).
+- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics`, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_video_benchmark`, `run_vulkan_benchmark`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations.
+- **`ui`**: Five views (`Overview`, `Monitor` with 4 rolling Canvas 2D strip charts, `Tuning` with fan-curve plot & explicit `Unlock Hardware Writes` confirmation gate, `Video (AMF)` with codec capabilities table & VCN hardware encode benchmark runner, and `Benchmarks`).
 
 ---
 
