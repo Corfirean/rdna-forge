@@ -11,10 +11,12 @@ pub use llama::{
     LlamaBenchEntry, LlamaComparisonReport,
 };
 pub use llm_optimizer::{
-    autotune_llm_model, discover_local_llm_assets, estimate_kv_and_state_bytes,
-    gguf_file_type_name, inspect_gguf_model, plan_llm_configuration, GgufModelMetadata,
-    KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult, LlmAutotuneConfig,
-    LlmAutotuneReport, LlmOptimizationPlan, LlmTweakProfile, LocalLlmAssets,
+    apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
+    build_lm_studio_model_config_json, discover_local_llm_assets, estimate_kv_and_state_bytes,
+    gguf_file_type_name, inspect_gguf_model, plan_llm_configuration, EnvAndOllamaPatchResult,
+    EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult,
+    LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LlmTweakProfile,
+    LmStudioPatchResult, LocalLlmAssets,
 };
 pub use memory::peak_process_rss_bytes;
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
@@ -204,6 +206,10 @@ mod tests {
             ssm_state_size: Some(128),
             ssm_inner_size: Some(6144),
             ssm_group_count: Some(16),
+            expert_count: None,
+            expert_used_count: None,
+            expert_feed_forward_length: None,
+            is_moe: false,
             bytes_per_layer: 14_403_496_864 / 65,
         };
 
@@ -211,5 +217,41 @@ mod tests {
         let q8_bytes = estimate_kv_and_state_bytes(&meta, 4096, KvCacheQuant::Q8_0);
         let q4_bytes = estimate_kv_and_state_bytes(&meta, 4096, KvCacheQuant::Q4_0);
         assert!(f16_bytes > q8_bytes && q8_bytes > q4_bytes);
+
+        let existing = r#"{
+            "preset": "",
+            "operation": { "fields": [] },
+            "load": {
+                "fields": [
+                    { "key": "llm.load.promptTemplate", "value": "custom-jinja" },
+                    { "key": "llm.load.llama.flashAttention", "value": true }
+                ]
+            }
+        }"#;
+        let profile = LlmTweakProfile {
+            id: "vulkan_wddm_priority".to_string(),
+            title: "Vulkan WDDM Priority".to_string(),
+            backend: "vulkan".to_string(),
+            device_selector: "Vulkan0".to_string(),
+            n_gpu_layers: 99,
+            n_cpu_moe: 0,
+            split_mode: "none".to_string(),
+            flash_attn: false,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            batch_size: 2048,
+            ubatch_size: 512,
+            threads: 8,
+            env_vars: vec![],
+            rationale: "test".to_string(),
+            llama_server_cmd: "llama-server".to_string(),
+        };
+        let (merged_json, ratio_str) =
+            build_lm_studio_model_config_json(Some(existing), &profile, 65, 4096, true);
+        assert_eq!(ratio_str, "1.00 (100% GPU)");
+        assert!(merged_json.contains("custom-jinja"));
+        assert!(merged_json.contains("\"disabledGpus\": [\n            1\n          ]"));
+        assert!(merged_json.contains("\"key\": \"llm.load.contextLength\""));
+        assert!(merged_json.contains("\"value\": 4096"));
     }
 }

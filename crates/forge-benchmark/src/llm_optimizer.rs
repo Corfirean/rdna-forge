@@ -43,6 +43,14 @@ pub struct GgufModelMetadata {
     pub ssm_state_size: Option<u32>,
     pub ssm_inner_size: Option<u32>,
     pub ssm_group_count: Option<u32>,
+    #[serde(default)]
+    pub expert_count: Option<u32>,
+    #[serde(default)]
+    pub expert_used_count: Option<u32>,
+    #[serde(default)]
+    pub expert_feed_forward_length: Option<u32>,
+    #[serde(default)]
+    pub is_moe: bool,
     pub bytes_per_layer: u64,
 }
 
@@ -91,6 +99,8 @@ pub struct KvCacheMemoryBudget {
     pub fits_with_wddm_memory_priority: bool,
     pub strict_zero_spill_ngl: u32,
     pub memory_priority_ngl: u32,
+    #[serde(default)]
+    pub recommended_n_cpu_moe: u32,
 }
 
 /// A concrete, hardware-tested `llama.cpp` execution profile for AMD RDNA2 (`gfx1030`).
@@ -101,6 +111,8 @@ pub struct LlmTweakProfile {
     pub backend: String,
     pub device_selector: String,
     pub n_gpu_layers: u32,
+    #[serde(default)]
+    pub n_cpu_moe: u32,
     pub split_mode: String,
     pub flash_attn: bool,
     pub cache_type_k: String,
@@ -190,6 +202,46 @@ pub struct LlmAutotuneReport {
     pub best_prefill_profile_id: Option<String>,
     pub best_balanced_profile_id: Option<String>,
     pub peak_rss_bytes: Option<u64>,
+}
+
+/// Result of previewing (`dry_run = true`) or writing (`dry_run = false`) optimized LM Studio config files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LmStudioPatchResult {
+    pub applied: bool,
+    pub profile_id: String,
+    pub profile_title: String,
+    pub model_config_path: String,
+    pub model_config_backup_path: Option<String>,
+    pub backend_prefs_path: String,
+    pub backend_prefs_backup_path: Option<String>,
+    pub selected_lmstudio_backend: String,
+    pub offload_ratio: String,
+    pub context_length: u32,
+    pub flash_attention: bool,
+    pub cache_type_k: String,
+    pub cache_type_v: String,
+    pub cpu_threads: u32,
+    pub disabled_igpu: bool,
+    pub patched_model_json_preview: String,
+    pub patched_backend_json_preview: String,
+}
+
+/// Single Windows User Environment (`HKCU\Environment`) variable change record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvVarChange {
+    pub key: String,
+    pub previous_value: Option<String>,
+    pub new_value: String,
+}
+
+/// Result of previewing (`dry_run = true`) or applying (`dry_run = false`) Windows & Ollama RDNA2 environment tweaks and `Modelfile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvAndOllamaPatchResult {
+    pub applied: bool,
+    pub env_changes: Vec<EnvVarChange>,
+    pub ollama_modelfile_content: String,
+    pub ollama_modelfile_path: Option<String>,
+    pub ollama_create_cmd: String,
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +549,10 @@ pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
     let ssm_state_size = get_arch_u32("ssm.state_size");
     let ssm_inner_size = get_arch_u32("ssm.inner_size");
     let ssm_group_count = get_arch_u32("ssm.group_count");
+    let expert_count = get_arch_u32("expert_count");
+    let expert_used_count = get_arch_u32("expert_used_count");
+    let expert_feed_forward_length = get_arch_u32("expert_feed_forward_length");
+    let is_moe = expert_count.unwrap_or(0) > 1;
 
     let file_type_code = kvs.get("general.file_type").and_then(GgufValue::as_u32);
     let quantization_name = gguf_file_type_name(file_type_code, &file_name);
@@ -538,6 +594,10 @@ pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
         ssm_state_size,
         ssm_inner_size,
         ssm_group_count,
+        expert_count,
+        expert_used_count,
+        expert_feed_forward_length,
+        is_moe,
         bytes_per_layer,
     })
 }
@@ -754,6 +814,17 @@ pub fn plan_llm_configuration(
         let memory_priority_ngl = ((budget_for_weights_prio as f64 / mib_per_layer).floor() as u32)
             .min(model.block_count);
 
+        // For MoE models (expert_count > 1), routed expert FFN tensors account for ~84% of each
+        // layer's size while attention + shared tensors take ~16%. Offloading `-ncmoe N` layers
+        // keeps `-ngl 99` (all attention layers + KV cache on GPU) and moves only N layers' experts to DDR5.
+        let recommended_n_cpu_moe = if model.is_moe && total_required_mib > usable_free_mib {
+            let overflow_mib = (total_required_mib - usable_free_mib) as f64;
+            let expert_mib_per_layer = (mib_per_layer * 0.84).max(1.0);
+            ((overflow_mib / expert_mib_per_layer).ceil() as u32).min(model.block_count)
+        } else {
+            0
+        };
+
         kv_budgets.push(KvCacheMemoryBudget {
             kv_quant: kv_q.as_cli_str().to_string(),
             requires_flash_attn: kv_q.requires_flash_attn_for_v(),
@@ -766,6 +837,7 @@ pub fn plan_llm_configuration(
             fits_with_wddm_memory_priority,
             strict_zero_spill_ngl,
             memory_priority_ngl,
+            recommended_n_cpu_moe,
         });
     }
 
@@ -831,6 +903,7 @@ pub fn plan_llm_configuration(
         backend: "vulkan".to_string(),
         device_selector: "Vulkan0".to_string(),
         n_gpu_layers: vk_prio_ngl,
+        n_cpu_moe: 0,
         split_mode: "none".to_string(),
         flash_attn: !is_hybrid_ssm,
         cache_type_k: "f16".to_string(),
@@ -864,6 +937,7 @@ pub fn plan_llm_configuration(
         backend: "hip".to_string(),
         device_selector: "ROCm0".to_string(),
         n_gpu_layers: rocm_q4_ngl,
+        n_cpu_moe: 0,
         split_mode: "none".to_string(),
         flash_attn: true,
         cache_type_k: "q4_0".to_string(),
@@ -886,6 +960,7 @@ pub fn plan_llm_configuration(
         backend: "vulkan".to_string(),
         device_selector: "Vulkan0".to_string(),
         n_gpu_layers: vk_q4_ngl,
+        n_cpu_moe: 0,
         split_mode: "none".to_string(),
         flash_attn: true,
         cache_type_k: "q4_0".to_string(),
@@ -904,6 +979,40 @@ pub fn plan_llm_configuration(
         ),
     });
 
+    // Optional MoE Expert-Offload Profile (-ncmoe) when model.is_moe is true
+    if model.is_moe && q4_budget.recommended_n_cpu_moe > 0 {
+        let ncmoe = q4_budget.recommended_n_cpu_moe;
+        recommended_profiles.push(LlmTweakProfile {
+            id: "moe_expert_offload".to_string(),
+            title: format!(
+                "MoE Smart Expert Offload (100% Attention on GPU + -ncmoe {ncmoe} Experts on Ryzen DDR5)"
+            ),
+            backend: "vulkan".to_string(),
+            device_selector: "Vulkan0".to_string(),
+            n_gpu_layers: 99,
+            n_cpu_moe: ncmoe,
+            split_mode: "none".to_string(),
+            flash_attn: true,
+            cache_type_k: "q8_0".to_string(),
+            cache_type_v: "q8_0".to_string(),
+            batch_size: 2048,
+            ubatch_size: 512,
+            threads: physical_cpu_cores,
+            env_vars: vec![
+                ("GGML_VK_ENABLE_MEMORY_PRIORITY".to_string(), "1".to_string()),
+                ("GGML_VK_VISIBLE_DEVICES".to_string(), "0".to_string()),
+            ],
+            rationale: format!(
+                "MoE model detected ({:?} routed experts, {:?} active per token). Keeps -ngl 99 so 100% of attention layers and KV cache remain in fast RX 6900 XT VRAM while offloading {}/{} layers' sparse expert FFN blocks (-ncmoe {}) to Ryzen DDR5.",
+                model.expert_count, model.expert_used_count, ncmoe, model.block_count, ncmoe
+            ),
+            llama_server_cmd: format!(
+                "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"0\"; llama-server.exe -m \"{}\" -c {} -ngl 99 -ncmoe {} -dev Vulkan0 -sm none -mg 0 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 -t {}",
+                model.file_path, target_ctx, ncmoe, physical_cpu_cores
+            ),
+        });
+    }
+
     // Profile 4: Strict Zero-Spill Hybrid GPU+CPU Split (Guaranteed fit without evicting background apps)
     if f16_budget.strict_zero_spill_ngl < model.block_count {
         let safe_ngl = kv_budgets[1].strict_zero_spill_ngl; // q8_0 strict fit
@@ -916,6 +1025,7 @@ pub fn plan_llm_configuration(
             backend: "vulkan".to_string(),
             device_selector: "Vulkan0".to_string(),
             n_gpu_layers: safe_ngl,
+            n_cpu_moe: 0,
             split_mode: "none".to_string(),
             flash_attn: false,
             cache_type_k: "q8_0".to_string(),
@@ -1310,5 +1420,416 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         best_prefill_profile_id,
         best_balanced_profile_id,
         peak_rss_bytes: peak_process_rss_bytes(),
+    })
+}
+
+/// Builds a merged LM Studio per-model JSON configuration (`user-concrete-model-default-config`),
+/// preserving any unrelated user fields (such as custom Jinja prompt templates).
+pub fn build_lm_studio_model_config_json(
+    existing_json: Option<&str>,
+    profile: &LlmTweakProfile,
+    block_count: u32,
+    context_length: u32,
+    disable_igpu: bool,
+) -> (String, String) {
+    let mut root = existing_json
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "preset": "",
+                "operation": { "fields": [] },
+                "load": { "fields": [] }
+            })
+        });
+
+    let managed_keys = [
+        "load.gpuSplitConfig",
+        "llm.load.contextLength",
+        "llm.load.llama.cpuThreadPoolSize",
+        "llm.load.llama.flashAttention",
+        "llm.load.llama.kCacheQuantizationType",
+        "llm.load.llama.vCacheQuantizationType",
+        "llm.load.llama.acceleration.offloadRatio",
+        "llm.load.llama.autoFit",
+        "llm.load.numParallelSessions",
+    ];
+
+    let mut preserved_fields: Vec<serde_json::Value> = root
+        .get("load")
+        .and_then(|l| l.get("fields"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("key")
+                .and_then(|k| k.as_str())
+                .is_none_or(|k| !managed_keys.contains(&k))
+        })
+        .collect();
+
+    let (offload_val, offload_str) = if profile.n_gpu_layers >= block_count {
+        (serde_json::json!(1), "1.00 (100% GPU)".to_string())
+    } else {
+        let r = ((profile.n_gpu_layers as f64 / f64::from(block_count.max(1))) * 10_000.0).round()
+            / 10_000.0;
+        (
+            serde_json::json!(r),
+            format!("{r:.4} ({}/{} layers)", profile.n_gpu_layers, block_count),
+        )
+    };
+
+    if disable_igpu {
+        preserved_fields.push(serde_json::json!({
+            "key": "load.gpuSplitConfig",
+            "value": {
+                "strategy": "evenly",
+                "disabledGpus": [1],
+                "priority": [],
+                "customRatio": []
+            }
+        }));
+    }
+
+    preserved_fields.extend([
+        serde_json::json!({
+            "key": "llm.load.contextLength",
+            "value": context_length
+        }),
+        serde_json::json!({
+            "key": "llm.load.llama.cpuThreadPoolSize",
+            "value": profile.threads
+        }),
+        serde_json::json!({
+            "key": "llm.load.llama.flashAttention",
+            "value": profile.flash_attn
+        }),
+        serde_json::json!({
+            "key": "llm.load.llama.kCacheQuantizationType",
+            "value": {
+                "checked": profile.cache_type_k != "f16",
+                "value": profile.cache_type_k
+            }
+        }),
+        serde_json::json!({
+            "key": "llm.load.llama.vCacheQuantizationType",
+            "value": {
+                "checked": profile.cache_type_v != "f16",
+                "value": profile.cache_type_v
+            }
+        }),
+        serde_json::json!({
+            "key": "llm.load.llama.acceleration.offloadRatio",
+            "value": offload_val
+        }),
+        serde_json::json!({
+            "key": "llm.load.llama.autoFit",
+            "value": false
+        }),
+        serde_json::json!({
+            "key": "llm.load.numParallelSessions",
+            "value": 1
+        }),
+    ]);
+
+    if let Some(obj) = root.as_object_mut() {
+        if !obj.contains_key("preset") {
+            obj.insert("preset".to_string(), serde_json::json!(""));
+        }
+        if !obj.contains_key("operation") {
+            obj.insert("operation".to_string(), serde_json::json!({ "fields": [] }));
+        }
+        obj.insert(
+            "load".to_string(),
+            serde_json::json!({ "fields": preserved_fields }),
+        );
+    }
+
+    let formatted = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
+    (formatted, offload_str)
+}
+
+/// Previews (`dry_run = true`) or writes (`dry_run = false`, with `.bak` backups) optimized
+/// LM Studio per-model load settings and backend selection for the given GGUF model.
+pub fn apply_lm_studio_config(
+    model_path: &Path,
+    profile_id: Option<&str>,
+    context_tokens: u32,
+    safety_margin_mib: u64,
+    dry_run: bool,
+) -> ForgeResult<LmStudioPatchResult> {
+    let meta = inspect_gguf_model(model_path)?;
+    let plan = plan_llm_configuration(&meta, context_tokens, safety_margin_mib)?;
+
+    let profile = match profile_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(want) => plan
+            .recommended_profiles
+            .iter()
+            .find(|p| p.id == want)
+            .ok_or_else(|| {
+                ForgeError::InvalidParameter(format!(
+                    "unknown LLM tweak profile '{want}' (available: {})",
+                    plan.recommended_profiles
+                        .iter()
+                        .map(|p| p.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?,
+        None => plan.recommended_profiles.first().ok_or_else(|| {
+            ForgeError::ExecutionFailed("no recommended LLM profiles generated".to_string())
+        })?,
+    };
+
+    let home = std::env::var("USERPROFILE").map_err(|_| ForgeError::RuntimeUnavailable {
+        runtime: "LM Studio".to_string(),
+        reason: "USERPROFILE environment variable is not set".to_string(),
+    })?;
+    let lms_root = PathBuf::from(home).join(".lmstudio");
+    let internal_dir = lms_root.join(".internal");
+    if !internal_dir.is_dir() {
+        return Err(ForgeError::RuntimeUnavailable {
+            runtime: "LM Studio".to_string(),
+            reason: format!(
+                "LM Studio config directory not found at '{}'",
+                internal_dir.display()
+            ),
+        });
+    }
+
+    let models_root = lms_root.join("models");
+    let rel_model_path = model_path
+        .strip_prefix(&models_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from(&meta.file_name));
+
+    let model_config_path = internal_dir
+        .join("user-concrete-model-default-config")
+        .join(format!("{}.json", rel_model_path.display()));
+    let backend_prefs_path = internal_dir.join("backend-preferences-v2.json");
+
+    let existing_model_json = std::fs::read_to_string(&model_config_path).ok();
+    let (patched_model_json_preview, offload_ratio) = build_lm_studio_model_config_json(
+        existing_model_json.as_deref(),
+        profile,
+        meta.block_count,
+        plan.target_context_tokens,
+        plan.has_secondary_igpu,
+    );
+
+    let selected_lmstudio_backend = if profile.backend == "hip" {
+        "llama.cpp-win-x86_64-amd-rocm-avx2".to_string()
+    } else {
+        "llama.cpp-win-x86_64-vulkan-avx2".to_string()
+    };
+
+    let mut backend_root = std::fs::read_to_string(&backend_prefs_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "formatDefaults": {},
+                "versions": {}
+            })
+        });
+
+    if let Some(obj) = backend_root.as_object_mut() {
+        let mut fmt_defaults = obj
+            .get("formatDefaults")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        fmt_defaults.insert(
+            "gguf".to_string(),
+            serde_json::Value::String(selected_lmstudio_backend.clone()),
+        );
+        obj.insert(
+            "formatDefaults".to_string(),
+            serde_json::Value::Object(fmt_defaults),
+        );
+
+        let mut versions = obj
+            .get("versions")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        versions
+            .entry(selected_lmstudio_backend.clone())
+            .or_insert_with(|| serde_json::Value::String("2.73.0".to_string()));
+        obj.insert("versions".to_string(), serde_json::Value::Object(versions));
+    }
+
+    let patched_backend_json_preview =
+        serde_json::to_string_pretty(&backend_root).unwrap_or_else(|_| "{}".to_string());
+
+    let mut model_config_backup_path = None;
+    let mut backend_prefs_backup_path = None;
+
+    if !dry_run {
+        if let Some(parent) = model_config_path.parent() {
+            std::fs::create_dir_all(parent).map_err(ForgeError::Io)?;
+        }
+        if model_config_path.exists() {
+            let bak = model_config_path.with_extension("json.bak");
+            std::fs::copy(&model_config_path, &bak).map_err(ForgeError::Io)?;
+            model_config_backup_path = Some(bak.display().to_string());
+        }
+        std::fs::write(&model_config_path, &patched_model_json_preview).map_err(ForgeError::Io)?;
+
+        if backend_prefs_path.exists() {
+            let bak = backend_prefs_path.with_extension("json.bak");
+            std::fs::copy(&backend_prefs_path, &bak).map_err(ForgeError::Io)?;
+            backend_prefs_backup_path = Some(bak.display().to_string());
+        }
+        std::fs::write(&backend_prefs_path, &patched_backend_json_preview)
+            .map_err(ForgeError::Io)?;
+    }
+
+    Ok(LmStudioPatchResult {
+        applied: !dry_run,
+        profile_id: profile.id.clone(),
+        profile_title: profile.title.clone(),
+        model_config_path: model_config_path.display().to_string(),
+        model_config_backup_path,
+        backend_prefs_path: backend_prefs_path.display().to_string(),
+        backend_prefs_backup_path,
+        selected_lmstudio_backend,
+        offload_ratio,
+        context_length: plan.target_context_tokens,
+        flash_attention: profile.flash_attn,
+        cache_type_k: profile.cache_type_k.clone(),
+        cache_type_v: profile.cache_type_v.clone(),
+        cpu_threads: profile.threads,
+        disabled_igpu: plan.has_secondary_igpu,
+        patched_model_json_preview,
+        patched_backend_json_preview,
+    })
+}
+
+fn query_hkcu_env_var(key: &str) -> Option<String> {
+    let out = Command::new("reg.exe")
+        .args(["query", r"HKCU\Environment", "/v", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(key) {
+            let parts: Vec<&str> = trimmed.splitn(3, char::is_whitespace).collect();
+            if let Some(last) = trimmed.split("REG_SZ").nth(1).or_else(|| {
+                let _ = parts;
+                trimmed.split("REG_EXPAND_SZ").nth(1)
+            }) {
+                return Some(last.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Previews (`dry_run = true`) or writes (`dry_run = false`) RDNA2 Windows User Environment
+/// variables (`HKCU\Environment`, inherited by both LM Studio and Ollama) and generates an optimized Ollama `Modelfile`.
+pub fn apply_windows_and_ollama_env_tweaks(
+    model_path: &Path,
+    context_tokens: u32,
+    kv_quant: KvCacheQuant,
+    modelfile_out: Option<&Path>,
+    dry_run: bool,
+) -> ForgeResult<EnvAndOllamaPatchResult> {
+    let meta = inspect_gguf_model(model_path)?;
+    let plan = plan_llm_configuration(&meta, context_tokens, 512)?;
+
+    let desired = [
+        ("GGML_VK_ENABLE_MEMORY_PRIORITY", "1".to_string()),
+        ("GGML_VK_VISIBLE_DEVICES", "0".to_string()),
+        ("HIP_VISIBLE_DEVICES", "0".to_string()),
+        ("OLLAMA_FLASH_ATTENTION", "1".to_string()),
+        ("OLLAMA_KV_CACHE_TYPE", kv_quant.as_cli_str().to_string()),
+        ("OLLAMA_NUM_PARALLEL", "1".to_string()),
+    ];
+
+    let mut env_changes = Vec::with_capacity(desired.len());
+    for (k, v) in desired {
+        let prev = query_hkcu_env_var(k);
+        if !dry_run {
+            let status = Command::new("reg.exe")
+                .args([
+                    "add",
+                    r"HKCU\Environment",
+                    "/v",
+                    k,
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &v,
+                    "/f",
+                ])
+                .status()
+                .map_err(ForgeError::Io)?;
+            if !status.success() {
+                return Err(ForgeError::ExecutionFailed(format!(
+                    "reg.exe failed to set HKCU\\Environment\\{k}"
+                )));
+            }
+        }
+        env_changes.push(EnvVarChange {
+            key: k.to_string(),
+            previous_value: prev,
+            new_value: v,
+        });
+    }
+
+    let rec_ngl = plan
+        .recommended_profiles
+        .first()
+        .map(|p| p.n_gpu_layers)
+        .unwrap_or(99);
+    let ollama_modelfile_content = format!(
+        "# Generated by RDNA Forge for {} ({})\n# Model: {} ({}, {} layers)\nFROM \"{}\"\nPARAMETER num_ctx {}\nPARAMETER num_gpu {}\nPARAMETER num_thread {}\nPARAMETER num_batch 512\n",
+        plan.gpu_name,
+        plan.gfx_target,
+        meta.file_name,
+        meta.quantization_name,
+        meta.block_count,
+        meta.file_path,
+        plan.target_context_tokens,
+        rec_ngl,
+        plan.physical_cpu_cores
+    );
+
+    let mut written_path = None;
+    if let Some(out_path) = modelfile_out {
+        written_path = Some(out_path.display().to_string());
+        if !dry_run {
+            if let Some(parent) = out_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(ForgeError::Io)?;
+                }
+            }
+            std::fs::write(out_path, &ollama_modelfile_content).map_err(ForgeError::Io)?;
+        }
+    }
+
+    let model_slug = meta
+        .model_name
+        .as_deref()
+        .unwrap_or(&meta.architecture)
+        .to_ascii_lowercase()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let mf_arg = written_path.as_deref().unwrap_or("Modelfile.rdna-forge");
+    let ollama_create_cmd = format!("ollama create {model_slug}-rdna -f \"{mf_arg}\"");
+
+    Ok(EnvAndOllamaPatchResult {
+        applied: !dry_run,
+        env_changes,
+        ollama_modelfile_content,
+        ollama_modelfile_path: written_path,
+        ollama_create_cmd,
     })
 }
