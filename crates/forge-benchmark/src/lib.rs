@@ -2,6 +2,7 @@ pub mod llama;
 pub mod memory;
 pub mod stats;
 pub mod triton;
+pub mod video;
 pub mod vulkan_suite;
 
 pub use llama::{
@@ -14,6 +15,7 @@ pub use triton::{
     parse_triton_suite_json, resolve_default_triton_script, run_triton_suite, TritonBenchConfig,
     TritonKernelOutcome, TritonProvenance, TritonSuiteReport,
 };
+pub use video::{run_video_benchmark_suite, VideoBenchReport, VideoBenchSuiteConfig};
 pub use vulkan_suite::{
     run_vulkan_suite, VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
 };

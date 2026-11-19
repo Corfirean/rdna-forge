@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
     peak_process_rss_bytes, resolve_default_triton_script, run_llama_comparison, run_triton_suite,
-    run_vulkan_suite, LlamaBenchConfig, TritonBenchConfig, VulkanBenchConfig,
-    VulkanKernelSelection,
+    run_video_benchmark_suite, run_vulkan_suite, LlamaBenchConfig, TritonBenchConfig,
+    VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
 };
 use forge_core::{
     CapabilityResult, DiagnosticReport, GpuDeviceInfo, HardwareProfile, SupportStatus,
@@ -17,7 +17,7 @@ use forge_profiler::{
 };
 use forge_runtime::{
     default_untested_capabilities, probe_all_backends, probe_amf_capabilities,
-    run_live_capability_checks, AmfAcceleration,
+    run_live_capability_checks, AmfAcceleration, AmfEncodeCodec, AmfQualityPreset,
 };
 mod monitor_tune;
 
@@ -162,6 +162,82 @@ enum VideoSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// Benchmark AMD VCN hardware video encoders (H.264/AVC, HEVC 8-bit NV12, HEVC 10-bit P010).
+    Bench(VideoBenchArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VideoCodecChoice {
+    All,
+    H264,
+    Hevc,
+    Hevc10,
+}
+
+impl VideoCodecChoice {
+    fn to_codecs(self) -> Vec<AmfEncodeCodec> {
+        match self {
+            Self::All => vec![
+                AmfEncodeCodec::H264Avc,
+                AmfEncodeCodec::Hevc,
+                AmfEncodeCodec::Hevc10Bit,
+            ],
+            Self::H264 => vec![AmfEncodeCodec::H264Avc],
+            Self::Hevc => vec![AmfEncodeCodec::Hevc],
+            Self::Hevc10 => vec![AmfEncodeCodec::Hevc10Bit],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VideoPresetChoice {
+    Speed,
+    Balanced,
+    Quality,
+}
+
+impl From<VideoPresetChoice> for AmfQualityPreset {
+    fn from(value: VideoPresetChoice) -> Self {
+        match value {
+            VideoPresetChoice::Speed => Self::Speed,
+            VideoPresetChoice::Balanced => Self::Balanced,
+            VideoPresetChoice::Quality => Self::Quality,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct VideoBenchArgs {
+    /// Target hardware encoder codec(s) to benchmark.
+    #[arg(long, value_enum, default_value_t = VideoCodecChoice::All)]
+    codec: VideoCodecChoice,
+    /// Frame width in pixels (even integer in 128..=7680).
+    #[arg(long, default_value_t = 1920)]
+    width: u32,
+    /// Frame height in pixels (even integer in 128..=4320).
+    #[arg(long, default_value_t = 1080)]
+    height: u32,
+    /// Nominal target stream frame rate in FPS (1..=240).
+    #[arg(long, default_value_t = 60)]
+    fps: u32,
+    /// Target bitrate in megabits per second (1..=500).
+    #[arg(long, default_value_t = 12)]
+    bitrate_mbps: u32,
+    /// Hardware encoder quality/speed preset.
+    #[arg(long, value_enum, default_value_t = VideoPresetChoice::Speed)]
+    preset: VideoPresetChoice,
+    /// Number of untimed warmup frames per codec.
+    #[arg(long, default_value_t = 15)]
+    warmup: u32,
+    /// Number of timed frames per codec.
+    #[arg(long, default_value_t = 120)]
+    frames: u32,
+    /// Emit machine-readable JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+    /// Optional path to write JSON benchmark report.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -262,6 +338,7 @@ fn main() -> Result<()> {
         },
         Commands::Video { action } => match action {
             VideoSubcommand::Caps { json } => cmd_video_caps(json),
+            VideoSubcommand::Bench(args) => cmd_video_bench(&args),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -831,6 +908,67 @@ fn cmd_video_caps(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_video_bench(args: &VideoBenchArgs) -> Result<()> {
+    let suite_cfg = VideoBenchSuiteConfig {
+        codecs: args.codec.to_codecs(),
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        target_bitrate_bps: u64::from(args.bitrate_mbps).saturating_mul(1_000_000),
+        preset: args.preset.into(),
+        warmup_frames: args.warmup,
+        measured_frames: args.frames,
+    };
+
+    let report = run_video_benchmark_suite(&suite_cfg)
+        .context("failed to run AMD AMF VCN hardware video encode benchmark")?;
+    let json_text = serde_json::to_string_pretty(&report)?;
+    write_optional_output(args.output.as_deref(), &json_text)?;
+
+    if args.json {
+        println!("{json_text}");
+        return Ok(());
+    }
+
+    println!("RDNA FORGE AMF VCN HARDWARE ENCODE BENCHMARK");
+    println!(
+        "  AMF Runtime: {} | Resolution: {}x{} @ {} FPS | Preset: {} | Target: {} Mbps | Warmup/Frames: {}/{}",
+        report.runtime_version,
+        args.width,
+        args.height,
+        args.fps,
+        suite_cfg.preset,
+        args.bitrate_mbps,
+        args.warmup,
+        args.frames
+    );
+    println!();
+    println!(
+        "  {:<18} {:<6} {:<10} {:<10} {:<10} {:<11} {:<9} {:<8}",
+        "Codec", "Format", "Encode FPS", "MPix/s", "Avg ms/f", "Eff. Mbps", "Packets", "Annex-B"
+    );
+    for r in &report.results {
+        println!(
+            "  {:<18} {:<6} {:<10.2} {:<10.2} {:<10.3} {:<11.2} {:<9} {:<8}",
+            r.codec,
+            r.surface_format,
+            r.encode_fps,
+            r.megapixels_per_sec,
+            r.avg_frame_ms,
+            r.effective_bitrate_mbps,
+            format!("{}/{}", r.output_packets, r.submitted_frames),
+            if r.valid_annex_b { "VALID" } else { "INVALID" }
+        );
+    }
+
+    if let Some(ref t) = report.telemetry {
+        println!();
+        print_telemetry_summary("VCN Telemetry", t);
+    }
+
+    Ok(())
+}
+
 fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {
     let profile = HardwareProfile::from_file(path)
         .with_context(|| format!("failed to load profile '{}'", path.display()))?;
@@ -991,5 +1129,23 @@ mod tests {
                 })
             }
         ));
+
+        let vb = Cli::try_parse_from([
+            "forge", "video", "bench", "--codec", "hevc10", "--width", "3840", "--height", "2160",
+            "--preset", "speed", "--frames", "120",
+        ])
+        .expect("video bench args must parse");
+        match vb.command {
+            Commands::Video {
+                action: VideoSubcommand::Bench(args),
+            } => {
+                assert_eq!(args.codec, VideoCodecChoice::Hevc10);
+                assert_eq!(args.width, 3840);
+                assert_eq!(args.height, 2160);
+                assert_eq!(args.preset, VideoPresetChoice::Speed);
+                assert_eq!(args.frames, 120);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
     }
 }

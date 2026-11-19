@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use forge_benchmark::{
-    run_vulkan_suite, VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
+    run_video_benchmark_suite, run_vulkan_suite, VideoBenchReport, VideoBenchSuiteConfig,
+    VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
 };
 use forge_core::{CapabilityResult, DiagnosticReport, SupportStatus};
 use forge_device::discover_all;
@@ -13,7 +14,7 @@ use forge_profiler::{
 };
 use forge_runtime::{
     default_untested_capabilities, probe_all_backends, probe_amf_capabilities,
-    run_live_capability_checks, AmfCapabilitiesReport,
+    run_live_capability_checks, AmfCapabilitiesReport, AmfEncodeCodec, AmfQualityPreset,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -159,6 +160,88 @@ impl DesktopBenchRequest {
             measured_iters: self.measured_iters,
             stability_runs: self.stability_runs,
             batch_dispatches: self.batch_dispatches,
+        })
+    }
+}
+
+/// AMF VCN hardware video encode benchmark parameters submitted by the Video view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopVideoBenchRequest {
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_mbps: u32,
+    pub preset: String,
+    pub warmup_frames: u32,
+    pub measured_frames: u32,
+}
+
+impl DesktopVideoBenchRequest {
+    /// Parses codec/preset strings and validates safe bounded VCN benchmark parameters.
+    pub fn validate_and_build_config(&self) -> Result<VideoBenchSuiteConfig, String> {
+        let codecs = match self.codec.trim() {
+            "all" => vec![
+                AmfEncodeCodec::H264Avc,
+                AmfEncodeCodec::Hevc,
+                AmfEncodeCodec::Hevc10Bit,
+            ],
+            "h264" | "h264_avc" => vec![AmfEncodeCodec::H264Avc],
+            "hevc" => vec![AmfEncodeCodec::Hevc],
+            "hevc10" | "hevc_10bit" => vec![AmfEncodeCodec::Hevc10Bit],
+            other => return Err(format!("Unsupported AMF video codec selection '{other}'.")),
+        };
+
+        let preset = match self.preset.trim() {
+            "speed" => AmfQualityPreset::Speed,
+            "balanced" => AmfQualityPreset::Balanced,
+            "quality" => AmfQualityPreset::Quality,
+            other => return Err(format!("Unsupported AMF quality preset '{other}'.")),
+        };
+
+        if !(128..=7680).contains(&self.width) || !self.width.is_multiple_of(2) {
+            return Err(format!(
+                "width must be an even integer in 128..=7680 (got {}).",
+                self.width
+            ));
+        }
+        if !(128..=4320).contains(&self.height) || !self.height.is_multiple_of(2) {
+            return Err(format!(
+                "height must be an even integer in 128..=4320 (got {}).",
+                self.height
+            ));
+        }
+        if !(1..=240).contains(&self.fps) {
+            return Err(format!("fps must be in 1..=240 (got {}).", self.fps));
+        }
+        if !(1..=500).contains(&self.bitrate_mbps) {
+            return Err(format!(
+                "bitrate_mbps must be in 1..=500 (got {}).",
+                self.bitrate_mbps
+            ));
+        }
+        if self.warmup_frames > 120 {
+            return Err(format!(
+                "warmup_frames must be <= 120 (got {}).",
+                self.warmup_frames
+            ));
+        }
+        if !(10..=600).contains(&self.measured_frames) {
+            return Err(format!(
+                "measured_frames must be in 10..=600 (got {}).",
+                self.measured_frames
+            ));
+        }
+
+        Ok(VideoBenchSuiteConfig {
+            codecs,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            target_bitrate_bps: u64::from(self.bitrate_mbps) * 1_000_000,
+            preset,
+            warmup_frames: self.warmup_frames,
+            measured_frames: self.measured_frames,
         })
     }
 }
@@ -345,6 +428,21 @@ pub async fn run_vulkan_benchmark(
     .map_err(|e| format!("Vulkan benchmark task failed: {e}"))?
 }
 
+#[tauri::command]
+pub async fn run_video_benchmark(
+    state: State<'_, AppState>,
+    request: DesktopVideoBenchRequest,
+) -> Result<VideoBenchReport, String> {
+    let config = request.validate_and_build_config()?;
+    let guard = state.acquire_gpu("VCN video benchmark")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        run_video_benchmark_suite(&config).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("VCN video benchmark task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +546,46 @@ mod tests {
         let reset: DesktopResetTuningRequest = serde_json::from_str(r#"{}"#).unwrap();
         assert!(reset.dry_run);
         assert_eq!(reset.pci_device_id, None);
+    }
+
+    #[test]
+    fn video_bench_request_validates_codecs_resolution_and_frame_bounds() {
+        let valid = DesktopVideoBenchRequest {
+            codec: "all".to_string(),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 12,
+            preset: "speed".to_string(),
+            warmup_frames: 15,
+            measured_frames: 120,
+        };
+        let cfg = valid
+            .validate_and_build_config()
+            .expect("valid video bench config");
+        assert_eq!(cfg.codecs.len(), 3);
+        assert_eq!(cfg.target_bitrate_bps, 12_000_000);
+        assert_eq!(cfg.preset, AmfQualityPreset::Speed);
+
+        assert!(DesktopVideoBenchRequest {
+            codec: "av1".to_string(),
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .is_err());
+
+        assert!(DesktopVideoBenchRequest {
+            width: 1921,
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .is_err());
+
+        assert!(DesktopVideoBenchRequest {
+            measured_frames: 5,
+            ..valid
+        }
+        .validate_and_build_config()
+        .is_err());
     }
 }

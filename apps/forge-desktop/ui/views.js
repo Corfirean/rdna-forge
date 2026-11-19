@@ -992,6 +992,236 @@ export function renderVideo(root, state, actions) {
   );
 
   root.appendChild(makePanel("AMD AMF Hardware Video Capabilities", `${caps.codecs.length} components probed`, codecTable, true));
+
+  const vcfg = state.videoBenchForm || {
+    codec: "all",
+    resolution: "1920x1080",
+    fps: 60,
+    bitrate_mbps: 12,
+    preset: "speed",
+    warmup_frames: 15,
+    measured_frames: 120,
+  };
+
+  const benchFormNode = el(
+    "div",
+    { className: "form-row" },
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "VCN Encoder Codec"),
+      el(
+        "select",
+        {
+          className: "select-input mono",
+          disabled: state.runningVideoBench,
+          onChange: (e) => actions.updateVideoBenchField("codec", e.target.value),
+        },
+        [
+          ["all", "all (H.264 + HEVC + HEVC 10-bit)"],
+          ["h264", "h264 (AMFVideoEncoderVCE_AVC NV12)"],
+          ["hevc", "hevc (AMFVideoEncoderHW_HEVC NV12)"],
+          ["hevc10", "hevc10 (AMFVideoEncoderHW_HEVC P010)"],
+        ].map(([val, label]) =>
+          el("option", { value: val, selected: vcfg.codec === val }, label)
+        )
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Resolution"),
+      el(
+        "select",
+        {
+          className: "select-input mono",
+          disabled: state.runningVideoBench,
+          onChange: (e) => actions.updateVideoBenchField("resolution", e.target.value),
+        },
+        [
+          ["1280x720", "1280x720 (720p HD)"],
+          ["1920x1080", "1920x1080 (1080p FHD)"],
+          ["2560x1440", "2560x1440 (1440p QHD)"],
+          ["3840x2160", "3840x2160 (4K UHD)"],
+        ].map(([val, label]) =>
+          el("option", { value: val, selected: vcfg.resolution === val }, label)
+        )
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Preset"),
+      el(
+        "select",
+        {
+          className: "select-input mono",
+          disabled: state.runningVideoBench,
+          onChange: (e) => actions.updateVideoBenchField("preset", e.target.value),
+        },
+        [
+          ["speed", "speed"],
+          ["balanced", "balanced"],
+          ["quality", "quality"],
+        ].map(([val, label]) =>
+          el("option", { value: val, selected: vcfg.preset === val }, label)
+        )
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Bitrate (Mbps)"),
+      el("input", {
+        type: "number",
+        className: "text-input mono",
+        style: "width:78px",
+        min: "1",
+        max: "500",
+        disabled: state.runningVideoBench,
+        value: String(vcfg.bitrate_mbps),
+        onChange: (e) => actions.updateVideoBenchField("bitrate_mbps", Number(e.target.value)),
+      })
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Warmup"),
+      el("input", {
+        type: "number",
+        className: "text-input mono",
+        style: "width:68px",
+        min: "0",
+        max: "120",
+        disabled: state.runningVideoBench,
+        value: String(vcfg.warmup_frames),
+        onChange: (e) => actions.updateVideoBenchField("warmup_frames", Number(e.target.value)),
+      })
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Frames"),
+      el("input", {
+        type: "number",
+        className: "text-input mono",
+        style: "width:74px",
+        min: "10",
+        max: "600",
+        disabled: state.runningVideoBench,
+        value: String(vcfg.measured_frames),
+        onChange: (e) => actions.updateVideoBenchField("measured_frames", Number(e.target.value)),
+      })
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-primary",
+          disabled: state.runningVideoBench || state.busyOp,
+          onClick: actions.runVideoBenchmark,
+        },
+        state.runningVideoBench ? "Encoding on VCN..." : "Run Encode Benchmark"
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: !state.videoBenchReport,
+          onClick: actions.exportVideoBenchJson,
+        },
+        "Export Bench JSON"
+      )
+    )
+  );
+
+  root.appendChild(
+    makePanel(
+      "VCN Hardware Encode Benchmark Runner",
+      "Pre-uploads 16 DX11 surfaces to VRAM before timing VCN hardware encode",
+      benchFormNode
+    )
+  );
+
+  if (state.videoBenchError) {
+    root.appendChild(el("div", { className: "banner banner-err" }, state.videoBenchError));
+  }
+
+  const vrep = state.videoBenchReport;
+  if (vrep && Array.isArray(vrep.results)) {
+    const vrows = vrep.results.map((r) =>
+      el(
+        "tr",
+        {},
+        el(
+          "td",
+          { className: "mono" },
+          r.codec,
+          el("div", { className: "sub-detail mono" }, r.component_id)
+        ),
+        el("td", { className: "mono" }, r.surface_format),
+        el("td", { className: "mono" }, `${r.width}x${r.height}`),
+        el("td", { className: "mono" }, r.preset),
+        el("td", { className: "num mono" }, `${r.encode_fps.toFixed(2)} FPS`),
+        el("td", { className: "num mono" }, `${r.megapixels_per_sec.toFixed(2)} MPix/s`),
+        el("td", { className: "num mono muted-text" }, `${r.avg_frame_ms.toFixed(3)} ms`),
+        el("td", { className: "num mono muted-text" }, `${r.effective_bitrate_mbps.toFixed(2)} Mbps`),
+        el("td", { className: "num mono muted-text" }, `${r.output_packets}/${r.submitted_frames}`),
+        el(
+          "td",
+          {},
+          r.valid_annex_b
+            ? el("span", { className: "badge badge-ok" }, "VALID")
+            : el("span", { className: "badge badge-err" }, "INVALID")
+        )
+      )
+    );
+
+    const vtable = el(
+      "div",
+      { className: "data-table-wrap" },
+      el(
+        "table",
+        { className: "data-table" },
+        el(
+          "thead",
+          {},
+          el(
+            "tr",
+            {},
+            el("th", {}, "Codec / Component"),
+            el("th", {}, "Format"),
+            el("th", {}, "Resolution"),
+            el("th", {}, "Preset"),
+            el("th", { className: "num" }, "Encode FPS"),
+            el("th", { className: "num" }, "Throughput"),
+            el("th", { className: "num" }, "Avg Frame"),
+            el("th", { className: "num" }, "Effective Bitrate"),
+            el("th", { className: "num" }, "Packets"),
+            el("th", {}, "Annex-B NAL")
+          )
+        ),
+        el("tbody", {}, vrows)
+      )
+    );
+
+    root.appendChild(
+      makePanel(
+        `VCN Hardware Encode Results (AMF ${vrep.runtime_version})`,
+        vrep.peak_rss_bytes ? `Peak RSS: ${(vrep.peak_rss_bytes / (1024 ** 2)).toFixed(1)} MiB` : "",
+        vtable,
+        true
+      )
+    );
+  }
 }
 
 /* ---------------- BENCHMARKS TAB ---------------- */

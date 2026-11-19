@@ -52,6 +52,18 @@ const state = {
   videoCaps: null,
   loadingVideo: false,
   videoError: null,
+  videoBenchForm: {
+    codec: "all",
+    resolution: "1920x1080",
+    fps: 60,
+    bitrate_mbps: 12,
+    preset: "speed",
+    warmup_frames: 15,
+    measured_frames: 120,
+  },
+  runningVideoBench: false,
+  videoBenchReport: null,
+  videoBenchError: null,
 
   benchForm: {
     device_index: 0,
@@ -402,6 +414,40 @@ async function refreshVideoCaps() {
   }
 }
 
+async function runVideoBenchmark() {
+  if (state.runningVideoBench || state.busyOp) return;
+  state.runningVideoBench = true;
+  state.busyOp = true;
+  state.videoBenchError = null;
+  const [wStr, hStr] = String(state.videoBenchForm.resolution || "1920x1080").split("x");
+  const width = Number(wStr) || 1920;
+  const height = Number(hStr) || 1080;
+  setStatusNote(`Running VCN hardware encode benchmark (${state.videoBenchForm.codec}, ${width}x${height})...`);
+  renderActiveView();
+
+  try {
+    state.videoBenchReport = await invokeCommand("run_video_benchmark", {
+      request: {
+        codec: state.videoBenchForm.codec,
+        width,
+        height,
+        fps: Number(state.videoBenchForm.fps) || 60,
+        bitrate_mbps: Number(state.videoBenchForm.bitrate_mbps) || 12,
+        preset: state.videoBenchForm.preset,
+        warmup_frames: Number(state.videoBenchForm.warmup_frames),
+        measured_frames: Number(state.videoBenchForm.measured_frames),
+      },
+    });
+    setStatusNote(`Completed VCN hardware encode benchmark (${width}x${height}).`);
+  } catch (err) {
+    state.videoBenchError = String(err);
+  } finally {
+    state.runningVideoBench = false;
+    state.busyOp = false;
+    renderActiveView();
+  }
+}
+
 async function runBenchmark() {
   if (state.runningBench || state.busyOp) return;
   state.runningBench = true;
@@ -522,6 +568,18 @@ const actions = {
     downloadTextFile(
       "rdna-forge-video-caps.json",
       JSON.stringify(state.videoCaps, null, 2),
+      "application/json"
+    );
+  },
+  updateVideoBenchField: (key, value) => {
+    state.videoBenchForm[key] = value;
+  },
+  runVideoBenchmark,
+  exportVideoBenchJson: () => {
+    if (!state.videoBenchReport) return;
+    downloadTextFile(
+      `rdna-forge-video-bench-${state.videoBenchForm.resolution}.json`,
+      JSON.stringify(state.videoBenchReport, null, 2),
       "application/json"
     );
   },

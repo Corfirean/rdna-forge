@@ -4,7 +4,7 @@ mod commands;
 
 use commands::{
     get_diagnostics, get_telemetry_snapshot, get_tuning_report, get_video_caps, reset_tuning,
-    run_live_verification, run_vulkan_benchmark, set_power_limit, AppState,
+    run_live_verification, run_video_benchmark, run_vulkan_benchmark, set_power_limit, AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -25,6 +25,7 @@ fn main() {
             set_power_limit,
             reset_tuning,
             get_video_caps,
+            run_video_benchmark,
             run_vulkan_benchmark,
         ])
         .run(tauri::generate_context!())
