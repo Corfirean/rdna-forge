@@ -51,9 +51,9 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 
 ### `forge-runtime`
 - **`probe`**: Audits Vulkan, HIP driver vs ROCm SDK tools (`rocm-sdk`/`hipcc`), Python PyTorch ROCm + `triton-windows`, ADLX, DirectML (flagging maintenance mode), AMF, and `llama-bench`.
-- **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `gemm_f32_tiled_vec4.wgsl`, `gemm_i8_dp4a.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`) and compiles them purely in Rust via `naga` to SPIR-V 1.3 or SPIR-V 1.6 (`OpSDot` / `V_DOT4_I32_I8` when `shader_integer_dot_product` is supported by the device).
-- **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::shader_integer_dot_product` when accelerated), queue, command pool, timestamp `QueryPool`, `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
-- **`reference`**: FP64-accumulated FP32 and exact `i64` INT8 CPU reference implementations plus `compare_slices` / `compare_i32_exact` evaluators and `k4` byte packing helpers.
+- **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `gemm_f32_tiled_vec4.wgsl`, `gemm_i8_dp4a.wgsl`, `gemv_w8a32_wave32.wgsl`, `gemv_q4_0_wave32.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`, `rmsnorm_rope_f32_subgroup.wgsl`) and compiles them purely in Rust via `naga` to SPIR-V 1.3 (`OpGroupNonUniformFAdd` subgroups + `OpBitFieldSExtract` unpacks) or SPIR-V 1.6 (`OpSDot` / `V_DOT4_I32_I8` when `shader_integer_dot_product` is supported by the device).
+- **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::{shader_integer_dot_product, subgroup_size_control, compute_full_subgroups}` when supported, with `requiredSubgroupSize = 32` for Wave32 kernels), queue, command pool, timestamp `QueryPool`, `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
+- **`reference`**: FP64-accumulated FP32, quantized `Q4_0`/`W8A32`, fused `RMSNorm+RoPE`, and exact `i64` INT8 CPU reference implementations plus `compare_slices` / `compare_i32_exact` evaluators and `k4`/`Q4_0` packing helpers.
 - **`hip_verify`**: RAII-guarded `hipMalloc` / `hipMemcpy` / `hipEvent*` 4 MiB bit-exact H2D+D2H verification against `amdhip64_*.dll`.
 
 ### `forge-benchmark`

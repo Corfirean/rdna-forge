@@ -7,8 +7,8 @@ RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contr
 ### What Works Today
 - **Multi-source Windows GPU, runtime & live ADLX telemetry (`forge doctor`, `forge monitor`)**: Correlates `RtlGetVersion`, Windows Display Registry (`qwMemorySize`, Adrenalin version), Vulkan (`ash`), AMD HIP (`amdhip64_*.dll` `R0600` ABI), Python ROCm/`triton-windows`, and pure-Rust ADLX `V1.4` live streaming (`table`, `jsonl`, `csv`) with WDDM VRAM pressure alerts.
 - **Read-only ADLX tuning inspection & safe power-limit validation (`forge tune`)**: Inspects hardware tuning capabilities, presets, power limits (`%`), GFX clocks/voltage, VRAM clock/memory timing modes, fan curves, and Zero-RPM state (`tune show`); validates `power-limit <PCT>` and `reset` in safe dry-run mode by default (explicit `--apply` required to commit).
-- **Live GPU capability verification (`forge doctor --verify`)**: Executes bit-exact HIP 4 MiB H2D/D2H transfers and pure-Rust WGSL->SPIR-V (`naga`) Vulkan compute kernels (baseline FP32 GEMM, register-blocked `128x64 vec4` FP32 GEMM, `OpSDot` INT8 DP4A GEMM, RMSNorm, RoPE) validated against exact FP64/`i64` CPU references.
-- **Reproducible benchmark harnesses (`forge bench`)**: Statistical median/IQR/MAD/p95 timing + numerical accuracy + peak RSS + ADLX telemetry across Vulkan compute (`--kernel all|gemm|gemm-opt|gemm-i8|rmsnorm|rope`), PyTorch ROCm + `triton-windows` (`--smoke`, opt-in `--telemetry`), and `llama.cpp` (`--flash-attn`, `--hip-disable-graphs`).
+- **Live GPU capability verification (`forge doctor --verify`)**: Executes bit-exact HIP 4 MiB H2D/D2H transfers and pure-Rust WGSL->SPIR-V (`naga`) Vulkan compute kernels (baseline FP32 GEMM, register-blocked `128x64 vec4` FP32 GEMM, `OpSDot` INT8 DP4A GEMM, Wave32 `W8A32` / `Q4_0` GEMV, RMSNorm, RoPE, fused subgroup `RMSNorm+RoPE`) validated against exact FP64/`i64` CPU references.
+- **Reproducible benchmark harnesses (`forge bench`)**: Statistical median/IQR/MAD/p95 timing + numerical accuracy + peak RSS + ADLX telemetry across Vulkan compute (`--kernel all|gemm|gemm-opt|gemm-i8|gemv-w8|gemv-q4|rmsnorm|rope|fused-rms-rope`), PyTorch ROCm + `triton-windows` (`--smoke`, opt-in `--telemetry`), and `llama.cpp` (`--flash-attn`, `--hip-disable-graphs`).
 
 ### Currently Verified Hardware
 - **Primary verified target**: AMD Radeon RX 6900 XT (`gfx1030`, RDNA2, 16 GiB VRAM) on Windows 11 Build `26300` with Adrenalin `26.11.2`.
@@ -23,7 +23,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 3A complete (`forge monitor` live ADLX streaming + `forge tune` ADLX `V1.4` tuning inspector & range-validated dry-run power-limit control), building on Milestone 2 (`forge-profiler`, `9.50x` Vulkan FP32 GEMM speedup, `30.29 TOPS` bit-exact INT8 `OpSDot`, `llama.cpp` WDDM root-cause analysis, and smoke-verified Triton kernels).
+**Current Project Status:** Milestone 3B complete (Wave32 subgroup `W8A32` & `Q4_0` LLM decode GEMV kernels and single-pass fused `RMSNorm+RoPE` in pure Rust WGSL->SPIR-V), building on Milestone 3A (`forge monitor` + `forge tune` ADLX `V1.4` live telemetry/tuning) and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
 
 ---
 
@@ -162,6 +162,9 @@ All benchmarks use warmups, repeated runs, median and dispersion (`min`, `p95`, 
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | GEMM FP32 (baseline vs `tiled_vec4`) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | 11.990 ms vs **1.262 ms** | 1432.90 vs **13610.84 GFLOP/s** | Verified (**9.50x speedup**, `max_abs=9.54e-5`) |
 | GEMM INT8 (`dot4I8Packed` -> `OpSDot`) | Vulkan (`ash` + `naga`) | `2048x2048x2048` | **0.567 ms** | **30.29 TOPS** | Verified (**bit-exact**, `max_abs=0`) |
+| GEMV `W8A32` (Wave32 subgroup, 0 LDS) | Vulkan 1.3 Wave32 | `11008x4096` (`4096^2`) | **0.218 ms** (`0.124 ms`) | **207.35 GB/s** (`135.87 GB/s`) | Verified (`4.00x` wt compression, `max_abs=9.77e-4`) |
+| GEMV `Q4_0` (Wave32 subgroup, block-32) | Vulkan 1.3 Wave32 | `11008x4096` (`4096^2`) | **0.301 ms** (`0.089` min) | **93.97 GB/s** (`317.8` peak min) | Verified (`6.40x` wt compression, `max_abs=1.14e-5`) |
+| Fused `RMSNorm+RoPE` (single-pass Wave32) | Vulkan subgroup | `1024x32x128` | **0.120 ms** | **280.55 GB/s** | Verified (`IQR=0.001 ms`, eliminates HBM round-trip) |
 | GEMM FP32 (`rocBLAS`) | PyTorch ROCm 10.2 | `2048x2048x2048` | 0.828 ms | 20.75 TFLOP/s | Verified |
 | GEMM FP16 (`rocBLAS`) | PyTorch ROCm 10.2 | `4096x4096x4096` | 3.975 ms | 34.58 TFLOP/s | Verified |
 | GEMM FP16 (Triton) | `triton-windows` 3.9 | `2048x2048x2048` | 0.884 ms | 19.43 TFLOP/s | Verified |
@@ -203,7 +206,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
 - **Milestone 3A (Complete):**
   - Added `forge monitor` real-time ADLX telemetry streaming (`table`, `jsonl`, `csv`, `--output`, Win32 `SetConsoleCtrlHandler` graceful exit, summary stats).
   - Added `forge tune` pure-Rust ADLX `V1.4` tuning inspection (`show`) and hardware range-validated `power-limit` / `reset` commands with safe dry-run default (`--apply` opt-in).
-- **Future:** Vulkan compute LLM decode kernels (`Q4_0`/`W8A32` GEMV, subgroup Wave32 fused `RMSNorm+RoPE`), hardware video pipelines (`AMF`), FidelityFX SDK evaluation, RDNA3/RDNA4 verification, optional Tauri desktop UI, Linux support.
+- **Milestone 3B (Complete):**
+  - Added Vulkan 1.3 `subgroup_size_control` (`required_subgroup_size = 32`, `REQUIRE_FULL_SUBGROUPS`) and SPIR-V `OpGroupNonUniformFAdd` subgroup compilation in `forge-runtime`.
+  - Implemented and live-verified Wave32 `W8A32` GEMV (`207.35 GB/s` at `11008x4096`), `Q4_0` block-32 GEMV (`6.40x` compression, `0.089 ms` min / `93.97 GB/s` median), and single-pass fused `RMSNorm+RoPE` with KV-cache `pos_offset` (`0.120 ms` / `280.55 GB/s`).
+- **Future:** Hardware video pipelines (`AMF`), FidelityFX SDK evaluation, RDNA3/RDNA4 verification, optional Tauri desktop UI, Linux support.
 
 ---
 

@@ -54,7 +54,7 @@ python -m py_compile modules/ai/triton/bench_suite.py
 ```
 
 ### Live GPU Correctness Tests
-Runs device discovery, live ADLX telemetry snapshots, read-only ADLX tuning inspection and dry-run range validation (never mutating GPU settings), HIP 4 MiB H2D/D2H verification, Vulkan baseline / tiled `vec4` / INT8 DP4A (`OpSDot`) edge-case tests (`1x1x1`, non-aligned shapes, dimension/VRAM bounds checks), and a repeated-dispatch stability check on physical AMD hardware (use `--test-threads=1` so ADLX and HIP tests run sequentially):
+Runs device discovery, live ADLX telemetry snapshots, read-only ADLX tuning inspection and dry-run range validation (never mutating GPU settings), HIP 4 MiB H2D/D2H verification, Vulkan baseline / tiled `vec4` / INT8 DP4A (`OpSDot`) / Wave32 `W8A32` & `Q4_0` GEMV / fused subgroup `RMSNorm+RoPE` edge-case tests, and a repeated-dispatch stability check on physical AMD hardware (use `--test-threads=1` so ADLX and HIP tests run sequentially):
 
 ```powershell
 cargo test --workspace -- --ignored --test-threads=1 --nocapture
@@ -89,6 +89,11 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 
 # Vulkan compute benchmark suite (writes JSON outside repo)
 .\target\release\forge.exe bench vulkan --kernel all --warmup 5 --iters 20 --stability-runs 30 --output ..\vulkan_bench.json
+
+# Individual Milestone 3B LLM decode kernels (W8A32 GEMV, Q4_0 GEMV, fused subgroup RMSNorm+RoPE)
+.\target\release\forge.exe bench vulkan --kernel gemv-w8 --warmup 10 --iters 50 --stability-runs 0
+.\target\release\forge.exe bench vulkan --kernel gemv-q4 --warmup 10 --iters 50 --stability-runs 0
+.\target\release\forge.exe bench vulkan --kernel fused-rms-rope --warmup 10 --iters 50 --stability-runs 0
 
 # Safe 256x256 Triton correctness smoke pass (avoids heavy 2048/4096 power bursts)
 .\target\release\forge.exe bench triton --python C:\venvs\rdna-forge\Scripts\python.exe --smoke --output ..\triton_smoke.json

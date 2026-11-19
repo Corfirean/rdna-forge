@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 3B (Vulkan Compute LLM Decode Kernels for RDNA2)
+- Enabled Vulkan 1.3 `subgroup_size_control` and `compute_full_subgroups` (`requiredSubgroupSize = 32`, `REQUIRE_FULL_SUBGROUPS`) plus `naga::valid::Capabilities::SUBGROUP` SPIR-V 1.3 codegen (`OpGroupNonUniformFAdd`) in `forge-runtime`.
+- Implemented three pure-Rust WGSL->SPIR-V RDNA2 LLM decode kernels:
+  - `gemv_w8a32_wave32.wgsl`: zero-LDS, zero-barrier Wave32 `extractBits` (`OpBitFieldSExtract`) + `subgroupAdd` INT8 weight-only GEMV achieving **207.35 GB/s** (`0.218 ms`, `413.73 GFLOP/s`) at `11008x4096` (`max_abs=9.77e-4`).
+  - `gemv_q4_0_wave32.wgsl`: zero-LDS, zero-barrier Wave32 block-32 `Q4_0` (`6.40x` compression vs FP32) GEMV reaching `0.089 ms` min (`~317.8 GB/s` peak) / `0.301 ms` median (`93.97 GB/s`) at `11008x4096` (`max_abs=1.14e-5`).
+  - `rmsnorm_rope_f32_subgroup.wgsl`: two-barrier, 64-byte LDS single-pass subgroup `RMSNorm + RoPE` with KV-cache `pos_offset` support (`0.120 ms` / `280.55 GB/s` at `1024x32x128`, eliminating intermediate HBM traffic).
+- Added exact FP64 CPU reference evaluators (`ref_gemv_w8a32_f32`, `ref_gemv_q4_0_f32`, `ref_rmsnorm_rope_f32`, `deterministic_q4_0_weights`), `forge bench vulkan --kernel {gemv-w8,gemv-q4,fused-rms-rope}` integration, `forge doctor --verify` checks (8/8 Vulkan + HIP + discovery = 10/10 verified), and offline/live-GPU tests (`13/13` passing on RX 6900 XT).
+
 ### Added — Milestone 3A (Forge Live Telemetry Monitor & ADLX Tuning Inspector)
 - Extended `forge-profiler` with pure-Rust ADLX `V1.4` tuning COM vtable bindings (`IADLXGPUTuningServices`, `IADLXGPUPresetTuning`, `IADLXManualPowerTuning(1)`, `IADLXManualGraphicsTuning2(_1)`, `IADLXManualVRAMTuning2(_1)`, `IADLXManualFanTuning(1)`) without vendoring proprietary SDK headers.
 - Added domain tuning types and hardware `IntRange` validation (`min..=max` and `step` alignment), `MemoryTimingMode` mapping, read-only `read_all_gpu_tuning()`, and dry-run-safe `set_gpu_power_limit()` / `reset_gpu_tuning_to_factory()`.

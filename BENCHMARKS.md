@@ -163,7 +163,27 @@ Five new `gfx1030` Triton kernels were added to `modules/ai/triton/bench_suite.p
 
 ---
 
-## 7. Reproduction Commands
+## 7. Milestone 3B — Vulkan Compute LLM Decode Kernels (`gfx1030`)
+
+Pure-Rust `naga` (`WGSL` -> SPIR-V 1.3 `OpGroupNonUniformFAdd` + `OpBitFieldSExtract`) kernels leveraging Vulkan 1.3 `subgroup_size_control` (`required_subgroup_size = 32`, `REQUIRE_FULL_SUBGROUPS`) on AMD Radeon RX 6900 XT (`warmup = 10`, `iters = 50`, `--stability-runs 0`, full FP64 CPU reference check):
+
+| Kernel | Strategy | Shape | Dtype | Median (ms) | Min / P95 / Max (ms) | IQR / MAD (ms) | Throughput | Compression vs FP32 | Max Abs Err | RMSE | Accuracy |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `gemv_w8a32_wave32_4096x4096` | Wave32 `extractBits` + `subgroupAdd` (0 LDS, 0 barriers) | `4096x4096` | `i8*f32->f32` | **0.124** | 0.114 / 0.135 / 0.137 | 0.009 / 0.004 | **135.87 GB/s** (270.95 GFLOP/s) | **4.00x** | 8.54e-4 | 1.69e-4 | Pass |
+| `gemv_w8a32_wave32_11008x4096` | Wave32 `extractBits` + `subgroupAdd` (LLaMA-7B MLP shape) | `11008x4096` | `i8*f32->f32` | **0.218** | 0.132 / 0.247 / 0.258 | 0.021 / 0.012 | **207.35 GB/s** (413.73 GFLOP/s) | **4.00x** | 9.77e-4 | 1.71e-4 | Pass |
+| `gemv_q4_0_wave32_4096x4096` | Wave32 block-32 nibble unpack + `subgroupAdd` | `4096x4096` | `q4_0->f32` | **0.124** | 0.123 / 0.132 / 0.132 | 0.001 / 0.000 | **84.87 GB/s** (270.73 GFLOP/s) | **6.40x** | 7.63e-6 | 2.58e-6 | Pass |
+| `gemv_q4_0_wave32_11008x4096` | Wave32 block-32 nibble unpack + `subgroupAdd` | `11008x4096` | `q4_0->f32` | **0.301** (`0.089` min) | 0.089 / 0.308 / 0.313 | 0.209 / 0.007 | **93.97 GB/s** (300.07 GFLOP/s) | **6.40x** | 1.14e-5 | 2.67e-6 | Pass |
+| `rmsnorm_rope_subgroup_1024x32x128` | Single-pass Wave32 subgroup `RMSNorm+RoPE` (2 barriers, 64 B LDS) | `1024x32x128` | `f32` | **0.120** | 0.118 / 0.121 / 0.128 | 0.001 / 0.001 | **280.55 GB/s** | — (fused) | 1.63e-4 | 4.15e-6 | Pass |
+| `rope_f32_1024x32x128` (ref) | Standalone unfused RoPE baseline at identical tensor shape | `1024x32x128` | `f32` | 0.088 | 0.088 / 0.089 / 0.093 | 0.000 / 0.000 | 379.23 GB/s | — | 1.13e-4 | 4.14e-6 | Pass |
+| `rmsnorm_f32_4096x4096` (ref) | Unfused RMSNorm (workgroup tree reduction, 128 MiB Infinity Cache working set) | `4096x4096` | `f32` | 0.163 | 0.136 / 0.510 / 0.567 | 0.138 / 0.025 | 823.83 GB/s | — | 3.58e-7 | 3.60e-8 | Pass |
+
+Observed hardware telemetry & behavior via `forge-profiler` ADLX:
+- **Sub-millisecond fence idle-clock effect**: Because `execute_timed_loop` waits on a host fence after each `~0.1 ms` dispatch, ADLX recorded idle/low SCLK (`52–84 MHz`, `41–42 W`, `36–37 C`, `~1982–1988 MHz` VRAM clock) across these runs. Even under `75–84 MHz` SMU idle P-states, `gemv_q4_0_wave32_11008x4096` peaked at **`0.089 ms` (`~317.8 GB/s`)** when clocks briefly boosted (accounting for the `min=0.089` vs `median=0.301` spread).
+- **Single-pass fusion benefit**: `rmsnorm_rope_subgroup_1024x32x128` executes full `RMSNorm + RoPE` (with `pos_offset` support for KV-cache single-token decode) in `0.120 ms` (`IQR = 0.001 ms`), adding only `0.032 ms` over standalone `rope_f32` while eliminating the intermediate `16 MiB` global VRAM round-trip.
+
+---
+
+## 8. Reproduction Commands
 
 ```powershell
 # 1. Build release CLI
@@ -172,8 +192,13 @@ cargo build --release -p forge-cli
 # 2. Diagnostics + live ADLX telemetry + Vulkan/HIP verification
 .\target\release\forge.exe doctor --verify --python <venv>\Scripts\python.exe
 
-# 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + stability)
+# 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + Wave32 decode kernels + stability)
 .\target\release\forge.exe bench vulkan --kernel all --warmup 5 --iters 20 --stability-runs 30 --output ..\vulkan_bench.json
+
+# 3b. Standalone Milestone 3B decode kernel benchmarks (W8A32 GEMV, Q4_0 GEMV, fused RMSNorm+RoPE)
+.\target\release\forge.exe bench vulkan --kernel gemv-w8 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_w8.json
+.\target\release\forge.exe bench vulkan --kernel gemv-q4 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_q4.json
+.\target\release\forge.exe bench vulkan --kernel fused-rms-rope --warmup 10 --iters 50 --stability-runs 0 --output ..\fused_rms_rope.json
 
 # 4. Safe 256x256 Triton verification pass (smoke mode)
 .\target\release\forge.exe bench triton --python <venv>\Scripts\python.exe --smoke --output ..\triton_smoke.json
