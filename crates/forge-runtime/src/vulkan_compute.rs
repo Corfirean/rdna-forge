@@ -146,6 +146,15 @@ impl Drop for ComputePipeline {
     }
 }
 
+fn validate_batch_dispatches(dispatches_per_submit: usize) -> ForgeResult<()> {
+    if !(1..=256).contains(&dispatches_per_submit) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "batch dispatches_per_submit must be in 1..=256, got {dispatches_per_submit}"
+        )));
+    }
+    Ok(())
+}
+
 /// Safe RAII Vulkan compute executor with hardware capability validation and timestamp profiling.
 pub struct VulkanComputeEngine {
     ctx: Arc<VulkanContext>,
@@ -518,7 +527,7 @@ impl VulkanComputeEngine {
         let gx = n.div_ceil(tile_n);
         let gy = m.div_ceil(tile_m);
         let timings =
-            self.execute_timed_loop(&pipeline, gx, gy, 1, warmup_iters, measured_iters)?;
+            self.execute_timed_loop(&pipeline, gx, gy, 1, warmup_iters, measured_iters, 1)?;
         let out = self.download_device_local_vec::<f32>(&buf_c, elems_c)?;
 
         Ok((out, timings))
@@ -623,7 +632,7 @@ impl VulkanComputeEngine {
         let gx = n.div_ceil(64);
         let gy = m.div_ceil(64);
         let timings =
-            self.execute_timed_loop(&pipeline, gx, gy, 1, warmup_iters, measured_iters)?;
+            self.execute_timed_loop(&pipeline, gx, gy, 1, warmup_iters, measured_iters, 1)?;
         let out = self.download_device_local_vec::<i32>(&buf_c, elems_c)?;
 
         Ok((out, timings))
@@ -645,7 +654,7 @@ impl VulkanComputeEngine {
         Ok((out, timing))
     }
 
-    /// Benchmarks row-wise RMSNorm on device-local buffers.
+    /// Benchmarks row-wise RMSNorm on device-local buffers (1 dispatch per submit).
     #[allow(clippy::too_many_arguments)]
     pub fn bench_rmsnorm_f32(
         &self,
@@ -657,6 +666,23 @@ impl VulkanComputeEngine {
         warmup_iters: usize,
         measured_iters: usize,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_rmsnorm_f32_batched(x, weight, rows, cols, eps, warmup_iters, measured_iters, 1)
+    }
+
+    /// Benchmarks row-wise RMSNorm with `dispatches_per_submit` dispatches per command buffer submit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_rmsnorm_f32_batched(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        validate_batch_dispatches(dispatches_per_submit)?;
         if rows == 0 || cols == 0 {
             return Err(ForgeError::InvalidDimension(
                 "RMSNorm rows and cols must be > 0".to_string(),
@@ -705,8 +731,15 @@ impl VulkanComputeEngine {
 
         self.bind_buffers(&pipeline, &[&buf_x, &buf_w, &buf_y], Some(&ubo));
 
-        let timings =
-            self.execute_timed_loop(&pipeline, rows, 1, 1, warmup_iters, measured_iters)?;
+        let timings = self.execute_timed_loop(
+            &pipeline,
+            rows,
+            1,
+            1,
+            warmup_iters,
+            measured_iters,
+            dispatches_per_submit,
+        )?;
         let out = self.download_device_local_vec::<f32>(&buf_y, elems)?;
 
         Ok((out, timings))
@@ -729,7 +762,7 @@ impl VulkanComputeEngine {
         Ok((out, timing))
     }
 
-    /// Benchmarks RoPE on device-local buffers.
+    /// Benchmarks RoPE on device-local buffers (1 dispatch per submit).
     #[allow(clippy::too_many_arguments)]
     pub fn bench_rope_f32(
         &self,
@@ -741,6 +774,32 @@ impl VulkanComputeEngine {
         warmup_iters: usize,
         measured_iters: usize,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_rope_f32_batched(
+            input,
+            seq_len,
+            n_heads,
+            head_dim,
+            theta_base,
+            warmup_iters,
+            measured_iters,
+            1,
+        )
+    }
+
+    /// Benchmarks RoPE with `dispatches_per_submit` dispatches per command buffer submit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_rope_f32_batched(
+        &self,
+        input: &[f32],
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta_base: f32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        validate_batch_dispatches(dispatches_per_submit)?;
         if seq_len == 0 || n_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Err(ForgeError::InvalidDimension(format!(
                 "RoPE requires non-zero dimensions and even head_dim, got ({seq_len}, {n_heads}, {head_dim})"
@@ -799,7 +858,15 @@ impl VulkanComputeEngine {
             .ok_or_else(|| ForgeError::InvalidDimension("RoPE pair count overflow".to_string()))?;
         let gx = total_pairs.div_ceil(256);
 
-        let timings = self.execute_timed_loop(&pipeline, gx, 1, 1, warmup_iters, measured_iters)?;
+        let timings = self.execute_timed_loop(
+            &pipeline,
+            gx,
+            1,
+            1,
+            warmup_iters,
+            measured_iters,
+            dispatches_per_submit,
+        )?;
         let out = self.download_device_local_vec::<f32>(&buf_out, elems)?;
 
         Ok((out, timings))
@@ -821,7 +888,7 @@ impl VulkanComputeEngine {
         Ok((out, timing))
     }
 
-    /// Benchmarks Wave32 INT8 weight-only GEMV (`W8A32`) on device-local buffers.
+    /// Benchmarks Wave32 INT8 weight-only GEMV (`W8A32`) on device-local buffers (1 dispatch per submit).
     #[allow(clippy::too_many_arguments)]
     pub fn bench_gemv_w8a32_wave32(
         &self,
@@ -832,6 +899,31 @@ impl VulkanComputeEngine {
         k: u32,
         warmup_iters: usize,
         measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_gemv_w8a32_wave32_batched(
+            w_packed,
+            scales,
+            x,
+            n,
+            k,
+            warmup_iters,
+            measured_iters,
+            1,
+        )
+    }
+
+    /// Benchmarks Wave32 INT8 weight-only GEMV (`W8A32`) with batched command buffer dispatches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemv_w8a32_wave32_batched(
+        &self,
+        w_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
         if n == 0 || k == 0 || !k.is_multiple_of(4) {
             return Err(ForgeError::InvalidDimension(format!(
@@ -855,6 +947,7 @@ impl VulkanComputeEngine {
             n as usize,
             warmup_iters,
             measured_iters,
+            dispatches_per_submit,
         )
     }
 
@@ -874,7 +967,7 @@ impl VulkanComputeEngine {
         Ok((out, timing))
     }
 
-    /// Benchmarks Wave32 `Q4_0` block-32 GEMV on device-local buffers.
+    /// Benchmarks Wave32 `Q4_0` block-32 GEMV on device-local buffers (1 dispatch per submit).
     #[allow(clippy::too_many_arguments)]
     pub fn bench_gemv_q4_0_wave32(
         &self,
@@ -885,6 +978,31 @@ impl VulkanComputeEngine {
         k: u32,
         warmup_iters: usize,
         measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_gemv_q4_0_wave32_batched(
+            w_q4_packed,
+            scales,
+            x,
+            n,
+            k,
+            warmup_iters,
+            measured_iters,
+            1,
+        )
+    }
+
+    /// Benchmarks Wave32 `Q4_0` block-32 GEMV with batched command buffer dispatches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemv_q4_0_wave32_batched(
+        &self,
+        w_q4_packed: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        n: u32,
+        k: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
         if n == 0 || k == 0 || !k.is_multiple_of(Q4_0_BLOCK_SIZE as u32) {
             return Err(ForgeError::InvalidDimension(format!(
@@ -911,6 +1029,7 @@ impl VulkanComputeEngine {
             total_blocks,
             warmup_iters,
             measured_iters,
+            dispatches_per_submit,
         )
     }
 
@@ -929,7 +1048,9 @@ impl VulkanComputeEngine {
         expected_scales_len: usize,
         warmup_iters: usize,
         measured_iters: usize,
+        dispatches_per_submit: usize,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        validate_batch_dispatches(dispatches_per_submit)?;
         if !self.ctx.subgroup_arithmetic_enabled || !self.ctx.wave32_subgroup_control_enabled {
             return Err(ForgeError::UnsupportedCapability(format!(
                 "Vulkan 1.3 Wave32 subgroup arithmetic control is unavailable on '{}'",
@@ -990,7 +1111,15 @@ impl VulkanComputeEngine {
         self.bind_buffers(&pipeline, &[&buf_w, &buf_s, &buf_x, &buf_y], Some(&ubo));
 
         let gx = n.div_ceil(4);
-        let timings = self.execute_timed_loop(&pipeline, gx, 1, 1, warmup_iters, measured_iters)?;
+        let timings = self.execute_timed_loop(
+            &pipeline,
+            gx,
+            1,
+            1,
+            warmup_iters,
+            measured_iters,
+            dispatches_per_submit,
+        )?;
         let out = self.download_device_local_vec::<f32>(&buf_y, n as usize)?;
 
         Ok((out, timings))
@@ -1018,7 +1147,7 @@ impl VulkanComputeEngine {
         Ok((out, timing))
     }
 
-    /// Benchmarks fused subgroup RMSNorm + RoPE (single-pass LDS/VRAM minimization) on device-local buffers.
+    /// Benchmarks fused subgroup RMSNorm + RoPE (1 dispatch per submit).
     #[allow(clippy::too_many_arguments)]
     pub fn bench_rmsnorm_rope_f32_subgroup(
         &self,
@@ -1033,6 +1162,38 @@ impl VulkanComputeEngine {
         warmup_iters: usize,
         measured_iters: usize,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_rmsnorm_rope_f32_subgroup_batched(
+            x,
+            weight,
+            seq_len,
+            n_heads,
+            head_dim,
+            pos_offset,
+            eps,
+            theta_base,
+            warmup_iters,
+            measured_iters,
+            1,
+        )
+    }
+
+    /// Benchmarks fused subgroup RMSNorm + RoPE with `dispatches_per_submit` batched dispatches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_rmsnorm_rope_f32_subgroup_batched(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        pos_offset: u32,
+        eps: f32,
+        theta_base: f32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        dispatches_per_submit: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        validate_batch_dispatches(dispatches_per_submit)?;
         if !self.ctx.subgroup_arithmetic_enabled {
             return Err(ForgeError::UnsupportedCapability(format!(
                 "Vulkan subgroup arithmetic operations are unavailable on '{}'",
@@ -1102,8 +1263,15 @@ impl VulkanComputeEngine {
 
         self.bind_buffers(&pipeline, &[&buf_x, &buf_w, &buf_y], Some(&ubo));
 
-        let timings =
-            self.execute_timed_loop(&pipeline, seq_len, 1, 1, warmup_iters, measured_iters)?;
+        let timings = self.execute_timed_loop(
+            &pipeline,
+            seq_len,
+            1,
+            1,
+            warmup_iters,
+            measured_iters,
+            dispatches_per_submit,
+        )?;
         let out = self.download_device_local_vec::<f32>(&buf_y, elems)?;
 
         Ok((out, timings))
@@ -1309,6 +1477,7 @@ impl VulkanComputeEngine {
         unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_timed_loop(
         &self,
         pipeline: &ComputePipeline,
@@ -1317,7 +1486,9 @@ impl VulkanComputeEngine {
         gz: u32,
         warmup_iters: usize,
         measured_iters: usize,
+        dispatches_per_submit: usize,
     ) -> ForgeResult<Vec<GpuTiming>> {
+        validate_batch_dispatches(dispatches_per_submit)?;
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.ctx.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -1331,6 +1502,9 @@ impl VulkanComputeEngine {
 
         let total = warmup_iters + measured_iters;
         let mut timings = Vec::with_capacity(measured_iters);
+        let batch_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ);
 
         let result = (|| -> ForgeResult<()> {
             for iter in 0..total {
@@ -1370,7 +1544,20 @@ impl VulkanComputeEngine {
                         std::slice::from_ref(&pipeline.descriptor_set),
                         &[],
                     );
-                    self.ctx.device.cmd_dispatch(cmd, gx, gy, gz);
+                    for dispatch_idx in 0..dispatches_per_submit {
+                        if dispatch_idx > 0 {
+                            self.ctx.device.cmd_pipeline_barrier(
+                                cmd,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                std::slice::from_ref(&batch_barrier),
+                                &[],
+                                &[],
+                            );
+                        }
+                        self.ctx.device.cmd_dispatch(cmd, gx, gy, gz);
+                    }
 
                     if let Some(qp) = self.ctx.query_pool {
                         self.ctx.device.cmd_write_timestamp(
@@ -1406,7 +1593,8 @@ impl VulkanComputeEngine {
                             ForgeError::ExecutionFailed(format!("wait_for_fences: {e}"))
                         })?;
                 }
-                let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+                let wall_ms =
+                    (wall_start.elapsed().as_secs_f64() * 1000.0) / (dispatches_per_submit as f64);
 
                 if iter >= warmup_iters {
                     let gpu_ms = self.ctx.query_pool.and_then(|qp| {
@@ -1422,7 +1610,7 @@ impl VulkanComputeEngine {
                         if rc.is_ok() && timestamps[1] >= timestamps[0] {
                             let ticks = timestamps[1] - timestamps[0];
                             let ns = (ticks as f64) * f64::from(self.ctx.timestamp_period_ns);
-                            Some(ns / 1_000_000.0)
+                            Some((ns / 1_000_000.0) / (dispatches_per_submit as f64))
                         } else {
                             None
                         }

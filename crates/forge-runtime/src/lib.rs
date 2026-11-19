@@ -1,9 +1,14 @@
+pub mod amf;
 pub mod hip_verify;
 pub mod probe;
 pub mod reference;
 pub mod shaders;
 pub mod vulkan_compute;
 
+pub use amf::{
+    amf_surface_format_name, format_amf_version, probe_amf_capabilities, AmfAcceleration,
+    AmfCapabilitiesReport, AmfCodecCapability, AmfCodecDirection,
+};
 pub use hip_verify::{verify_hip_transfer, HipVerificationResult};
 pub use probe::probe_all_backends;
 pub use reference::{
@@ -188,5 +193,69 @@ mod tests {
             ref_rope_f32(&[1.0, 2.0, 3.0], 1, 1, 3, 10000.0),
             Err(ForgeError::InvalidDimension(_))
         ));
+    }
+
+    #[test]
+    fn amf_version_and_enum_decoders_work() {
+        assert_eq!(format_amf_version(0x0001_0004_0025_0000), "1.4.37.0");
+        assert_eq!(format_amf_version(0x0001_0005_0003_0000), "1.5.3.0");
+
+        assert_eq!(AmfAcceleration::from_amf(-1), AmfAcceleration::NotSupported);
+        assert_eq!(AmfAcceleration::from_amf(0), AmfAcceleration::Hardware);
+        assert_eq!(AmfAcceleration::from_amf(1), AmfAcceleration::Gpu);
+        assert_eq!(AmfAcceleration::from_amf(2), AmfAcceleration::Software);
+        assert_eq!(AmfAcceleration::from_amf(9), AmfAcceleration::Unknown(9));
+        assert_eq!(AmfAcceleration::Hardware.to_string(), "HARDWARE");
+
+        assert_eq!(amf_surface_format_name(0), "UNKNOWN");
+        assert_eq!(amf_surface_format_name(1), "NV12");
+        assert_eq!(amf_surface_format_name(10), "P010");
+        assert_eq!(amf_surface_format_name(26), "R32G8X24");
+        assert_eq!(amf_surface_format_name(999), "FORMAT_999");
+    }
+
+    #[test]
+    fn amf_report_json_roundtrip() {
+        let report = AmfCapabilitiesReport {
+            runtime_version: "1.4.37.0".to_string(),
+            dx11_initialized: true,
+            codecs: vec![
+                AmfCodecCapability {
+                    codec: "HEVC/H.265".to_string(),
+                    component_id: "AMFVideoEncoderHW_HEVC".to_string(),
+                    direction: AmfCodecDirection::Encode,
+                    acceleration: AmfAcceleration::Hardware,
+                    min_width: Some(128),
+                    max_width: Some(8192),
+                    min_height: Some(128),
+                    max_height: Some(4352),
+                    vert_align: Some(16),
+                    interlaced_supported: Some(false),
+                    native_formats: vec!["NV12".to_string(), "P010".to_string()],
+                    supported_formats: vec!["NV12".to_string(), "P010".to_string()],
+                    detail: None,
+                },
+                AmfCodecCapability {
+                    codec: "AV1".to_string(),
+                    component_id: "AMFVideoEncoderHW_AV1".to_string(),
+                    direction: AmfCodecDirection::Encode,
+                    acceleration: AmfAcceleration::NotSupported,
+                    min_width: None,
+                    max_width: None,
+                    min_height: None,
+                    max_height: None,
+                    vert_align: None,
+                    interlaced_supported: None,
+                    native_formats: Vec::new(),
+                    supported_formats: Vec::new(),
+                    detail: Some("CreateComponent returned error 30".to_string()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string_pretty(&report).expect("serialize AMF report");
+        let parsed: AmfCapabilitiesReport =
+            serde_json::from_str(&json).expect("deserialize AMF report");
+        assert_eq!(parsed, report);
     }
 }

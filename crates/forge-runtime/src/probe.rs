@@ -204,24 +204,8 @@ pub fn probe_all_backends(
         }
     });
 
-    // 6. AMF (Video pipeline)
-    backends.push(if system32_dll_path("amfrt64.dll").is_some() {
-        BackendStatus {
-            kind: BackendKind::Amf,
-            status: SupportStatus::PartiallyVerified,
-            version: None,
-            summary: "Detected (amfrt64.dll present)".to_string(),
-            details: Vec::new(),
-        }
-    } else {
-        BackendStatus {
-            kind: BackendKind::Amf,
-            status: SupportStatus::Unsupported,
-            version: None,
-            summary: "Unavailable (amfrt64.dll not found)".to_string(),
-            details: Vec::new(),
-        }
-    });
+    // 6. AMF (Hardware video pipeline)
+    backends.push(probe_amf_backend());
 
     // 7. llama.cpp CLI
     if let Some(path) = command_path("llama-bench") {
@@ -244,6 +228,79 @@ pub fn probe_all_backends(
     }
 
     (backends, missing)
+}
+
+fn probe_amf_backend() -> BackendStatus {
+    match crate::amf::probe_amf_capabilities() {
+        Ok(report) => {
+            let mut hw_encoders = Vec::new();
+            let mut hw_decoders = Vec::new();
+            let mut unsupported = Vec::new();
+
+            for c in &report.codecs {
+                match (c.direction, c.acceleration) {
+                    (
+                        crate::amf::AmfCodecDirection::Encode,
+                        crate::amf::AmfAcceleration::Hardware,
+                    ) => {
+                        hw_encoders.push(c.codec.as_str());
+                    }
+                    (
+                        crate::amf::AmfCodecDirection::Decode,
+                        crate::amf::AmfAcceleration::Hardware,
+                    ) => {
+                        hw_decoders.push(c.codec.as_str());
+                    }
+                    (_, crate::amf::AmfAcceleration::NotSupported) => {
+                        unsupported.push(format!("{} {}", c.codec, c.direction));
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut details = vec![format!(
+                "amfrt64.dll DX11 probe OK; HW Encoders: [{}]",
+                hw_encoders.join(", ")
+            )];
+            details.push(format!("HW Decoders: [{}]", hw_decoders.join(", ")));
+            if !unsupported.is_empty() {
+                details.push(format!("Unsupported: [{}]", unsupported.join(", ")));
+            }
+
+            BackendStatus {
+                kind: BackendKind::Amf,
+                status: SupportStatus::Verified,
+                version: Some(report.runtime_version.clone()),
+                summary: format!(
+                    "Detected (AMF {}, {} HW encoders / {} HW decoders)",
+                    report.runtime_version,
+                    hw_encoders.len(),
+                    hw_decoders.len()
+                ),
+                details,
+            }
+        }
+        Err(err) => {
+            if system32_dll_path("amfrt64.dll").is_some() {
+                BackendStatus {
+                    kind: BackendKind::Amf,
+                    status: SupportStatus::PartiallyVerified,
+                    version: None,
+                    summary: "Detected (amfrt64.dll present; live capability probe failed)"
+                        .to_string(),
+                    details: vec![err.to_string()],
+                }
+            } else {
+                BackendStatus {
+                    kind: BackendKind::Amf,
+                    status: SupportStatus::Unsupported,
+                    version: None,
+                    summary: "Unavailable (amfrt64.dll not found)".to_string(),
+                    details: Vec::new(),
+                }
+            }
+        }
+    }
 }
 
 fn probe_triton_python(python_override: Option<&Path>) -> BackendStatus {
