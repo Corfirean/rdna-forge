@@ -3,10 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use forge_benchmark::{
-    autotune_llm_model, discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration,
-    run_video_benchmark_suite, run_vulkan_suite, LlmAutotuneConfig, LlmAutotuneReport,
-    LlmOptimizationPlan, LocalLlmAssets, VideoBenchReport, VideoBenchSuiteConfig,
-    VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
+    apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
+    discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration,
+    run_video_benchmark_suite, run_vulkan_suite, EnvAndOllamaPatchResult, KvCacheQuant,
+    LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult, LocalLlmAssets,
+    VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
+    VulkanKernelSelection,
 };
 use forge_core::{CapabilityResult, DiagnosticReport, SupportStatus};
 use forge_device::discover_all;
@@ -268,6 +270,38 @@ pub struct DesktopLlmAutotuneRequest {
     pub gen_tokens: u32,
     pub context_depth: u32,
     pub reps: u32,
+}
+
+/// Request payload for previewing (`dry_run = true`) or writing (`dry_run = false`) LM Studio configs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopLmStudioPatchRequest {
+    pub model_path: Option<String>,
+    pub profile_id: Option<String>,
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
+    #[serde(default = "default_safety_margin_mib")]
+    pub safety_margin_mib: u64,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+/// Request payload for previewing (`dry_run = true`) or applying (`dry_run = false`) Windows/Ollama user env variables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopEnvPatchRequest {
+    pub model_path: Option<String>,
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
+    pub kv_quant: Option<String>,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_context_tokens() -> u32 {
+    4096
+}
+
+fn default_safety_margin_mib() -> u64 {
+    512
 }
 
 fn default_true() -> bool {
@@ -540,6 +574,49 @@ pub async fn run_llm_autotune(
     .map_err(|e| format!("LLM autotuner task failed: {e}"))?
 }
 
+#[tauri::command]
+pub async fn apply_lm_studio_patch(
+    request: DesktopLmStudioPatchRequest,
+) -> Result<LmStudioPatchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
+        apply_lm_studio_config(
+            &model_path,
+            request.profile_id.as_deref(),
+            request.context_tokens.clamp(512, 262_144),
+            request.safety_margin_mib.clamp(0, 4096),
+            request.dry_run,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("LM Studio config patch task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn apply_env_and_ollama_patch(
+    request: DesktopEnvPatchRequest,
+) -> Result<EnvAndOllamaPatchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
+        let kv_quant = match request.kv_quant.as_deref().map(str::trim) {
+            Some("f16") => KvCacheQuant::F16,
+            Some("q4_0") => KvCacheQuant::Q4_0,
+            _ => KvCacheQuant::Q8_0,
+        };
+        apply_windows_and_ollama_env_tweaks(
+            &model_path,
+            request.context_tokens.clamp(512, 262_144),
+            kv_quant,
+            None,
+            request.dry_run,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Windows/Ollama env patch task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +720,15 @@ mod tests {
         let reset: DesktopResetTuningRequest = serde_json::from_str(r#"{}"#).unwrap();
         assert!(reset.dry_run);
         assert_eq!(reset.pci_device_id, None);
+
+        let lms_patch: DesktopLmStudioPatchRequest =
+            serde_json::from_str(r#"{"profile_id":"vulkan_wddm_priority"}"#).unwrap();
+        assert!(lms_patch.dry_run);
+        assert_eq!(lms_patch.context_tokens, 4096);
+
+        let env_patch: DesktopEnvPatchRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(env_patch.dry_run);
+        assert_eq!(env_patch.context_tokens, 4096);
     }
 
     #[test]

@@ -1700,7 +1700,13 @@ export function renderLlmOptimizer(root, state, actions) {
         "div",
         { className: "kpi-tile" },
         el("div", { className: "kpi-label" }, "Architecture & Layers"),
-        el("div", { className: "kpi-value" }, `${m.architecture} (${m.block_count}L)`),
+        el(
+          "div",
+          { className: "kpi-value" },
+          m.is_moe
+            ? `${m.architecture} MoE (${m.block_count}L, ${m.expert_used_count ?? "?"}/${m.expert_count}E)`
+            : `${m.architecture} (${m.block_count}L)`
+        ),
         el(
           "div",
           { className: "kpi-sub" },
@@ -1753,7 +1759,9 @@ export function renderLlmOptimizer(root, state, actions) {
       el(
         "td",
         { className: "num mono" },
-        `${b.strict_zero_spill_ngl} / ${b.memory_priority_ngl} of ${m.block_count}`
+        b.recommended_n_cpu_moe > 0
+          ? `${b.strict_zero_spill_ngl} / ${b.memory_priority_ngl} of ${m.block_count} (-ncmoe ${b.recommended_n_cpu_moe})`
+          : `${b.strict_zero_spill_ngl} / ${b.memory_priority_ngl} of ${m.block_count}`
       )
     )
   );
@@ -1791,7 +1799,7 @@ export function renderLlmOptimizer(root, state, actions) {
     )
   );
 
-  // Recommended RDNA2 Profiles & One-Click Copy Commands
+  // Recommended RDNA2 Profiles & One-Click Copy / LM Studio Patcher Commands
   const profileCards = (plan.recommended_profiles || []).map((p) => {
     const envStr = (p.env_vars || []).map(([k, v]) => `${k}=${v}`).join(" | ") || "none";
     return el(
@@ -1802,15 +1810,38 @@ export function renderLlmOptimizer(root, state, actions) {
       },
       el(
         "div",
-        { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
+        { style: "display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap" },
         el("strong", { style: "color:#e6e8ec;font-size:12.5px" }, p.title),
         el(
           "div",
-          { style: "display:flex;gap:6px;align-items:center" },
+          { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
           el("span", { className: "badge badge-ok mono" }, `${p.backend.toUpperCase()} (${p.device_selector})`),
           el("span", { className: "badge badge-idle mono" }, `ngl=${p.n_gpu_layers}`),
+          p.n_cpu_moe > 0
+            ? el("span", { className: "badge badge-warn mono" }, `ncmoe=${p.n_cpu_moe}`)
+            : null,
           el("span", { className: "badge badge-idle mono" }, `fa=${p.flash_attn ? "on" : "off"}`),
           el("span", { className: "badge badge-idle mono" }, `kv=${p.cache_type_k}/${p.cache_type_v}`),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn",
+              disabled: state.patchingLlm,
+              onClick: () => actions.applyLmStudioPatch(p.id, true),
+            },
+            "Preview LM Studio Patch"
+          ),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn btn-primary",
+              disabled: state.patchingLlm || !form.unlockConfigWrites,
+              onClick: () => actions.applyLmStudioPatch(p.id, false),
+            },
+            "Apply to LM Studio"
+          ),
           el(
             "button",
             {
@@ -1841,6 +1872,162 @@ export function renderLlmOptimizer(root, state, actions) {
       `Verified AMD RDNA2 (${plan.gfx_target}) Tweaks & Launch Profiles`,
       `${plan.gpu_name}`,
       el("div", {}, profileCards)
+    )
+  );
+
+  // 1-Click LM Studio, Ollama & Windows Environment Patcher Panel
+  const patchPanelBody = el(
+    "div",
+    { style: "display:flex;flex-direction:column;gap:10px" },
+    el(
+      "div",
+      { className: "toolbar-group" },
+      el(
+        "label",
+        { className: "checkbox-label" },
+        el("input", {
+          type: "checkbox",
+          checked: Boolean(form.unlockConfigWrites),
+          onChange: (e) => actions.updateLlmField("unlockConfigWrites", e.target.checked, false),
+        }),
+        "Unlock Config & Registry Writes (creates .bak backups before modifying LM Studio JSONs)"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: state.patchingLlm,
+          onClick: () => actions.applyEnvPatch(true),
+        },
+        "Preview Windows & Ollama Env (Dry-Run)"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-primary",
+          disabled: state.patchingLlm || !form.unlockConfigWrites,
+          onClick: () => actions.applyEnvPatch(false),
+        },
+        "Apply Windows & Ollama Env (HKCU)"
+      )
+    )
+  );
+
+  if (state.llmPatchError) {
+    patchPanelBody.appendChild(el("div", { className: "banner banner-err mono" }, state.llmPatchError));
+  }
+
+  if (state.llmPatchResult) {
+    const pr = state.llmPatchResult;
+    if (pr.kind === "lmstudio") {
+      const d = pr.data;
+      patchPanelBody.appendChild(
+        el(
+          "div",
+          {
+            className: `banner ${d.applied ? "banner-ok" : "banner-warn"} mono`,
+            style: "margin-bottom:0",
+          },
+          `[${d.applied ? "APPLIED" : "DRY-RUN PREVIEW"}] Profile: ${d.profile_id} (${d.profile_title}) | Runtime: ${d.selected_runtime}`
+        )
+      );
+      patchPanelBody.appendChild(
+        makeKvTable([
+          ["Model Config Path", d.model_config_path],
+          ["Model Backup (.bak)", d.model_backup_path || "(none — new file or dry-run)"],
+          ["Backend Preferences Path", d.backend_prefs_path],
+          ["Backend Backup (.bak)", d.backend_backup_path || "(none)"],
+        ])
+      );
+      patchPanelBody.appendChild(
+        el(
+          "pre",
+          {
+            className: "mono",
+            style:
+              "margin:0;padding:8px 10px;background:#111214;border:1px solid #24272d;font-size:11px;max-height:220px;overflow:auto;color:#cfd4dc",
+          },
+          d.model_config_json
+        )
+      );
+    } else if (pr.kind === "env") {
+      const d = pr.data;
+      patchPanelBody.appendChild(
+        el(
+          "div",
+          {
+            className: `banner ${d.applied ? "banner-ok" : "banner-warn"} mono`,
+            style: "margin-bottom:0",
+          },
+          `[${d.applied ? "APPLIED TO HKCU\\Environment" : "DRY-RUN PREVIEW"}] ${d.note}`
+        )
+      );
+      const envRows = (d.env_changes || []).map((c) =>
+        el(
+          "tr",
+          {},
+          el("td", { className: "mono" }, c.name),
+          el("td", { className: "mono muted-text" }, c.previous_value || "(unset)"),
+          el("td", { className: "mono" }, c.new_value),
+          el("td", { className: "muted-text" }, c.purpose)
+        )
+      );
+      patchPanelBody.appendChild(
+        el(
+          "table",
+          { className: "data-table" },
+          el(
+            "thead",
+            {},
+            el(
+              "tr",
+              {},
+              el("th", {}, "Variable (HKCU\\Environment)"),
+              el("th", {}, "Previous"),
+              el("th", {}, "Target"),
+              el("th", {}, "RDNA2 Purpose")
+            )
+          ),
+          el("tbody", {}, envRows)
+        )
+      );
+      patchPanelBody.appendChild(
+        el(
+          "div",
+          { style: "display:flex;justify-content:space-between;align-items:center" },
+          el("span", { className: "mono muted-text", style: "font-size:11.5px" }, "Generated Ollama Modelfile:"),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn",
+              onClick: () => actions.copyLlmCommand(d.ollama_modelfile),
+            },
+            "Copy Ollama Modelfile"
+          )
+        )
+      );
+      patchPanelBody.appendChild(
+        el(
+          "pre",
+          {
+            className: "mono",
+            style:
+              "margin:0;padding:8px 10px;background:#111214;border:1px solid #24272d;font-size:11px;max-height:180px;overflow:auto;color:#cfd4dc",
+          },
+          d.ollama_modelfile
+        )
+      );
+    }
+  }
+
+  root.appendChild(
+    makePanel(
+      "1-Click LM Studio, Ollama & Windows Environment Auto-Patcher",
+      "Dry-Run by default; automatically creates .bak backups and preserves custom Prompt Templates",
+      patchPanelBody
     )
   );
 

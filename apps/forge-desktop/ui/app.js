@@ -94,6 +94,7 @@ const state = {
     vulkan_bin: "",
     hip_bin: "",
     context_depth: 2048,
+    unlockConfigWrites: false,
   },
   loadingLlmPlan: false,
   llmPlan: null,
@@ -101,6 +102,9 @@ const state = {
   runningLlmAutotune: false,
   llmAutotuneReport: null,
   llmAutotuneError: null,
+  patchingLlm: false,
+  llmPatchResult: null,
+  llmPatchError: null,
 };
 
 function invokeCommand(cmd, args) {
@@ -633,10 +637,14 @@ const actions = {
     state.llmForm[key] = value;
     if (autoRefresh) {
       refreshLlmPlan();
+    } else if (key === "unlockConfigWrites") {
+      renderActiveView();
     }
   },
   refreshLlmPlan,
   runLlmAutotune,
+  applyLmStudioPatch,
+  applyEnvPatch,
   copyLlmCommand: (cmdText) => {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
       navigator.clipboard.writeText(cmdText).then(
@@ -719,6 +727,75 @@ async function runLlmAutotune() {
   } finally {
     state.runningLlmAutotune = false;
     state.busyOp = false;
+    renderActiveView();
+  }
+}
+
+async function applyLmStudioPatch(profileId, dryRun) {
+  if (state.patchingLlm) return;
+  state.patchingLlm = true;
+  state.llmPatchError = null;
+  setStatusNote(
+    dryRun
+      ? `Generating LM Studio config dry-run preview for profile '${profileId}'...`
+      : `Writing LM Studio config & backup for profile '${profileId}'...`
+  );
+  renderActiveView();
+
+  try {
+    const res = await invokeCommand("apply_lm_studio_patch", {
+      request: {
+        model_path: state.llmForm.model_path || null,
+        profile_id: profileId || null,
+        context_tokens: Number(state.llmForm.context_tokens) || 4096,
+        safety_margin_mib: Number(state.llmForm.safety_margin_mib) || 512,
+        dry_run: Boolean(dryRun),
+      },
+    });
+    state.llmPatchResult = { kind: "lmstudio", data: res };
+    setStatusNote(
+      res.applied
+        ? `Applied LM Studio config (${res.profile_id}). Backup created if prior file existed.`
+        : `LM Studio config dry-run preview ready (${res.profile_id}).`
+    );
+  } catch (err) {
+    state.llmPatchError = String(err);
+  } finally {
+    state.patchingLlm = false;
+    renderActiveView();
+  }
+}
+
+async function applyEnvPatch(dryRun) {
+  if (state.patchingLlm) return;
+  state.patchingLlm = true;
+  state.llmPatchError = null;
+  setStatusNote(
+    dryRun
+      ? "Previewing Windows HKCU environment variables & Ollama Modelfile (dry-run)..."
+      : "Applying Windows HKCU environment variables & generating Ollama Modelfile..."
+  );
+  renderActiveView();
+
+  try {
+    const res = await invokeCommand("apply_env_and_ollama_patch", {
+      request: {
+        model_path: state.llmForm.model_path || null,
+        context_tokens: Number(state.llmForm.context_tokens) || 4096,
+        kv_quant: "q8_0",
+        dry_run: Boolean(dryRun),
+      },
+    });
+    state.llmPatchResult = { kind: "env", data: res };
+    setStatusNote(
+      res.applied
+        ? "Applied HKCU\\Environment variables for llama.cpp / LM Studio / Ollama."
+        : "Windows & Ollama environment dry-run preview ready."
+    );
+  } catch (err) {
+    state.llmPatchError = String(err);
+  } finally {
+    state.patchingLlm = false;
     renderActiveView();
   }
 }
