@@ -569,7 +569,18 @@ fn print_tuning_report(r: &GpuTuningReport) {
                 .iter()
                 .map(|p| format!("{}C->{}%", p.temp_c, p.speed_pct))
                 .collect();
-            println!("  Fan Curve: {}", pts.join(", "));
+            println!("  Fan Curve (Active ADLX): {}", pts.join(", "));
+        }
+        if !fan.default_fan_curve.is_empty() {
+            let dpts: Vec<String> = fan
+                .default_fan_curve
+                .iter()
+                .map(|p| format!("{}C->{}%", p.temp_c, p.speed_pct))
+                .collect();
+            println!("  Fan Curve (Factory VBIOS): {}", dpts.join(", "));
+        }
+        if let Some(ref note) = fan.fan_note {
+            println!("  Fan Diagnostic: {note}");
         }
     }
 }

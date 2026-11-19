@@ -189,6 +189,14 @@ pub struct FanTuningInfo {
     pub target_fan_speed_range: Option<IntRange>,
     pub target_fan_speed_default_pct: Option<i32>,
     pub fan_curve: Vec<FanCurvePoint>,
+    #[serde(default)]
+    pub default_fan_curve: Vec<FanCurvePoint>,
+    #[serde(default)]
+    pub flat_pwm_override_pct: Option<i32>,
+    #[serde(default)]
+    pub external_controller: Option<String>,
+    #[serde(default)]
+    pub fan_note: Option<String>,
 }
 
 /// Complete read-only ADLX tuning inspection report for a single AMD GPU.

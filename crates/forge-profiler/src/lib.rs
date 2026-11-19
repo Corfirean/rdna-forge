@@ -245,6 +245,13 @@ mod tests {
                     temp_c: 50,
                     speed_pct: 20,
                 }],
+                default_fan_curve: vec![FanCurvePoint {
+                    temp_c: 50,
+                    speed_pct: 35,
+                }],
+                flat_pwm_override_pct: None,
+                external_controller: None,
+                fan_note: None,
             }),
         };
 

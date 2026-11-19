@@ -176,7 +176,8 @@ struct IAdlxManualFanTuning1Vtbl {
     get_target_fan_speed_range: unsafe extern "system" fn(*mut c_void, *mut AdlxIntRange) -> i32, // [20]
     get_target_fan_speed: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32, // [21]
     _set_target_fan_speed: *const c_void,                                          // [22]
-    _get_default_fan_tuning_states: *const c_void,                                 // [23]
+    get_default_fan_tuning_states:
+        unsafe extern "system" fn(*mut c_void, *mut *mut IAdlxInterface) -> i32, // [23]
     get_min_acoustic_limit_default: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32, // [24]
     get_min_fan_speed_default: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32, // [25]
     get_target_fan_speed_default: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32, // [26]
@@ -570,30 +571,41 @@ fn read_fan_info(
         )
     };
 
-    let mut fan_curve = Vec::new();
-    let mut state_list_ptr: *mut IAdlxInterface = ptr::null_mut();
-    if unsafe { (fvt.get_fan_tuning_states)(obj.as_raw().cast(), &mut state_list_ptr) } == ADLX_OK {
-        if let Some(list) = OwnedInterface::from_raw(state_list_ptr) {
-            let lvt = unsafe { vtbl::<IAdlxManualFanTuningStateListVtbl>(&list) };
-            let count = unsafe { (lvt.size)(list.as_raw().cast()) };
-            for idx in 0..count {
-                let mut state_ptr: *mut IAdlxInterface = ptr::null_mut();
-                if unsafe { (lvt.at_list)(list.as_raw().cast(), idx, &mut state_ptr) } == ADLX_OK {
-                    if let Some(state) = OwnedInterface::from_raw(state_ptr) {
-                        let svt = unsafe { vtbl::<IAdlxManualFanTuningStateVtbl>(&state) };
-                        if let (Some(temp_c), Some(speed_pct)) = unsafe {
-                            (
-                                read_i32(&state, svt.get_temperature),
-                                read_i32(&state, svt.get_fan_speed),
-                            )
-                        } {
-                            fan_curve.push(FanCurvePoint { temp_c, speed_pct });
-                        }
-                    }
-                }
-            }
+    let fan_curve = read_fan_state_list(&obj, fvt.get_fan_tuning_states);
+    let default_fan_curve = if is_v1 {
+        read_fan_state_list(&obj, fvt.get_default_fan_tuning_states)
+    } else {
+        Vec::new()
+    };
+
+    let flat_pwm_override_pct = if fan_curve.len() >= 2 {
+        let first_spd = fan_curve[0].speed_pct;
+        fan_curve
+            .iter()
+            .all(|p| p.speed_pct == first_spd)
+            .then_some(first_spd)
+    } else {
+        None
+    };
+
+    let external_controller = detect_external_fan_controller();
+    let fan_note = match (flat_pwm_override_pct, external_controller.as_deref()) {
+        (Some(pct), Some(ctrl)) => {
+            let min_hw = speed_range_pct.map(|r| r.min).unwrap_or(20);
+            Some(format!(
+                "External fan manager ({ctrl}) is actively overriding ADLX by setting all {} curve points to a flat {pct}% instant PWM target (on RDNA2, ADLX has no single-value PWM setter and clamps values below {min_hw}% to the {min_hw}% hardware floor when Zero-RPM is off).",
+                fan_curve.len()
+            ))
         }
-    }
+        (Some(pct), None) => Some(format!(
+            "All {} ADLX curve points are set to a constant {pct}% (fixed/flat PWM override mode).",
+            fan_curve.len()
+        )),
+        (None, Some(ctrl)) => Some(format!(
+            "External fan manager ({ctrl}) detected running in background."
+        )),
+        (None, None) => None,
+    };
 
     Some(FanTuningInfo {
         speed_range_pct,
@@ -611,7 +623,109 @@ fn read_fan_info(
         target_fan_speed_range,
         target_fan_speed_default_pct,
         fan_curve,
+        default_fan_curve,
+        flat_pwm_override_pct,
+        external_controller,
+        fan_note,
     })
+}
+
+fn read_fan_state_list(
+    obj: &OwnedInterface,
+    getter: unsafe extern "system" fn(*mut c_void, *mut *mut IAdlxInterface) -> i32,
+) -> Vec<FanCurvePoint> {
+    let mut curve = Vec::new();
+    let mut state_list_ptr: *mut IAdlxInterface = ptr::null_mut();
+    if unsafe { getter(obj.as_raw().cast(), &mut state_list_ptr) } == ADLX_OK {
+        if let Some(list) = OwnedInterface::from_raw(state_list_ptr) {
+            let lvt = unsafe { vtbl::<IAdlxManualFanTuningStateListVtbl>(&list) };
+            let count = unsafe { (lvt.size)(list.as_raw().cast()) };
+            for idx in 0..count {
+                let mut state_ptr: *mut IAdlxInterface = ptr::null_mut();
+                if unsafe { (lvt.at_list)(list.as_raw().cast(), idx, &mut state_ptr) } == ADLX_OK {
+                    if let Some(state) = OwnedInterface::from_raw(state_ptr) {
+                        let svt = unsafe { vtbl::<IAdlxManualFanTuningStateVtbl>(&state) };
+                        if let (Some(temp_c), Some(speed_pct)) = unsafe {
+                            (
+                                read_i32(&state, svt.get_temperature),
+                                read_i32(&state, svt.get_fan_speed),
+                            )
+                        } {
+                            curve.push(FanCurvePoint { temp_c, speed_pct });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    curve
+}
+
+fn detect_external_fan_controller() -> Option<String> {
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
+        fn Process32FirstW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(h_snapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(h_object: isize) -> i32;
+    }
+
+    const KNOWN_CONTROLLERS: &[(&str, &str)] = &[
+        ("fancontrol.exe", "FanControl.exe"),
+        ("msiafterburner.exe", "MSIAfterburner.exe"),
+        ("argusmonitor.exe", "ArgusMonitor.exe"),
+        ("hydra.exe", "Hydra.exe"),
+    ];
+
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap == 0 {
+            return None;
+        }
+        let mut entry: ProcessEntry32W = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+
+        let mut found = None;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .sz_exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..len]);
+                let lower = name.to_ascii_lowercase();
+                for &(needle, display) in KNOWN_CONTROLLERS {
+                    if lower == needle {
+                        found = Some(display.to_string());
+                        break;
+                    }
+                }
+                if found.is_some() || Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        found
+    }
 }
 
 impl AdlxSession {
