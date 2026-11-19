@@ -208,24 +208,56 @@ Verified live on RX 6900 XT (VCN 3.0, Windows 11 Build `26300`, Adrenalin `26.11
 
 ---
 
-## 9. Reproduction Commands
+## 9. Milestone 4B — RX 6900 XT Vulkan Compute Practice (GGUF `Q4_K` GEMV & Causal FlashAttention)
+
+Pure-Rust `naga` WGSL -> SPIR-V 1.3 Wave32 shaders targeting RDNA2 (`gfx1030`, Windows 11 `26300`, Adrenalin `26.11.2`):
+
+### 9.1 GGUF `Q4_K` Super-Block Wave32 GEMV (`warmup = 10`, `iters = 50`, `--stability-runs 0`)
+
+Implements upstream `llama.cpp` `block_q4_K` (`256` weights / `144` bytes per super-block = **`7.11x`** compression vs FP32: `f16` `(d, dmin)`, 12-byte packed 6-bit sub-block scales & mins, 128-byte 4-bit nibbles) with zero LDS and a single `subgroupAdd`:
+
+| Kernel | Shape | Mode | Median (ms) | Min / P95 / Max (ms) | IQR / MAD (ms) | Throughput | Max Abs Err | RMSE | Accuracy |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `gemv_q4_k_wave32_4096x4096` | `4096x4096` | `batch=1` | 0.2001 | 0.0469 / 0.2017 / 0.2034 | 0.1500 / 0.0008 | 47.33 GB/s (`167.71 GFLOP/s`) | 1.526e-4 | 3.621e-5 | Pass |
+| `gemv_q4_k_wave32_4096x4096` | `4096x4096` | **`batch=16`** | **0.0491** (**4.08x**) | 0.0442 / 0.0500 / 0.0502 | **0.0006** / 0.0003 | **192.73 GB/s** (`682.90 GFLOP/s`) | 1.526e-4 | 3.621e-5 | Pass |
+| `gemv_q4_k_wave32_11008x4096` | `11008x4096` | `batch=1` | 0.2268 | 0.1016 / 0.4707 / 0.4718 | 0.3377 / 0.1188 | 112.10 GB/s (`397.64 GFLOP/s`) | 1.602e-4 | 3.595e-5 | Pass |
+| `gemv_q4_k_wave32_11008x4096` | `11008x4096` | **`batch=16`** | **0.1063** (**2.13x**) | 0.1051 / 0.1072 / 0.1078 | **0.0006** / 0.0003 | **239.14 GB/s** (`848.27 GFLOP/s`) | 1.602e-4 | 3.595e-5 | Pass |
+
+- **Tradeoff vs `Q4_0` & batching stability**: `Q4_K` achieves higher weight compression (`7.11x` vs `Q4_0`'s `6.40x`) and sub-block dynamic range via asymmetric 6-bit `(scale, min)` unpacking, at higher per-super-block ALU density than `Q4_0` (`0.1063 ms` / `239.14 GB/s` vs `Q4_0`'s `0.0644 ms` / `438.74 GB/s` at `11008x4096`, `batch=16`). Batching `batch=16` collapses `11008x4096` IQR from `0.3377 ms` to **`0.0006 ms`** (`CV = 0.51%`).
+
+### 9.2 Tiled Wave32 Causal FlashAttention (`warmup = 5`, `iters = 20`, `--stability-runs 0`, `batch = 1`)
+
+Streams `BC = 16` key/value tiles through **`16 KiB` LDS** (`head_dim <= 128`), keeping score accumulators in registers with workgroup-uniform upper-triangle tile skipping and online softmax:
+
+| Kernel | Shape (`H x S x D`) | Dtype | Median (ms) | Min / P95 / Max (ms) | IQR / MAD (ms) | CV | Throughput | Score HBM Saved | Max Abs Err | RMSE | Accuracy |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `flash_attn_f32_wave32_16x1024x64` | `16x1024x64` (causal) | `f32` | **2.3772** | 2.3673 / 2.3873 / 2.3884 | 0.0074 / 0.0037 | 0.23% | **904.26 GFLOP/s** | **64.0 MiB** | 1.267e-7 | 1.579e-8 | Pass |
+| `flash_attn_f32_wave32_8x1024x128` | `8x1024x128` (causal) | `f32` | **1.9096** | 1.8986 / 1.9243 / 1.9399 | 0.0105 / 0.0051 | 0.49% | **1125.66 GFLOP/s** | **32.0 MiB** | 1.416e-7 | 1.445e-8 | Pass |
+
+- **Comparison context vs Milestone 1 Triton Attention**: Milestone 1's Triton FP16 non-causal `1x16x1024x64` kernel reached `0.657 ms` (`6.54 TFLOP/s`) using `triton-windows` in FP16; this standalone Vulkan kernel executes full **FP32** causal online softmax (`1.27e-7` / `1.42e-7` error vs FP64 CPU reference) in pure Rust + Adrenalin Vulkan with zero Python/ROCm runtime dependencies and zero `S x S` score matrix allocation.
+
+---
+
+## 10. Reproduction Commands
 
 ```powershell
-# 1. Build release CLI
-cargo build --release -p forge-cli
+# 1. Build release CLI and optional desktop GUI
+cargo build --release -p forge-cli -p forge-desktop
 
-# 2. Diagnostics + live ADLX telemetry + AMF video probe + Vulkan/HIP verification
+# 2. Diagnostics + live ADLX telemetry + AMF video probe + Vulkan/HIP verification (12 capabilities)
 .\target\release\forge.exe doctor --verify --python <venv>\Scripts\python.exe
 .\target\release\forge.exe video caps
 
-# 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + Wave32 decode kernels + stability)
-# Note: decode/elementwise kernels default to --batch-dispatches 16 (override with 1..=256); heavy GEMM stays at 1.
+# 3. Vulkan compute benchmark (baseline + tiled vec4 + INT8 DP4A OpSDot + Wave32 decode + FlashAttention + stability)
+# Note: decode/elementwise kernels default to --batch-dispatches 16 (override with 1..=256); heavy GEMM & FlashAttention stay at 1.
 .\target\release\forge.exe bench vulkan --kernel all --warmup 5 --iters 20 --stability-runs 30 --output ..\vulkan_bench.json
 
-# 3b. Batched Milestone 3C decode & elementwise benchmarks (default batch=16; pass --batch-dispatches 1 for single-dispatch baseline)
+# 3b. Batched Milestone 3C / 4B decode, elementwise & FlashAttention benchmarks
 .\target\release\forge.exe bench vulkan --kernel gemv-w8 --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_w8.json
 .\target\release\forge.exe bench vulkan --kernel gemv-q4 --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_q4.json
+.\target\release\forge.exe bench vulkan --kernel gemv-q4-k --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\gemv_q4_k.json
 .\target\release\forge.exe bench vulkan --kernel fused-rms-rope --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\fused_rms_rope.json
+.\target\release\forge.exe bench vulkan --kernel flash-attn --warmup 5 --iters 20 --stability-runs 0 --output ..\flash_attn.json
 .\target\release\forge.exe bench vulkan --kernel rmsnorm --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\rmsnorm.json
 .\target\release\forge.exe bench vulkan --kernel rope --batch-dispatches 16 --warmup 10 --iters 50 --stability-runs 0 --output ..\rope.json
 

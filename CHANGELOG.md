@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 4B (RX 6900 XT Vulkan Compute Practice: GGUF `Q4_K` GEMV & Causal FlashAttention)
+- Implemented two new RDNA2 Wave32 Vulkan 1.3 WGSL->SPIR-V 1.3 compute kernels in `forge-runtime`:
+  - `gemv_q4_k_wave32.wgsl`: zero-LDS, zero-barrier GGUF `Q4_K` super-block-256 (`144 B` / `7.11x` compression vs FP32) GEMV with IEEE-754 half `(d, dmin)` unpacking and 6-bit sub-block `(scale, min)` decoding, achieving **`192.73 GB/s`** (`0.0491 ms`) at `4096x4096` (**4.08x** vs `batch=1`) and **`239.14 GB/s`** (`0.1063 ms`, `IQR=0.0006 ms`, `CV=0.51%`, `max_abs=1.60e-4`) at `11008x4096` with `batch=16`.
+  - `flash_attention_f32_wave32.wgsl`: `16 KiB` LDS tiled (`BC = 16`, `head_dim <= 128`) online-softmax FlashAttention with workgroup-uniform upper-triangle causal skipping, achieving **`904.26 GFLOP/s`** (`2.3772 ms`, `max_abs=1.27e-7`) at `16x1024x64` and **`1125.66 GFLOP/s`** (`1.9096 ms`, `max_abs=1.42e-7`) at `8x1024x128` while saving `32–64 MiB` of naive `S^2` score HBM traffic.
+- Added pure-Rust `f16_bits_to_f32`, `f32_to_f16_bits`, `pack_q4_k_block`, `unpack_q4_k_scale_min`, `deterministic_q4_k_weights`, `ref_gemv_q4_k_f32`, and `ref_flash_attention_f32` CPU references in `crates/forge-runtime/src/reference.rs`, plus `.emit_to_string(source)` WGSL validation error reporting in `shaders.rs`.
+- Integrated `--kernel gemv-q4-k` and `--kernel flash-attn` across `forge doctor --verify` (12/12 capabilities verified), `forge-benchmark`, `forge-cli`, and `Forge Desktop`, with offline unit/integration tests and live RX 6900 XT edge-case/tail-length GPU tests (`40/40` offline, `17/17` live GPU passing).
+
 ### Added — Milestone 4A (Forge Desktop — Tauri v2 Windows UI)
 - Added `apps/forge-desktop` (Tauri v2 + Edge WebView2, zero `node_modules` build dependencies) providing an engineering-focused desktop UI over the shared Rust crates:
   - **Overview**: Hardware adapter specifications, detected compute/video/telemetry backends, live HIP+Vulkan verification trigger (`Verify Live`), and JSON export.
