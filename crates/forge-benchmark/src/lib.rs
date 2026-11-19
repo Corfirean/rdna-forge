@@ -18,6 +18,28 @@ pub use vulkan_suite::{
     run_vulkan_suite, VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
 };
 
+pub(crate) fn run_with_pre_post_telemetry<R>(
+    pci_device_id: Option<u32>,
+    f: impl FnOnce() -> R,
+) -> (R, Option<forge_profiler::TelemetrySummary>) {
+    let pre = forge_profiler::snapshot_for_device(pci_device_id)
+        .ok()
+        .flatten();
+    let res = f();
+    let post = forge_profiler::snapshot_for_device(pci_device_id)
+        .ok()
+        .flatten();
+    let mut samples = Vec::with_capacity(2);
+    if let Some(ref s) = pre {
+        samples.push(s.clone());
+    }
+    if let Some(s) = post {
+        samples.push(s);
+    }
+    let summary = forge_profiler::summarize_samples(&samples, 0, pre.as_ref());
+    (res, summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

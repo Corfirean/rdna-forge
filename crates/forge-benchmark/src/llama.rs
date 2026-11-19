@@ -7,6 +7,7 @@ use forge_profiler::{TelemetryGuard, TelemetrySummary};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::peak_process_rss_bytes;
+use crate::run_with_pre_post_telemetry;
 use crate::stats::{compute_latency_stats, LatencyStats};
 
 /// Parameters controlling an apples-to-apples `llama-bench` comparison across backends.
@@ -306,9 +307,16 @@ fn execute_single_backend(
         cmd.env("GGML_CUDA_DISABLE_GRAPHS", "1");
     }
 
-    let guard = TelemetryGuard::start(telemetry_device_id, std::time::Duration::from_millis(100));
-    let output_res = cmd.output();
-    let telemetry = guard.and_then(|g| g.stop_and_summarize());
+    // Poll ADLX only around native Vulkan runs; use pre/post snapshots for ROCm/HIP.
+    let (output_res, telemetry) = if label == "hip" {
+        run_with_pre_post_telemetry(telemetry_device_id, || cmd.output())
+    } else {
+        let guard =
+            TelemetryGuard::start(telemetry_device_id, std::time::Duration::from_millis(250));
+        let res = cmd.output();
+        let tel = guard.and_then(|g| g.stop_and_summarize());
+        (res, tel)
+    };
 
     match output_res {
         Ok(out) if out.status.success() => {

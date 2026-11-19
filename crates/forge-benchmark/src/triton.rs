@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use forge_core::{ForgeError, ForgeResult};
 use forge_device::discover_gpus;
-use forge_profiler::{TelemetryGuard, TelemetrySummary};
+use forge_profiler::TelemetrySummary;
 use serde::{Deserialize, Serialize};
+
+use crate::run_with_pre_post_telemetry;
 
 use crate::stats::LatencyStats;
 
@@ -97,20 +98,20 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
     }
 
     let primary_device_id = discover_gpus().first().map(|g| g.device_id);
-    let guard = TelemetryGuard::start(primary_device_id, Duration::from_millis(100));
-
-    let output = Command::new(&config.python_exe)
-        .arg(&config.script_path)
-        .arg("--warmup")
-        .arg(config.warmup_iters.to_string())
-        .arg("--iters")
-        .arg(config.measured_iters.to_string())
-        .output()
-        .map_err(|e| ForgeError::RuntimeUnavailable {
-            runtime: "Python/Triton".to_string(),
-            reason: format!("failed to launch '{}': {e}", config.python_exe.display()),
-        })?;
-    let telemetry = guard.and_then(|g| g.stop_and_summarize());
+    // Avoid polling ADLX in a background thread concurrently with ROCm/HIP JIT & execution.
+    let (output_res, telemetry) = run_with_pre_post_telemetry(primary_device_id, || {
+        Command::new(&config.python_exe)
+            .arg(&config.script_path)
+            .arg("--warmup")
+            .arg(config.warmup_iters.to_string())
+            .arg("--iters")
+            .arg(config.measured_iters.to_string())
+            .output()
+    });
+    let output = output_res.map_err(|e| ForgeError::RuntimeUnavailable {
+        runtime: "Python/Triton".to_string(),
+        reason: format!("failed to launch '{}': {e}", config.python_exe.display()),
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

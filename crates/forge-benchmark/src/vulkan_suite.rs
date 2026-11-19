@@ -72,7 +72,7 @@ pub fn run_vulkan_suite(config: &VulkanBenchConfig) -> ForgeResult<VulkanBenchRe
     let system = discover_system();
     let engine = VulkanComputeEngine::new(config.device_index)?;
     let device = engine.device_info().clone();
-    let guard = TelemetryGuard::start(Some(device.device_id), Duration::from_millis(100));
+    let guard = TelemetryGuard::start(Some(device.device_id), Duration::from_millis(250));
     let mut benchmarks = Vec::new();
 
     let gemm_sizes: Vec<u32> = match config.size_override {
