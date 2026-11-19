@@ -12,16 +12,19 @@ import os
 import platform
 import statistics
 import sys
+import time
 from typing import Any, Callable
 
 
 def peak_rss_bytes() -> int | None:
     if os.name == "nt":
         try:
+            from ctypes import wintypes
+
             class ProcessMemoryCounters(ctypes.Structure):
                 _fields_ = [
-                    ("cb", ctypes.c_uint32),
-                    ("PageFaultCount", ctypes.c_uint32),
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
                     ("PeakWorkingSetSize", ctypes.c_size_t),
                     ("WorkingSetSize", ctypes.c_size_t),
                     ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
@@ -32,12 +35,18 @@ def peak_rss_bytes() -> int | None:
                     ("PeakPagefileUsage", ctypes.c_size_t),
                 ]
 
-            psapi = ctypes.WinDLL("psapi.dll")
             kernel32 = ctypes.WinDLL("kernel32.dll")
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.K32GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ProcessMemoryCounters),
+                wintypes.DWORD,
+            ]
+            kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
             counters = ProcessMemoryCounters()
             counters.cb = ctypes.sizeof(ProcessMemoryCounters)
             handle = kernel32.GetCurrentProcess()
-            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            if kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
                 return int(counters.PeakWorkingSetSize)
         except Exception:
             return None
@@ -115,7 +124,7 @@ def bench_gpu_fn(
     fn: Callable[[], Any],
     warmup_iters: int,
     measured_iters: int,
-) -> tuple[Any, dict[str, Any], int, int]:
+) -> tuple[Any, dict[str, Any], int, int, int]:
     import torch
 
     torch.cuda.synchronize()
@@ -127,19 +136,28 @@ def bench_gpu_fn(
     torch.cuda.synchronize()
 
     samples_ms: list[float] = []
+    negative_events = 0
     for _ in range(measured_iters):
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         start_ev.record()
         out = fn()
         end_ev.record()
-        torch.cuda.synchronize()
-        samples_ms.append(float(start_ev.elapsed_time(end_ev)))
+        end_ev.synchronize()
+        t1 = time.perf_counter()
+        ev_ms = float(start_ev.elapsed_time(end_ev))
+        if ev_ms >= 0.0:
+            samples_ms.append(ev_ms)
+        else:
+            negative_events += 1
+            samples_ms.append((t1 - t0) * 1000.0)
 
     peak_alloc = int(torch.cuda.max_memory_allocated())
     peak_res = int(torch.cuda.max_memory_reserved())
     stats = compute_latency_stats(warmup_iters, samples_ms)
-    return out, stats, peak_alloc, peak_res
+    return out, stats, peak_alloc, peak_res, negative_events
 
 
 def collect_provenance() -> dict[str, Any]:
@@ -223,7 +241,12 @@ def run_all_benchmarks(warmup_iters: int, measured_iters: int, stability_iters: 
         # fn() returns (gpu_fn, ref_tensor, flops_or_bytes, throughput_unit, abs_tol, rel_tol, note)
         try:
             gpu_fn, ref_t, work_units, unit, abs_tol, rel_tol, note = fn()
-            out_t, lat, peak_alloc, peak_res = bench_gpu_fn(gpu_fn, warmup_iters, measured_iters)
+            out_t, lat, peak_alloc, peak_res, neg_evs = bench_gpu_fn(
+                gpu_fn, warmup_iters, measured_iters
+            )
+            if neg_evs > 0:
+                extra = f"{neg_evs} negative hipEventElapsedTime readings replaced with perf_counter"
+                note = f"{note}; {extra}" if note else extra
             acc = check_accuracy(out_t, ref_t, abs_tol, rel_tol)
             med_s = lat["median_ms"] / 1000.0
             tp = (work_units / med_s) if med_s > 0.0 else 0.0
@@ -800,7 +823,9 @@ def run_all_benchmarks(warmup_iters: int, measured_iters: int, stability_iters: 
     # 6. Stability loop (100 consecutive iterations)
     if triton_gemm_fn_for_stability is not None and triton_ref_for_stability is not None:
         try:
-            out_s, lat_s, _, _ = bench_gpu_fn(triton_gemm_fn_for_stability, 5, stability_iters)
+            out_s, lat_s, _, _, _ = bench_gpu_fn(
+                triton_gemm_fn_for_stability, 5, stability_iters
+            )
             acc_s = check_accuracy(out_s, triton_ref_for_stability, 1e-1, 2e-2)
             stability_report = {
                 "workload": "triton_gemm_f16_512x512x512",
@@ -826,7 +851,9 @@ def run_all_benchmarks(warmup_iters: int, measured_iters: int, stability_iters: 
             sa = torch.randn((512, 512), device=device, dtype=torch.float16)
             sb = torch.randn((512, 512), device=device, dtype=torch.float16)
             sref = sa.to("cpu", torch.float64) @ sb.to("cpu", torch.float64)
-            out_s, lat_s, _, _ = bench_gpu_fn(lambda: torch.matmul(sa, sb), 5, stability_iters)
+            out_s, lat_s, _, _, _ = bench_gpu_fn(
+                lambda: torch.matmul(sa, sb), 5, stability_iters
+            )
             acc_s = check_accuracy(out_s, sref, 1e-1, 2e-2)
             stability_report = {
                 "workload": "pytorch_gemm_f16_512x512x512",
