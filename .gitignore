@@ -1,0 +1,68 @@
+# Rust / Cargo build outputs
+/target/
+**/target/
+**/*.rs.bk
+
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and crash / GPU diagnostic dumps
+*.log
+*.dmp
+*.mdmp
+*.stackdump
+crash_dumps/
+gpu_dumps/
+
+# IDE and editor metadata
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local environment & secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Temporary benchmark outputs, raw datasets, and model artifacts
+bench-results/
+*.bench.json
+*.raw.json
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Native compiled binaries and archives
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.zip
+*.tar.gz
+*.7z
+
+# Local scratch and temporary directories
+scratch/
+tmp/
+temp/

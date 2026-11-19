@@ -1,0 +1,23 @@
+* text=auto eol=lf
+
+# Rust, TOML, Markdown, Python, Shaders, Configs, CI
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.wgsl text eol=lf
+*.glsl text eol=lf
+*.comp text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.editorconfig text eol=lf
+LICENSE text eol=lf
+
+# Windows batch and PowerShell scripts
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
