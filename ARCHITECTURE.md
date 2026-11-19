@@ -9,12 +9,13 @@ RDNA Forge uses a modular Rust workspace for device discovery, runtime probing, 
 ```text
 rdna-forge/
 ├── apps/
-│   └── forge-cli/        # `forge` CLI binary (doctor, bench, monitor, tune, profile)
+│   ├── forge-cli/        # `forge` CLI binary (doctor, video, bench, monitor, tune, profile)
+│   └── forge-desktop/    # Optional Tauri v2 + WebView2 desktop GUI (embedded vanilla ES UI)
 ├── crates/
 │   ├── forge-core/       # Domain types, gfx target parser, profile schema, capability policy
 │   ├── forge-device/     # Windows OS, Registry, Vulkan, HIP ABI, and ADLX discovery
 │   ├── forge-profiler/   # Dynamic ADLX COM telemetry sampler & WDDM VRAM pressure checks
-│   ├── forge-runtime/    # Backend probing, naga WGSL->SPIR-V (1.3/1.6), RAII Vulkan compute, HIP transfer check
+│   ├── forge-runtime/    # Backend probing, AMF COM probe, naga WGSL->SPIR-V, RAII Vulkan, live verification
 │   └── forge-benchmark/  # Statistical harness, RSS memory tracking, ADLX/Vulkan/Triton/llama-bench runners
 ├── modules/
 │   └── ai/triton/        # Reproducible PyTorch ROCm + Triton kernel suite (bench_suite.py)
@@ -25,7 +26,7 @@ rdna-forge/
     └── gpu/              # Ignored live-GPU correctness and stability tests
 ```
 
-Crate dependency flow (`forge-cli` -> `forge-benchmark` -> {`forge-runtime`, `forge-profiler`} -> `forge-device` -> `forge-core`). No circular dependencies exist.
+Crate dependency flow (`forge-cli`, `forge-desktop` -> `forge-benchmark` -> {`forge-runtime`, `forge-profiler`} -> `forge-device` -> `forge-core`). No circular dependencies exist.
 
 ---
 
@@ -55,6 +56,7 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 - **`shaders`**: Embeds WGSL compute kernels (`gemm_f32.wgsl`, `gemm_f32_tiled_vec4.wgsl`, `gemm_i8_dp4a.wgsl`, `gemv_w8a32_wave32.wgsl`, `gemv_q4_0_wave32.wgsl`, `rmsnorm_f32.wgsl`, `rope_f32.wgsl`, `rmsnorm_rope_f32_subgroup.wgsl`) and compiles them purely in Rust via `naga` to SPIR-V 1.3 (`OpGroupNonUniformFAdd` subgroups + `OpBitFieldSExtract` unpacks) or SPIR-V 1.6 (`OpSDot` / `V_DOT4_I32_I8` when `shader_integer_dot_product` is supported by the device).
 - **`vulkan_compute`**: `VulkanComputeEngine` manages instance, device (enabling `PhysicalDeviceVulkan13Features::{shader_integer_dot_product, subgroup_size_control, compute_full_subgroups}` when supported, with `requiredSubgroupSize = 32` for Wave32 kernels), queue, command pool, timestamp `QueryPool`, batched multi-dispatch submissions (`dispatches_per_submit` `1..=256` with inter-dispatch `SHADER_WRITE -> SHADER_WRITE | SHADER_READ` memory barriers), `DEVICE_LOCAL` storage buffers, and staging transfers with strict RAII `Drop` cleanup.
 - **`reference`**: FP64-accumulated FP32, quantized `Q4_0`/`W8A32`, fused `RMSNorm+RoPE`, and exact `i64` INT8 CPU reference implementations plus `compare_slices` / `compare_i32_exact` evaluators and `k4`/`Q4_0` packing helpers.
+- **`verify`**: Shared live HIP transfer and Vulkan compute capability checks (`VULKAN_VERIFY_CAPABILITIES`, `default_untested_capabilities`, `run_live_capability_checks`) consumed by both `forge-cli` and `forge-desktop`.
 - **`hip_verify`**: RAII-guarded `hipMalloc` / `hipMemcpy` / `hipEvent*` 4 MiB bit-exact H2D+D2H verification against `amdhip64_*.dll`.
 
 ### `forge-benchmark`
@@ -70,6 +72,11 @@ Thin CLI boundary (`clap` + `anyhow`) exposing:
 - `forge tune {show [--device-id HEX] [--json], power-limit <PCT> [--device-id HEX] [--apply], reset [--device-id HEX] [--apply]}`
 - `forge bench {vulkan [--batch-dispatches N],llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
 - `forge profile show`
+
+### `forge-desktop`
+Optional Windows-native Tauri v2 + Edge WebView2 application (`apps/forge-desktop`) serving embedded vanilla ES assets (`ui/`) with zero `node_modules` dependencies:
+- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics`, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_vulkan_benchmark`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations.
+- **`ui`**: Five views (`Overview`, `Monitor` with 4 rolling Canvas 2D strip charts, `Tuning` with fan-curve plot & explicit `Unlock Hardware Writes` confirmation gate, `Video (AMF)`, and `Benchmarks`).
 
 ---
 

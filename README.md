@@ -23,7 +23,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 3C complete (batched Vulkan command buffer dispatches delivering **438–937 GB/s** on decode/elementwise kernels, plus pure-Rust dynamic AMD AMF `amfrt64.dll` hardware video codec probing via `forge video caps`), building on Milestone 3B (Wave32 subgroup `W8A32` & `Q4_0` LLM decode GEMV kernels and single-pass fused `RMSNorm+RoPE`), Milestone 3A (`forge monitor` + `forge tune` ADLX `V1.4` live telemetry/tuning), and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
+**Current Project Status:** Milestone 4A complete (**Forge Desktop** optional Tauri v2 Windows UI in [`apps/forge-desktop`](apps/forge-desktop) covering diagnostics, live ADLX strip charts, ADLX tuning dry-run/lockout, AMF VCN codecs, and batched Vulkan benchmarks), building on Milestone 3C (batched Vulkan command buffer dispatches + dynamic AMF `amfrt64.dll` COM probe), Milestone 3B (Wave32 `W8A32`/`Q4_0` GEMV + fused `RMSNorm+RoPE`), Milestone 3A (`forge monitor` + `forge tune`), and Milestone 2 (`9.50x` Vulkan FP32 GEMM, `30.29 TOPS` INT8 `OpSDot`, WDDM diagnosis).
 
 ---
 
@@ -196,6 +196,7 @@ RDNA Forge separates Rust orchestration and safety policy from GPU compute backe
 - [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust dynamic AMF DX11 COM video capability probing (`amfrt64.dll`), pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine with multi-dispatch batching (`gemm_f32_tiled_vec4`, `gemm_i8_dp4a`, Wave32 `gemv_w8a32` & `gemv_q4_0`, `rmsnorm_rope_f32_subgroup`), FP64/`i64` CPU references, HIP transfer verifier.
 - [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, ADLX telemetry integration, and `llama-bench` / Triton adapters.
 - [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `video`, `monitor`, `tune`, `bench`, `profile`).
+- [`apps/forge-desktop`](apps/forge-desktop): Optional Tauri v2 + WebView2 Windows GUI (`Overview`, live `Monitor`, `Tuning`, `Video (AMF)`, and Vulkan `Benchmarks` with shared `BusyGuard` mutual exclusion).
 - [`modules/ai/triton`](modules/ai/triton): Reproducible PyTorch ROCm + Triton kernel suite.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points.
@@ -219,7 +220,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
 - **Milestone 3C (Complete):**
   - Added multi-dispatch Vulkan command buffer batching (`--batch-dispatches 1..=256`, default `16`) with inter-dispatch `vkCmdPipelineBarrier` synchronization, boosting RX 6900 XT decode/elementwise kernels by **3.34x–4.67x** (`W8A32` GEMV `835.67 GB/s`, `Q4_0` GEMV `438.74 GB/s` with `IQR=0.0003 ms`, fused `RMSNorm+RoPE` `936.98 GB/s`).
   - Implemented pure-Rust dynamic AMD AMF (`amfrt64.dll`) DX11 COM capability probing via `forge video caps [--json]` and upgraded `forge doctor` (`1.4.37.0`, `2 HW enc / 5 HW dec` verified on VCN 3.0).
-- **Future:** Full AMF encode/decode transcoding pipelines, FidelityFX SDK evaluation, RDNA3/RDNA4 verification, optional Tauri desktop UI (`Forge Desktop`), Linux support.
+- **Milestone 4A (Complete):**
+  - Added `Forge Desktop` (`apps/forge-desktop`, Tauri v2 + Edge WebView2, zero `node_modules`) with real-time Canvas 2D ADLX strip charts, hardware-locked tuning validation, AMF VCN viewer, and batched Vulkan compute benchmark runner synchronized by RAII `BusyGuard`.
+- **Future:** Advanced RX 6900 XT practice (full AMF encode/decode pipelines, additional RDNA2 Vulkan shaders such as `Q4_K` GEMV or FlashAttention), FidelityFX SDK evaluation, RDNA3/RDNA4 verification, Linux support.
 
 ---
 

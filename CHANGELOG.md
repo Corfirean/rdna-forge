@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 4A (Forge Desktop — Tauri v2 Windows UI)
+- Added `apps/forge-desktop` (Tauri v2 + Edge WebView2, zero `node_modules` build dependencies) providing an engineering-focused desktop UI over the shared Rust crates:
+  - **Overview**: Hardware adapter specifications, detected compute/video/telemetry backends, live HIP+Vulkan verification trigger (`Verify Live`), and JSON export.
+  - **Monitor**: Live ADLX polling (`500 ms` / `1000 ms` / `2000 ms`, pause/resume, automatic pause during exclusive GPU operations), 8 KPI tiles, WDDM VRAM pressure warnings, 4 high-DPI Canvas 2D rolling strip charts (`Clocks`, `Temperatures`, `Power`, `Load & VRAM %`), and CSV/JSONL export.
+  - **Tuning**: Read-only ADLX capabilities/preset/GFX/VRAM state, 5-point fan curve plot, hardware-range-bounded Power Limit dry-run validator, and explicit `Unlock Hardware Writes` confirmation gate for `--apply` / factory reset.
+  - **Video (AMF)**: DX11 COM VCN hardware encoder/decoder capability table (`H.264`, `HEVC`, `VP9`, `AV1`, `MJPEG`) and JSON export.
+  - **Benchmarks**: Parameterized Vulkan compute runner (`gemv_w8`, `gemv_q4`, `fused_rms_rope`, `rmsnorm`, `rope`, `gemm_opt`, `gemm_i8`, `gemm`, `all`) with configurable batch dispatch count, full statistical dispersion & accuracy table, and ADLX telemetry summary.
+- Added thread-safe `AppState` / `BusyGuard` mutual exclusion in `apps/forge-desktop/src/commands.rs` with unit tests for lock exclusion, benchmark parameter bounds, and safe `dry_run = true` defaults.
+
+### Changed
+- Extracted shared `VULKAN_VERIFY_CAPABILITIES`, `default_untested_capabilities`, and `run_live_capability_checks` from `apps/forge-cli/src/main.rs` into `crates/forge-runtime/src/verify.rs` so CLI diagnostics and Forge Desktop share one verified implementation.
+
 ### Added — Milestone 3C (Batched Vulkan Dispatch & AMD AMF Video Capability Probing)
 - Added multi-dispatch command buffer batching (`dispatches_per_submit` `1..=256`, default `16` for sub-millisecond decode/elementwise kernels) with inter-dispatch `SHADER_WRITE -> SHADER_WRITE | SHADER_READ` `vkCmdPipelineBarrier` synchronization in `forge-runtime`, `forge-benchmark`, and `forge bench vulkan --batch-dispatches N`:
   - Eliminated single-dispatch host-fence overhead on RX 6900 XT (`gfx1030`), delivering **`512.41–835.67 GB/s`** on Wave32 `W8A32` GEMV (**3.77x–4.03x** speedup vs `batch=1`), **`353.30–438.74 GB/s`** on `Q4_0` GEMV (**4.16x–4.67x** speedup; `11008x4096` IQR collapsed from `0.209 ms` to `0.0003 ms`), **`936.98 GB/s`** on fused Wave32 `RMSNorm+RoPE` (**3.34x**), and **`1317.99 GB/s`** on `rope_f32` (**3.48x**), all passing full FP64 CPU reference checks.

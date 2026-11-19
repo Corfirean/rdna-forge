@@ -37,8 +37,11 @@ cargo fmt --all -- --check
 # Clippy with warnings denied
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Release binary build
-cargo build --release -p forge-cli
+# Release binary builds (CLI + optional Tauri v2 desktop app; requires Edge WebView2 on Windows)
+cargo build --release -p forge-cli -p forge-desktop
+
+# Launch Forge Desktop (serves embedded frontend assets with zero Node runtime required)
+.\target\release\forge-desktop.exe
 ```
 
 ---
