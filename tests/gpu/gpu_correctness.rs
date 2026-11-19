@@ -8,10 +8,11 @@ use forge_profiler::{
 };
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
-    deterministic_q4_0_weights, pack_i8_b_transposed_k4, pack_i8_row_major_k4,
-    probe_amf_capabilities, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32, ref_gemv_q4_0_f32,
-    ref_gemv_w8a32_f32, ref_rmsnorm_f32, ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer,
-    AmfAcceleration, AmfCodecDirection, VulkanComputeEngine,
+    deterministic_q4_0_weights, deterministic_q4_k_weights, pack_i8_b_transposed_k4,
+    pack_i8_row_major_k4, probe_amf_capabilities, ref_flash_attention_f32, ref_gemm_f32_exact_f64,
+    ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_q4_k_f32, ref_gemv_w8a32_f32, ref_rmsnorm_f32,
+    ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer, AmfAcceleration, AmfCodecDirection,
+    VulkanComputeEngine,
 };
 
 #[test]
@@ -479,5 +480,103 @@ fn vulkan_batched_decode_dispatch_matches_single_dispatch() {
     assert!(matches!(
         engine.bench_gemv_q4_0_wave32_batched(&w_q4, &scales, &x, n, k, 0, 1, 0),
         Err(ForgeError::InvalidParameter(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_gemv_q4_k_wave32_edge_cases_and_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    assert!(engine.supports_subgroup_arithmetic());
+    assert!(engine.supports_wave32_subgroup_control());
+
+    for (n, k) in [(1u32, 256u32), (13, 512), (65, 1024)] {
+        let w_q4k =
+            deterministic_q4_k_weights(n as usize, k as usize, 4100 + u64::from(n)).unwrap();
+        let x = deterministic_f32_data(k as usize, 4200 + u64::from(k));
+        let (actual, timing) = engine
+            .run_gemv_q4_k_wave32(&w_q4k, &x, n, k)
+            .expect("Wave32 Q4_K GEMV should pass");
+        let expected = ref_gemv_q4_k_f32(&w_q4k, &x, n as usize, k as usize).unwrap();
+        let acc = compare_slices(&actual, &expected, 1e-3, 1e-4).unwrap();
+        assert!(
+            acc.passed,
+            "Wave32 Q4_K GEMV mismatch on ({n}, {k}): max_abs={}, rmse={}",
+            acc.max_abs_err, acc.rmse
+        );
+        assert!(timing.gpu_ms.unwrap_or(timing.wall_ms) > 0.0);
+    }
+
+    // Batched dispatch equivalence check (batch=4)
+    let (n, k) = (65u32, 512u32);
+    let w_q4k = deterministic_q4_k_weights(n as usize, k as usize, 4301).unwrap();
+    let x = deterministic_f32_data(k as usize, 4302);
+    let (batched, timings) = engine
+        .bench_gemv_q4_k_wave32_batched(&w_q4k, &x, n, k, 2, 3, 4)
+        .expect("batched Q4_K dispatch must succeed");
+    assert_eq!(timings.len(), 3);
+    let expected = ref_gemv_q4_k_f32(&w_q4k, &x, n as usize, k as usize).unwrap();
+    let acc = compare_slices(&batched, &expected, 1e-3, 1e-4).unwrap();
+    assert!(acc.passed, "batched Q4_K max_abs_err={}", acc.max_abs_err);
+
+    assert!(matches!(
+        engine.run_gemv_q4_k_wave32(&[0u32; 36], &[1.0f32; 128], 1, 128),
+        Err(ForgeError::InvalidDimension(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_flash_attention_wave32_causal_and_full_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    assert!(engine.supports_subgroup_arithmetic());
+    assert!(engine.supports_wave32_subgroup_control());
+
+    for (heads, seq, dim, causal) in [
+        (2u32, 64u32, 64u32, true),
+        (2, 64, 64, false),
+        (2, 37, 64, true),
+        (2, 19, 96, false),
+        (2, 48, 128, true),
+    ] {
+        let elems = (heads * seq * dim) as usize;
+        let q = deterministic_f32_data(elems, 5100 + u64::from(seq));
+        let k = deterministic_f32_data(elems, 5200 + u64::from(dim));
+        let v = deterministic_f32_data(elems, 5300 + u64::from(seq));
+        let scale = 1.0_f32 / (dim as f32).sqrt();
+
+        let (actual, timing) = engine
+            .run_flash_attention_f32_wave32(&q, &k, &v, heads, seq, dim, causal, scale)
+            .expect("Wave32 FlashAttention should pass");
+        let expected = ref_flash_attention_f32(
+            &q,
+            &k,
+            &v,
+            heads as usize,
+            seq as usize,
+            dim as usize,
+            causal,
+            scale,
+        )
+        .unwrap();
+        let acc = compare_slices(&actual, &expected, 1e-4, 1e-5).unwrap();
+        assert!(
+            acc.passed,
+            "Wave32 FlashAttention mismatch on ({heads}, {seq}, {dim}, causal={causal}): max_abs={}, rmse={}",
+            acc.max_abs_err, acc.rmse
+        );
+        assert!(timing.gpu_ms.unwrap_or(timing.wall_ms) > 0.0);
+    }
+
+    assert!(matches!(
+        engine.run_flash_attention_f32_wave32(&[], &[], &[], 1, 8, 0, true, 1.0),
+        Err(ForgeError::InvalidDimension(_))
+    ));
+    let oversized = vec![0.0f32; 8 * 160];
+    assert!(matches!(
+        engine.run_flash_attention_f32_wave32(
+            &oversized, &oversized, &oversized, 1, 8, 160, true, 1.0
+        ),
+        Err(ForgeError::InvalidDimension(_))
     ));
 }

@@ -9,9 +9,10 @@ use forge_core::{
 use forge_profiler::{summarize_samples, GpuTelemetrySample};
 use forge_runtime::{
     compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, compile_wgsl_to_spirv_subgroup,
-    ref_gemm_f32, spirv_contains_opcode, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL,
-    GEMM_I8_DP4A_WGSL, GEMV_Q4_0_WAVE32_WGSL, GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL,
-    RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL, SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
+    ref_gemm_f32, spirv_contains_opcode, FLASH_ATTENTION_F32_WAVE32_WGSL, GEMM_F32_TILED_VEC4_WGSL,
+    GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, GEMV_Q4_0_WAVE32_WGSL, GEMV_Q4_K_WAVE32_WGSL,
+    GEMV_W8A32_WAVE32_WGSL, RMSNORM_F32_WGSL, RMSNORM_ROPE_F32_SUBGROUP_WGSL, ROPE_F32_WGSL,
+    SPIRV_OP_GROUP_NON_UNIFORM_FADD, SPIRV_OP_SDOT,
 };
 
 fn repo_root() -> PathBuf {
@@ -59,7 +60,9 @@ fn wgsl_compute_shaders_compile_offline_to_spirv() {
     for src in [
         GEMV_W8A32_WAVE32_WGSL,
         GEMV_Q4_0_WAVE32_WGSL,
+        GEMV_Q4_K_WAVE32_WGSL,
         RMSNORM_ROPE_F32_SUBGROUP_WGSL,
+        FLASH_ATTENTION_F32_WAVE32_WGSL,
     ] {
         let words =
             compile_wgsl_to_spirv_subgroup(src).expect("subgroup shader must compile to SPIR-V");
