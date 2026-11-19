@@ -5,6 +5,7 @@ members = [
     "crates/forge-device",
     "crates/forge-runtime",
     "crates/forge-benchmark",
+    "apps/forge-cli",
 ]
 
 [workspace.package]
