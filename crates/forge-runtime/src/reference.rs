@@ -262,3 +262,170 @@ pub fn compare_slices(
         passed,
     })
 }
+
+/// Deterministic pseudo-random signed `i8` generator in `[-64, 63]` to prevent `i32` matmul overflow.
+pub fn deterministic_i8_data(len: usize, seed: u64) -> Vec<i8> {
+    let mut state = seed ^ 0xA076_1D64_78BD_642F;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let v = ((state >> 57) as i8) - 64;
+        out.push(v);
+    }
+    out
+}
+
+/// Packs row-major `A[rows, k]` of signed `i8` along `k` (4 bytes per `u32`, little-endian).
+pub fn pack_i8_row_major_k4(a: &[i8], rows: usize, k: usize) -> ForgeResult<Vec<u32>> {
+    if rows == 0 || k == 0 || !k.is_multiple_of(4) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "packed INT8 A requires non-zero rows and k divisible by 4, got ({rows}, {k})"
+        )));
+    }
+    let expected = rows
+        .checked_mul(k)
+        .ok_or_else(|| ForgeError::InvalidDimension("rows * k overflow".to_string()))?;
+    if a.len() != expected {
+        return Err(ForgeError::InvalidDimension(format!(
+            "packed INT8 A length mismatch: got {}, expected {expected}",
+            a.len()
+        )));
+    }
+
+    let k_packed = k / 4;
+    let mut out = Vec::with_capacity(rows * k_packed);
+    for r in 0..rows {
+        let row = &a[r * k..(r + 1) * k];
+        for kp in 0..k_packed {
+            let base = kp * 4;
+            let bytes = [
+                row[base] as u8,
+                row[base + 1] as u8,
+                row[base + 2] as u8,
+                row[base + 3] as u8,
+            ];
+            out.push(u32::from_le_bytes(bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// Packs column-major transposed `B[k, n]` into `B_t[n, k/4]` so each `u32` holds 4 consecutive `k` elements.
+pub fn pack_i8_b_transposed_k4(b: &[i8], k: usize, n: usize) -> ForgeResult<Vec<u32>> {
+    if k == 0 || n == 0 || !k.is_multiple_of(4) {
+        return Err(ForgeError::InvalidDimension(format!(
+            "packed INT8 B requires non-zero n and k divisible by 4, got ({k}, {n})"
+        )));
+    }
+    let expected = k
+        .checked_mul(n)
+        .ok_or_else(|| ForgeError::InvalidDimension("k * n overflow".to_string()))?;
+    if b.len() != expected {
+        return Err(ForgeError::InvalidDimension(format!(
+            "packed INT8 B length mismatch: got {}, expected {expected}",
+            b.len()
+        )));
+    }
+
+    let k_packed = k / 4;
+    let mut out = Vec::with_capacity(n * k_packed);
+    for col in 0..n {
+        for kp in 0..k_packed {
+            let k0 = kp * 4;
+            let bytes = [
+                b[k0 * n + col] as u8,
+                b[(k0 + 1) * n + col] as u8,
+                b[(k0 + 2) * n + col] as u8,
+                b[(k0 + 3) * n + col] as u8,
+            ];
+            out.push(u32::from_le_bytes(bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// Exact CPU reference INT8 matrix multiplication `C[m, n] = A[m, k] * B[k, n]` accumulated in `i64`.
+pub fn ref_gemm_i8_to_i32(
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> ForgeResult<Vec<i32>> {
+    if m == 0 || k == 0 || n == 0 {
+        return Err(ForgeError::InvalidDimension(
+            "INT8 GEMM dimensions m, k, n must all be > 0".to_string(),
+        ));
+    }
+    let expected_a = m
+        .checked_mul(k)
+        .ok_or_else(|| ForgeError::InvalidDimension("m * k overflow".to_string()))?;
+    let expected_b = k
+        .checked_mul(n)
+        .ok_or_else(|| ForgeError::InvalidDimension("k * n overflow".to_string()))?;
+    let expected_c = m
+        .checked_mul(n)
+        .ok_or_else(|| ForgeError::InvalidDimension("m * n overflow".to_string()))?;
+    if a.len() != expected_a || b.len() != expected_b {
+        return Err(ForgeError::InvalidDimension(format!(
+            "INT8 GEMM buffer mismatch: got a={}, b={}, expected a={expected_a}, b={expected_b}",
+            a.len(),
+            b.len()
+        )));
+    }
+
+    let mut acc = vec![0i64; expected_c];
+    for row in 0..m {
+        let a_row = &a[row * k..(row + 1) * k];
+        let acc_row = &mut acc[row * n..(row + 1) * n];
+        for (kk, &av) in a_row.iter().enumerate() {
+            let av64 = i64::from(av);
+            let b_row = &b[kk * n..(kk + 1) * n];
+            for col in 0..n {
+                acc_row[col] += av64 * i64::from(b_row[col]);
+            }
+        }
+    }
+    Ok(acc.into_iter().map(|v| v as i32).collect())
+}
+
+/// Compares exact integer GPU outputs against an integer CPU reference.
+pub fn compare_i32_exact(actual: &[i32], expected: &[i32]) -> ForgeResult<NumericalAccuracy> {
+    if actual.len() != expected.len() {
+        return Err(ForgeError::InvalidDimension(format!(
+            "integer comparison length mismatch: actual={}, expected={}",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    if actual.is_empty() {
+        return Err(ForgeError::InvalidDimension(
+            "cannot compare empty slices".to_string(),
+        ));
+    }
+
+    let mut max_abs_err = 0.0f64;
+    let mut max_rel_err = 0.0f64;
+    let mut sum_sq_err = 0.0f64;
+
+    for (&a, &e) in actual.iter().zip(expected.iter()) {
+        let diff = (i64::from(a) - i64::from(e)).abs() as f64;
+        max_abs_err = max_abs_err.max(diff);
+        if e != 0 {
+            max_rel_err = max_rel_err.max(diff / (e.abs() as f64));
+        }
+        sum_sq_err += diff * diff;
+    }
+
+    let rmse = (sum_sq_err / (actual.len() as f64)).sqrt();
+    Ok(NumericalAccuracy {
+        element_count: actual.len(),
+        max_abs_err,
+        max_rel_err,
+        rmse,
+        all_finite: true,
+        passed: max_abs_err == 0.0,
+    })
+}

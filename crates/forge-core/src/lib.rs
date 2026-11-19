@@ -54,6 +54,7 @@ mod tests {
             vulkan_cooperative_matrix: false,
             vulkan_fp16: true,
             vulkan_int8: true,
+            vulkan_int8_dot_product: true,
             hip_available: true,
             hip_runtime_version: None,
             core_clock_mhz: None,

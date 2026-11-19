@@ -7,10 +7,15 @@ pub mod vulkan_compute;
 pub use hip_verify::{verify_hip_transfer, HipVerificationResult};
 pub use probe::probe_all_backends;
 pub use reference::{
-    compare_slices, deterministic_f32_data, ref_gemm_f32, ref_gemm_f32_exact_f64, ref_rmsnorm_f32,
-    ref_rope_f32, NumericalAccuracy,
+    compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
+    pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32, ref_gemm_f32_exact_f64,
+    ref_gemm_i8_to_i32, ref_rmsnorm_f32, ref_rope_f32, NumericalAccuracy,
 };
-pub use shaders::{compile_wgsl_to_spirv, GEMM_F32_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL};
+pub use shaders::{
+    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, spirv_contains_opcode,
+    GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
+    SPIRV_OP_SDOT,
+};
 pub use vulkan_compute::{GpuTiming, VulkanComputeEngine};
 
 #[cfg(test)]
@@ -22,6 +27,7 @@ mod tests {
     fn all_embedded_wgsl_shaders_compile_to_spirv() {
         for (name, src) in [
             ("gemm_f32", GEMM_F32_WGSL),
+            ("gemm_f32_tiled_vec4", GEMM_F32_TILED_VEC4_WGSL),
             ("rmsnorm_f32", RMSNORM_F32_WGSL),
             ("rope_f32", ROPE_F32_WGSL),
         ] {
@@ -32,6 +38,44 @@ mod tests {
                 "{name} did not emit valid SPIR-V magic word"
             );
         }
+
+        let dp4a_spv = compile_wgsl_to_spirv_dp4a(GEMM_I8_DP4A_WGSL)
+            .expect("gemm_i8_dp4a failed SPIR-V 1.6 compile");
+        assert!(dp4a_spv.len() > 10 && dp4a_spv[0] == 0x0723_0203);
+        assert!(
+            spirv_contains_opcode(&dp4a_spv, SPIRV_OP_SDOT),
+            "gemm_i8_dp4a SPIR-V must emit native OpSDot (4450)"
+        );
+    }
+
+    #[test]
+    fn i8_packing_and_exact_reference_work() {
+        // A = [[1, 2, 3, 4], [-1, -2, -3, -4]] (2x4)
+        let a = [1i8, 2, 3, 4, -1, -2, -3, -4];
+        // B = [[1, 0], [1, 2], [1, 3], [1, 4]] (4x2)
+        // C[0] = [1+2+3+4, 0+4+9+16] = [10, 29]
+        // C[1] = [-10, -29]
+        let b = [1i8, 0, 1, 2, 1, 3, 1, 4];
+
+        let a_p = pack_i8_row_major_k4(&a, 2, 4).unwrap();
+        let b_p = pack_i8_b_transposed_k4(&b, 4, 2).unwrap();
+        assert_eq!(a_p.len(), 2);
+        assert_eq!(b_p.len(), 2);
+
+        let c_ref = ref_gemm_i8_to_i32(&a, &b, 2, 4, 2).unwrap();
+        assert_eq!(c_ref, vec![10, 29, -10, -29]);
+
+        let exact = compare_i32_exact(&c_ref, &[10, 29, -10, -29]).unwrap();
+        assert!(exact.passed);
+        assert_eq!(exact.max_abs_err, 0.0);
+
+        let wrong = compare_i32_exact(&c_ref, &[10, 28, -10, -29]).unwrap();
+        assert!(!wrong.passed);
+
+        assert!(matches!(
+            pack_i8_row_major_k4(&[1, 2, 3], 1, 3),
+            Err(ForgeError::InvalidDimension(_))
+        ));
     }
 
     #[test]

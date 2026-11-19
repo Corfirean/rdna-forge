@@ -101,6 +101,8 @@ pub struct GpuDeviceInfo {
     pub vulkan_cooperative_matrix: bool,
     pub vulkan_fp16: bool,
     pub vulkan_int8: bool,
+    #[serde(default)]
+    pub vulkan_int8_dot_product: bool,
     pub hip_available: bool,
     pub hip_runtime_version: Option<String>,
     pub core_clock_mhz: Option<u32>,

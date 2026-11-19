@@ -323,6 +323,9 @@ fn build_device_info(
         vulkan_cooperative_matrix: vk_dev.map(|v| v.cooperative_matrix).unwrap_or(false),
         vulkan_fp16: vk_dev.map(|v| v.fp16_supported).unwrap_or(false),
         vulkan_int8: vk_dev.map(|v| v.int8_supported).unwrap_or(false),
+        vulkan_int8_dot_product: vk_dev
+            .map(|v| v.int8_dot_product_4x8_signed)
+            .unwrap_or(false),
         hip_available: hip_dev.is_some(),
         hip_runtime_version: hip_dev.and(hip_runtime_version),
         core_clock_mhz: hip_dev.and_then(|h| h.clock_mhz),
@@ -397,6 +400,7 @@ mod tests {
                 amd_compute_units: None,
                 fp16_supported: true,
                 int8_supported: true,
+                int8_dot_product_4x8_signed: true,
                 storage_16bit: true,
                 storage_8bit: true,
                 cooperative_matrix: true,
@@ -425,6 +429,7 @@ mod tests {
                 amd_compute_units: Some(80),
                 fp16_supported: true,
                 int8_supported: true,
+                int8_dot_product_4x8_signed: true,
                 storage_16bit: true,
                 storage_8bit: true,
                 cooperative_matrix: true,

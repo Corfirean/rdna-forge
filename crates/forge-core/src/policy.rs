@@ -67,7 +67,9 @@ pub fn validate_kernel_execution(
         )));
     }
 
-    if req.require_int8_dp4a && !(device.vulkan_int8 || arch_caps.has_dp4a_i8) {
+    if req.require_int8_dp4a
+        && !(device.vulkan_int8_dot_product || device.vulkan_int8 || arch_caps.has_dp4a_i8)
+    {
         return Err(ForgeError::UnsupportedCapability(format!(
             "INT8 DP4A compute is not supported on '{}'",
             device.name

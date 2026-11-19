@@ -9,7 +9,10 @@ use forge_core::{
 use forge_device::discover_gpus;
 use serde::{Deserialize, Serialize};
 
-use crate::shaders::{compile_wgsl_to_spirv, GEMM_F32_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL};
+use crate::shaders::{
+    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL,
+    GEMM_I8_DP4A_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
+};
 
 /// Timing measurements from a single Vulkan compute dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ struct VulkanContext {
     command_pool: vk::CommandPool,
     query_pool: Option<vk::QueryPool>,
     timestamp_period_ns: f32,
+    int8_dot_product_enabled: bool,
 }
 
 impl Drop for VulkanContext {
@@ -210,12 +214,33 @@ impl VulkanComputeEngine {
                 ))
             })?;
 
+        let has_vk13 = props.api_version >= vk::API_VERSION_1_3;
+        let dp4a_supported = if has_vk13 {
+            let mut vk13_props = vk::PhysicalDeviceVulkan13Properties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut vk13_props);
+            unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+
+            let mut vk13_feat = vk::PhysicalDeviceVulkan13Features::default();
+            let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vk13_feat);
+            unsafe { instance.get_physical_device_features2(pd, &mut feat2) };
+
+            vk13_feat.shader_integer_dot_product == vk::TRUE
+                && vk13_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
+        } else {
+            false
+        };
+
         let queue_priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qf_index as u32)
             .queue_priorities(&queue_priorities);
-        let device_info =
+        let mut enabled_vk13_feat = vk::PhysicalDeviceVulkan13Features::default()
+            .shader_integer_dot_product(dp4a_supported);
+        let mut device_info =
             vk::DeviceCreateInfo::default().queue_create_infos(std::slice::from_ref(&queue_info));
+        if dp4a_supported {
+            device_info = device_info.push_next(&mut enabled_vk13_feat);
+        }
 
         let device = match unsafe { instance.create_device(pd, &device_info, None) } {
             Ok(dev) => dev,
@@ -263,6 +288,7 @@ impl VulkanComputeEngine {
             command_pool,
             query_pool,
             timestamp_period_ns: props.limits.timestamp_period,
+            int8_dot_product_enabled: dp4a_supported,
         });
 
         Ok(Self {
@@ -275,7 +301,11 @@ impl VulkanComputeEngine {
         &self.device_info
     }
 
-    /// Executes `C[m, n] = A[m, k] * B[k, n]` once and returns output plus timing.
+    pub fn supports_int8_dp4a(&self) -> bool {
+        self.ctx.int8_dot_product_enabled
+    }
+
+    /// Executes baseline `16x16` FP32 `C[m, n] = A[m, k] * B[k, n]` once and returns output plus timing.
     pub fn run_gemm_f32(
         &self,
         a: &[f32],
@@ -291,7 +321,7 @@ impl VulkanComputeEngine {
         Ok((std::mem::take(&mut out), timing))
     }
 
-    /// Runs `warmup_iters` + `measured_iters` of tiled FP32 GEMM on device-local buffers and returns the output + per-iteration timings.
+    /// Runs `warmup_iters` + `measured_iters` of baseline `16x16` tiled FP32 GEMM.
     #[allow(clippy::too_many_arguments)]
     pub fn bench_gemm_f32(
         &self,
@@ -302,6 +332,76 @@ impl VulkanComputeEngine {
         n: u32,
         warmup_iters: usize,
         measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_gemm_f32_with_shader(
+            a,
+            b,
+            m,
+            k,
+            n,
+            warmup_iters,
+            measured_iters,
+            GEMM_F32_WGSL,
+            16,
+            16,
+        )
+    }
+
+    /// Executes register-blocked `128x64` FP32 `C[m, n] = A[m, k] * B[k, n]` once and returns output plus timing.
+    pub fn run_gemm_f32_tiled_vec4(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: u32,
+        k: u32,
+        n: u32,
+    ) -> ForgeResult<(Vec<f32>, GpuTiming)> {
+        let (mut out, mut timings) = self.bench_gemm_f32_tiled_vec4(a, b, m, k, n, 0, 1)?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed("missing tiled GEMM timing measurement".to_string())
+        })?;
+        Ok((std::mem::take(&mut out), timing))
+    }
+
+    /// Runs `warmup_iters` + `measured_iters` of register-blocked `128x64` FP32 GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemm_f32_tiled_vec4(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: u32,
+        k: u32,
+        n: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
+        self.bench_gemm_f32_with_shader(
+            a,
+            b,
+            m,
+            k,
+            n,
+            warmup_iters,
+            measured_iters,
+            GEMM_F32_TILED_VEC4_WGSL,
+            64,
+            128,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bench_gemm_f32_with_shader(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: u32,
+        k: u32,
+        n: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+        shader_src: &str,
+        tile_n: u32,
+        tile_m: u32,
     ) -> ForgeResult<(Vec<f32>, Vec<GpuTiming>)> {
         if m == 0 || k == 0 || n == 0 {
             return Err(ForgeError::InvalidDimension(
@@ -347,22 +447,127 @@ impl VulkanComputeEngine {
             },
         )?;
 
-        let spirv = compile_wgsl_to_spirv(GEMM_F32_WGSL)?;
+        let spirv = compile_wgsl_to_spirv(shader_src)?;
         let pipeline = self.create_compute_pipeline(&spirv, 3, true)?;
 
-        let buf_a = self.upload_device_local_f32(a)?;
-        let buf_b = self.upload_device_local_f32(b)?;
+        let buf_a = self.upload_device_local_slice(a)?;
+        let buf_b = self.upload_device_local_slice(b)?;
         let buf_c = self.create_device_local_buffer(bytes_c)?;
         let params = GemmParams { m, k, n, _pad: 0 };
         let ubo = self.create_uniform_buffer(&params)?;
 
         self.bind_buffers(&pipeline, &[&buf_a, &buf_b, &buf_c], Some(&ubo));
 
-        let gx = n.div_ceil(16);
-        let gy = m.div_ceil(16);
+        let gx = n.div_ceil(tile_n);
+        let gy = m.div_ceil(tile_m);
         let timings =
             self.execute_timed_loop(&pipeline, gx, gy, 1, warmup_iters, measured_iters)?;
-        let out = self.download_device_local_f32(&buf_c, elems_c)?;
+        let out = self.download_device_local_vec::<f32>(&buf_c, elems_c)?;
+
+        Ok((out, timings))
+    }
+
+    /// Executes DP4A INT8 GEMM (`OpSDot`) once and returns exact `i32` accumulators plus timing.
+    pub fn run_gemm_i8_dp4a(
+        &self,
+        a_packed: &[u32],
+        b_t_packed: &[u32],
+        m: u32,
+        k_packed: u32,
+        n: u32,
+    ) -> ForgeResult<(Vec<i32>, GpuTiming)> {
+        let (mut out, mut timings) =
+            self.bench_gemm_i8_dp4a(a_packed, b_t_packed, m, k_packed, n, 0, 1)?;
+        let timing = timings.pop().ok_or_else(|| {
+            ForgeError::ExecutionFailed("missing INT8 DP4A GEMM timing measurement".to_string())
+        })?;
+        Ok((std::mem::take(&mut out), timing))
+    }
+
+    /// Benchmarks DP4A INT8 GEMM (`OpSDot` / `V_DOT4_I32_I8`) on device-local buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_gemm_i8_dp4a(
+        &self,
+        a_packed: &[u32],
+        b_t_packed: &[u32],
+        m: u32,
+        k_packed: u32,
+        n: u32,
+        warmup_iters: usize,
+        measured_iters: usize,
+    ) -> ForgeResult<(Vec<i32>, Vec<GpuTiming>)> {
+        if !self.ctx.int8_dot_product_enabled {
+            return Err(ForgeError::UnsupportedCapability(format!(
+                "Vulkan 1.3 shader_integer_dot_product (packed 4x8 signed) is not supported on '{}'",
+                self.device_info.name
+            )));
+        }
+        if m == 0 || k_packed == 0 || n == 0 {
+            return Err(ForgeError::InvalidDimension(
+                "INT8 GEMM dimensions m, k_packed, n must all be > 0".to_string(),
+            ));
+        }
+        if measured_iters == 0 {
+            return Err(ForgeError::InvalidDimension(
+                "measured_iters must be > 0".to_string(),
+            ));
+        }
+
+        let elems_a = (m as usize)
+            .checked_mul(k_packed as usize)
+            .ok_or_else(|| ForgeError::InvalidDimension("m * k_packed overflow".to_string()))?;
+        let elems_b = (n as usize)
+            .checked_mul(k_packed as usize)
+            .ok_or_else(|| ForgeError::InvalidDimension("n * k_packed overflow".to_string()))?;
+        let elems_c = (m as usize)
+            .checked_mul(n as usize)
+            .ok_or_else(|| ForgeError::InvalidDimension("m * n overflow".to_string()))?;
+
+        if a_packed.len() != elems_a || b_t_packed.len() != elems_b {
+            return Err(ForgeError::InvalidDimension(format!(
+                "INT8 DP4A input mismatch: got a_packed={}, b_t_packed={}, expected ({elems_a}, {elems_b})",
+                a_packed.len(),
+                b_t_packed.len()
+            )));
+        }
+
+        let bytes_a = (elems_a as u64) * 4;
+        let bytes_b = (elems_b as u64) * 4;
+        let bytes_c = (elems_c as u64) * 4;
+        let max_buf = bytes_a.max(bytes_b).max(bytes_c);
+        let total_vram = bytes_a.saturating_add(bytes_b).saturating_add(bytes_c);
+
+        validate_kernel_execution(
+            &self.device_info,
+            &KernelRequirements {
+                required_vram_bytes: total_vram,
+                max_single_buffer_bytes: max_buf,
+                require_int8_dp4a: true,
+                ..Default::default()
+            },
+        )?;
+
+        let spirv = compile_wgsl_to_spirv_dp4a(GEMM_I8_DP4A_WGSL)?;
+        let pipeline = self.create_compute_pipeline(&spirv, 3, true)?;
+
+        let buf_a = self.upload_device_local_slice(a_packed)?;
+        let buf_b = self.upload_device_local_slice(b_t_packed)?;
+        let buf_c = self.create_device_local_buffer(bytes_c)?;
+        let params = GemmParams {
+            m,
+            k: k_packed,
+            n,
+            _pad: 0,
+        };
+        let ubo = self.create_uniform_buffer(&params)?;
+
+        self.bind_buffers(&pipeline, &[&buf_a, &buf_b, &buf_c], Some(&ubo));
+
+        let gx = n.div_ceil(64);
+        let gy = m.div_ceil(64);
+        let timings =
+            self.execute_timed_loop(&pipeline, gx, gy, 1, warmup_iters, measured_iters)?;
+        let out = self.download_device_local_vec::<i32>(&buf_c, elems_c)?;
 
         Ok((out, timings))
     }
@@ -430,8 +635,8 @@ impl VulkanComputeEngine {
         let spirv = compile_wgsl_to_spirv(RMSNORM_F32_WGSL)?;
         let pipeline = self.create_compute_pipeline(&spirv, 3, true)?;
 
-        let buf_x = self.upload_device_local_f32(x)?;
-        let buf_w = self.upload_device_local_f32(weight)?;
+        let buf_x = self.upload_device_local_slice(x)?;
+        let buf_w = self.upload_device_local_slice(weight)?;
         let buf_y = self.create_device_local_buffer(bytes_x)?;
         let params = RmsNormParams {
             rows,
@@ -445,7 +650,7 @@ impl VulkanComputeEngine {
 
         let timings =
             self.execute_timed_loop(&pipeline, rows, 1, 1, warmup_iters, measured_iters)?;
-        let out = self.download_device_local_f32(&buf_y, elems)?;
+        let out = self.download_device_local_vec::<f32>(&buf_y, elems)?;
 
         Ok((out, timings))
     }
@@ -519,7 +724,7 @@ impl VulkanComputeEngine {
         let spirv = compile_wgsl_to_spirv(ROPE_F32_WGSL)?;
         let pipeline = self.create_compute_pipeline(&spirv, 2, true)?;
 
-        let buf_in = self.upload_device_local_f32(input)?;
+        let buf_in = self.upload_device_local_slice(input)?;
         let buf_out = self.create_device_local_buffer(bytes)?;
         let params = RopeParams {
             seq_len,
@@ -538,7 +743,7 @@ impl VulkanComputeEngine {
         let gx = total_pairs.div_ceil(256);
 
         let timings = self.execute_timed_loop(&pipeline, gx, 1, 1, warmup_iters, measured_iters)?;
-        let out = self.download_device_local_f32(&buf_out, elems)?;
+        let out = self.download_device_local_vec::<f32>(&buf_out, elems)?;
 
         Ok((out, timings))
     }
@@ -962,7 +1167,7 @@ impl VulkanComputeEngine {
         Ok(buf)
     }
 
-    fn upload_device_local_f32(&self, data: &[f32]) -> ForgeResult<GpuBuffer> {
+    fn upload_device_local_slice<T: Copy>(&self, data: &[T]) -> ForgeResult<GpuBuffer> {
         let size = (std::mem::size_of_val(data)) as u64;
         let staging = self.create_buffer(
             size,
@@ -975,7 +1180,7 @@ impl VulkanComputeEngine {
                 .device
                 .map_memory(staging.memory, 0, size, vk::MemoryMapFlags::empty())
                 .map_err(|e| ForgeError::ExecutionFailed(format!("map_memory(upload): {e}")))?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<f32>(), data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<T>(), data.len());
             self.ctx.device.unmap_memory(staging.memory);
         }
 
@@ -984,8 +1189,12 @@ impl VulkanComputeEngine {
         Ok(dev_buf)
     }
 
-    fn download_device_local_f32(&self, dev_buf: &GpuBuffer, len: usize) -> ForgeResult<Vec<f32>> {
-        let size = (len * std::mem::size_of::<f32>()) as u64;
+    fn download_device_local_vec<T: Copy + Default>(
+        &self,
+        dev_buf: &GpuBuffer,
+        len: usize,
+    ) -> ForgeResult<Vec<T>> {
+        let size = (len * std::mem::size_of::<T>()) as u64;
         let staging = self.create_buffer(
             size,
             vk::BufferUsageFlags::TRANSFER_DST,
@@ -993,14 +1202,14 @@ impl VulkanComputeEngine {
         )?;
         self.copy_buffer(dev_buf, &staging, size)?;
 
-        let mut out = vec![0.0f32; len];
+        let mut out = vec![T::default(); len];
         unsafe {
             let ptr = self
                 .ctx
                 .device
                 .map_memory(staging.memory, 0, size, vk::MemoryMapFlags::empty())
                 .map_err(|e| ForgeError::ExecutionFailed(format!("map_memory(download): {e}")))?;
-            std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), out.as_mut_ptr(), len);
+            std::ptr::copy_nonoverlapping(ptr.cast::<T>(), out.as_mut_ptr(), len);
             self.ctx.device.unmap_memory(staging.memory);
         }
         Ok(out)

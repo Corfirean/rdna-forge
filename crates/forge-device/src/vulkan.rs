@@ -30,6 +30,8 @@ pub struct VulkanDeviceProbe {
     pub amd_compute_units: Option<u32>,
     pub fp16_supported: bool,
     pub int8_supported: bool,
+    #[serde(default)]
+    pub int8_dot_product_4x8_signed: bool,
     pub storage_16bit: bool,
     pub storage_8bit: bool,
     pub cooperative_matrix: bool,
@@ -201,8 +203,23 @@ fn inspect_physical_device(
     let mut storage16_feat = vk::PhysicalDevice16BitStorageFeatures::default();
     let mut storage8_feat = vk::PhysicalDevice8BitStorageFeatures::default();
     let mut coop_mat_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let mut vk13_feat = vk::PhysicalDeviceVulkan13Features::default();
+    let mut int_dot_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+    let mut int_dot_props = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let has_int_dot = !has_vk13 && exts.contains("VK_KHR_shader_integer_dot_product");
+
+    if has_int_dot {
+        // Query separately below if on Vulkan 1.1/1.2 with KHR extension.
+        let mut p2_dot = vk::PhysicalDeviceProperties2::default().push_next(&mut int_dot_props);
+        unsafe { instance.get_physical_device_properties2(pd, &mut p2_dot) };
+    }
 
     let mut feat2 = vk::PhysicalDeviceFeatures2::default();
+    if has_vk13 {
+        feat2 = feat2.push_next(&mut vk13_feat);
+    } else if has_int_dot {
+        feat2 = feat2.push_next(&mut int_dot_feat);
+    }
     if has_f16_i8 {
         feat2 = feat2.push_next(&mut f16_i8_feat);
     }
@@ -295,6 +312,16 @@ fn inspect_physical_device(
         "probed Vulkan physical device"
     );
 
+    let int8_dot_product_4x8_signed = if has_vk13 {
+        vk13_feat.shader_integer_dot_product == vk::TRUE
+            && vk13_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
+    } else if has_int_dot {
+        int_dot_feat.shader_integer_dot_product == vk::TRUE
+            && int_dot_props.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE
+    } else {
+        false
+    };
+
     VulkanDeviceProbe {
         index,
         name,
@@ -318,6 +345,7 @@ fn inspect_physical_device(
         amd_compute_units,
         fp16_supported: f16_i8_feat.shader_float16 == vk::TRUE,
         int8_supported: f16_i8_feat.shader_int8 == vk::TRUE,
+        int8_dot_product_4x8_signed,
         storage_16bit: storage16_feat.storage_buffer16_bit_access == vk::TRUE,
         storage_8bit: storage8_feat.storage_buffer8_bit_access == vk::TRUE,
         cooperative_matrix: coop_mat_feat.cooperative_matrix == vk::TRUE,
