@@ -257,7 +257,27 @@ Observed VCN 3.0 hardware characteristics via `forge-profiler` ADLX:
 
 ---
 
-## 11. Reproduction Commands
+## 11. Milestone 5 — 27B GGUF LLM Autotuning & Anti-WDDM-Spill Tweaks on RX 6900 XT (16 GiB)
+
+Empirical evaluation of a borderline 16 GiB VRAM model (**`Qwen3.8-27B` `UD-IQ4_XS`**, `27.32B` params, `13.41 GiB` / `13,737 MiB` weights, `65` layers, hybrid `qwen35` SSM+Attention architecture with full attention every 4th layer and declared `262,144` max context) on RX 6900 XT (`gfx1030`, `16,368 MiB` VRAM, Windows 11 Build `26300`, Adrenalin `26.11.2`, `llama.cpp` `b12532`):
+
+### 11.1 Confirmed Hardware & Driver Traps on 13.4 GiB 27B Models
+1. **WDDM VRAM Cliff (`13.41 GiB` weights vs `~13.3–13.6 GiB` free VRAM)**: With `~2.5–3.0 GiB` occupied by Windows 11 desktop and background apps, loading all 65 layers (`-ngl 99`) without WDDM memory priority or KV cache quantization overflows physical VRAM by `~600–1200 MiB` as context grows (`d=2048..4096`), causing Windows WDDM to silently page active layers/KV cache over PCIe (`tg32` drops from `27.4 tok/s` to `14.4–16.4 tok/s`).
+2. **ROCm Ryzen 7000 iGPU Shared-RAM Misreporting (`Total VRAM: 28823 MiB`)**: On Windows ROCm, the Ryzen 7 7700X iGPU (`gfx1036`, `Device 1`) reports `12,455 MiB` of shared DDR5 RAM as "VRAM". Without `HIP_VISIBLE_DEVICES=0` / `GGML_VK_VISIBLE_DEVICES=0` and `-sm none`, `llama.cpp`'s default `-sm layer` can split layers onto the 2-CU iGPU.
+3. **Hybrid `qwen35` Vulkan FlashAttention vs Non-FlashAttention Tradeoff**: On Vulkan with `f16` KV cache at `<= 2048` context, `-fa 0` (`FlashAttention OFF`) + `GGML_VK_ENABLE_MEMORY_PRIORITY=1` achieves **`343.20 tok/s` prefill** and **`26.81 tok/s` generation**, whereas at `d=4096` switching to **`-fa 1 -ctk q4_0 -ctv q4_0`** (or **`ROCm0 -fa 1 -ctk q4_0 -ctv q4_0`**) prevents KV cache WDDM spill.
+
+### 11.2 Measured 27B Performance Across Context Depths (`d=0`, `d=2048`, `d=4096`)
+
+| Configuration / Profile | Backend | Env Tweaks | FA | KV Cache | `pp128 @ d=0` | `tg32 @ d=0` | `pp128 @ d=2048` | `tg32 @ d=2048` | `pp128 @ d=4096` | `tg32 @ d=4096` |
+| :--- | :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline Vulkan (default WDDM priority) | `Vulkan0` | `default` | `0` | `f16/f16` | 379.21 tok/s | 27.32 tok/s | 165.12 tok/s | 16.42 tok/s | — | — |
+| **Tuned Vulkan WDDM Priority (`-fa 0`)** | `Vulkan0` | `GGML_VK_ENABLE_MEMORY_PRIORITY=1`, `GGML_VK_VISIBLE_DEVICES=0` | `0` | `f16/f16` | **378.01 tok/s** | **27.42 tok/s** | **343.20 tok/s** (**+108%**) | **26.81 tok/s** (**+63%**) | 139.78 tok/s | 15.92 tok/s |
+| **Tuned Vulkan Long-Context (`q4_0` KV)** | `Vulkan0` | `GGML_VK_ENABLE_MEMORY_PRIORITY=1`, `GGML_VK_VISIBLE_DEVICES=0` | `1` | `q4_0/q4_0` | 374.22 tok/s | 26.39 tok/s | 251.61 tok/s (**+52%**) | 20.06–26.04 tok/s | 12.13 tok/s | **25.63 tok/s** (**+61%**) |
+| **Tuned ROCm/HIP Long-Context (`q4_0` KV)** | `ROCm0` | `HIP_VISIBLE_DEVICES=0` + ROCm `PATH` | `1` | `q4_0/q4_0` | **522.57 tok/s** (**+38%**) | **27.20 tok/s** | **260.08 tok/s** | **22.13 tok/s** | **246.22 tok/s** (**20.3x**) | **18.99 tok/s** |
+
+---
+
+## 12. Reproduction Commands
 
 ```powershell
 # 1. Build release CLI and optional desktop GUI
@@ -285,7 +305,10 @@ cargo build --release -p forge-cli -p forge-desktop
 # 4. Safe 256x256 Triton verification pass (smoke mode)
 .\target\release\forge.exe bench triton --python <venv>\Scripts\python.exe --smoke --output ..\triton_smoke.json
 
-# 5. llama.cpp Vulkan vs ROCm/HIP comparison (ensure TheRock ROCm bin dirs are on PATH for HIP)
+# 5. llama.cpp Vulkan vs ROCm/HIP comparison & GGUF LLM Optimizer / Autotuner
+.\target\release\forge.exe llm inspect
+.\target\release\forge.exe llm plan --context 4096
+.\target\release\forge.exe llm autotune --vulkan-bin <llama-vk>\llama-bench.exe --hip-bin <llama-hip>\llama-bench.exe --context-depth 2048 --reps 2 --output ..\llm_autotune.json
 $env:PATH = "<venv>\Lib\site-packages\_rocm_sdk_libraries\bin;<venv>\Lib\site-packages\_rocm_sdk_core\bin;" + $env:PATH
 .\target\release\forge.exe bench llama `
   --model <models>\qwen2.5-1.5b-instruct-q4_k_m.gguf `

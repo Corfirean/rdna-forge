@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 5 (ADLX Fan Curve Diagnostics + GGUF Inspector, Anti-WDDM-Spill Memory Planner & RDNA2 LLM Autotuner)
+- Upgraded `crates/forge-profiler/src/adlx_tuning.rs` and `tuning.rs` (`FanTuningInfo`):
+  - Added `IADLXManualFanTuning1::GetDefaultFanTuningStates` (vtable slot `[23]`) to read the GPU VBIOS factory 5-point fan curve (`default_fan_curve`, verified on RX 6900 XT as `30C->20%, 50C->30%, 61C->40%, 72C->50%, 80C->70%`) alongside active ADLX states (`GetFanTuningStates`).
+  - Added flat PWM override detection (`flat_pwm_override_pct`) and Win32 `CreateToolhelp32Snapshot` process detection (`external_controller`, e.g. `FanControl.exe`) explaining why external fan controllers set all 5 RDNA2 ADLX curve points to a single instant PWM percentage (clamped to the `20%` hardware floor when Zero-RPM is disabled).
+  - Updated `forge tune show` and `Forge Desktop` (**Tuning** tab & `drawFanCurveChart`) to plot both active ADLX and dashed factory VBIOS curves.
+- Added `crates/forge-benchmark/src/llm_optimizer.rs` (`inspect_gguf_model`, `estimate_kv_and_state_bytes`, `discover_local_llm_assets`, `plan_llm_configuration`, `autotune_llm_model`):
+  - Pure-Rust GGUF v2/v3 header parser supporting standard and hybrid SSM/Attention architectures (`qwen35` `full_attention_interval`, `nextn_predict_layers`, `ssm.*`), computing exact per-layer weight sizes and `f16`/`q8_0`/`q4_0` KV+SSM memory budgets against live ADLX free physical VRAM.
+  - Hardware-verified AMD RDNA2 (`gfx1030`) tweaks (`GGML_VK_ENABLE_MEMORY_PRIORITY=1` for Windows WDDM `VK_EXT_memory_priority` residency, `GGML_VK_VISIBLE_DEVICES=0` & `HIP_VISIBLE_DEVICES=0` to isolate from the Ryzen 7000 iGPU `12.4 GiB` shared-RAM trap, `-sm none`, `-ctk/-ctv q4_0`, and physical core thread count `-t 8`).
+  - Live-verified on RX 6900 XT + `Qwen3.8-27B` `UD-IQ4_XS` (`13.41 GiB`, 65 layers): `GGML_VK_ENABLE_MEMORY_PRIORITY=1` + `-fa 0` boosts `d=2048` prefill by **+108%** (`165.12 -> 343.20 tok/s`) and token generation by **+63%** (`16.42 -> 26.81 tok/s`); at `d=4096`, `-ctk q4_0 -ctv q4_0` sustains **`25.63 tok/s`** decode on Vulkan (**+61%**) and **`246.22 tok/s`** prefill on ROCm (**20.3x** vs Vulkan `-fa 1`).
+- Added `forge llm {discover,inspect,plan,autotune}` CLI commands and the **LLM Optimizer** tab in `Forge Desktop`.
+
 ### Added — Milestone 4C (AMD AMF VCN 3.0 Hardware Video Encode Benchmark)
 - Extended `crates/forge-runtime/src/amf.rs` with pure-Rust dynamic `amfrt64.dll` COM vtable bindings (`AMFVariantStruct` 24-byte x64 ABI, `AMFContext::AllocSurface`, `AMFComponent::{SetProperty,Init,Drain,SubmitInput,QueryOutput}`, `AMFData::{QueryInterface,Convert,SetPts,SetDuration}`, `AMFSurface::{GetPlanesCount,GetPlaneAt}`, `AMFPlane::{GetNative,GetWidth,GetHeight,GetHPitch}`, `AMFBuffer::{GetSize,GetNative}` with `AMFBuffer` IID `b04b7248-b6f0-4321-b691-baa4740f9fcb`) and `run_amf_encode_benchmark`:
   - Pre-allocates a 16-surface ring in `AMF_MEMORY_HOST`, fills moving synthetic `NV12` (8-bit) or `P010` (10-bit MSB-aligned `u16`) Y/UV planes, and converts all 16 surfaces to `AMF_MEMORY_DX11` VRAM textures via `AMFData::Convert(AMF_MEMORY_DX11)` prior to timing so CPU `memcpy` is excluded from VCN hardware encode measurements.

@@ -47,7 +47,7 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 
 ### `forge-profiler`
 - **`adlx_ffi`**: Pure-Rust `#[repr(C)]` COM vtable bindings matching ADLX `V1.4` C ABI (`IADLXSystem`, `IADLXGPUList`, `IADLXGPU`, `IADLXPerformanceMonitoringServices`, `IADLXGPUMetrics`), dynamically loading `amdadlx64.dll` via `libloading` without vendoring AMD SDK headers. Serializes process-global `ADLXInitialize`/`ADLXTerminate` lifecycle with a `Mutex<()>` and deterministically releases all child COM interfaces (including `IADLXGPUTuningServices`) before `ADLXTerminate()`.
-- **`adlx_tuning` & `tuning`**: Pure-Rust ADLX `V1.4` tuning COM bindings (`IADLXGPUTuningServices`, `IADLXGPUPresetTuning`, `IADLXManualPowerTuning(1)`, `IADLXManualGraphicsTuning2(_1)`, `IADLXManualVRAMTuning2(_1)`, `IADLXManualFanTuning(1)`, and `QueryInterface` fallback to base interfaces). Exposes strictly read-only `read_all_gpu_tuning()`, hardware-validated `IntRange` checks (`min..=max` & `step` alignment), and opt-in `set_gpu_power_limit` / `reset_gpu_tuning_to_factory` (dry-run by default; mutation gated behind explicit `dry_run = false` / `--apply`).
+- **`adlx_tuning` & `tuning`**: Pure-Rust ADLX `V1.4` tuning COM bindings (`IADLXGPUTuningServices`, `IADLXGPUPresetTuning`, `IADLXManualPowerTuning(1)`, `IADLXManualGraphicsTuning2(_1)`, `IADLXManualVRAMTuning2(_1)`, `IADLXManualFanTuning(1)`, and `QueryInterface` fallback to base interfaces). Exposes strictly read-only `read_all_gpu_tuning()`, both active (`GetFanTuningStates`) and VBIOS factory default (`GetDefaultFanTuningStates`) 5-point fan curves, external fan controller (`FanControl.exe` / flat PWM override) detection via Win32 `CreateToolhelp32Snapshot`, hardware-validated `IntRange` checks (`min..=max` & `step` alignment), and opt-in `set_gpu_power_limit` / `reset_gpu_tuning_to_factory` (dry-run by default; mutation gated behind explicit `dry_run = false` / `--apply`).
 - **`sampler` & `types`**: Exposes single-shot `snapshot_all_gpus()` / `snapshot_for_device()`, background `TelemetryGuard` sampling, `TELEMETRY_TABLE_HEADER` / `TELEMETRY_CSV_HEADER` / `MonitorRecord` streaming formatters, and automatic Windows WDDM VRAM pressure (>50% dedicated VRAM) and competing-workload (>20% usage) warnings.
 
 ### `forge-runtime`
@@ -62,12 +62,13 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 ### `forge-benchmark`
 - **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs.
 - **`memory`**: Captures process peak working set via Win32 `GetProcessMemoryInfo`.
-- **`vulkan_suite`**, **`video`**, **`llama`**, **`triton`**: Orchestrates reproducible compute, VCN hardware video encode (`run_video_benchmark_suite`), and LLM benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan and AMF VCN; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
+- **`vulkan_suite`**, **`video`**, **`llama`**, **`llm_optimizer`**, **`triton`**: Orchestrates reproducible compute, VCN hardware video encode (`run_video_benchmark_suite`), GGUF v2/v3 header inspection & anti-WDDM-spill VRAM planning (`inspect_gguf_model`, `plan_llm_configuration`, `autotune_llm_model`), and LLM benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan and AMF VCN; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
 
 ### `forge-cli`
 Thin CLI boundary (`clap` + `anyhow`) exposing:
 - `forge doctor [--json] [--verify] [--python]`
 - `forge video {caps [--json], bench [--codec all|h264|hevc|hevc10] [--width W] [--height H] [--fps F] [--bitrate-mbps M] [--preset speed|balanced|quality] [--warmup N] [--frames N] [--json] [--output PATH]}`
+- `forge llm {discover [--json], inspect [--model PATH] [--json], plan [--model PATH] [--context N] [--safety-margin-mib M] [--json] [--output PATH], autotune [--model PATH] [--vulkan-bin PATH] [--hip-bin PATH] [--rocm-lib-dir PATH] [--context-depth D] [--reps R] [--json] [--output PATH]}`
 - `forge monitor [--interval-ms N] [--count N] [--duration-secs S] [--device-id HEX] [--format table|jsonl|csv] [--output PATH]` (with Win32 `SetConsoleCtrlHandler` graceful termination and clean `ADLXTerminate`)
 - `forge tune {show [--device-id HEX] [--json], power-limit <PCT> [--device-id HEX] [--apply], reset [--device-id HEX] [--apply]}`
 - `forge bench {vulkan [--batch-dispatches N],llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
@@ -75,8 +76,8 @@ Thin CLI boundary (`clap` + `anyhow`) exposing:
 
 ### `forge-desktop`
 Optional Windows-native Tauri v2 + Edge WebView2 application (`apps/forge-desktop`) serving embedded vanilla ES assets (`ui/`) with zero `node_modules` dependencies:
-- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics`, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_video_benchmark`, `run_vulkan_benchmark`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations.
-- **`ui`**: Five views (`Overview`, `Monitor` with 4 rolling Canvas 2D strip charts, `Tuning` with fan-curve plot & explicit `Unlock Hardware Writes` confirmation gate, `Video (AMF)` with codec capabilities table & VCN hardware encode benchmark runner, and `Benchmarks`).
+- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics`, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_video_benchmark`, `run_vulkan_benchmark`, `get_llm_assets`, `get_llm_plan`, `run_llm_autotune`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations.
+- **`ui`**: Six views (`Overview`, `Monitor` with 4 rolling Canvas 2D strip charts, `Tuning` with active vs factory VBIOS fan-curve plot, external fan manager diagnostics & explicit `Unlock Hardware Writes` confirmation gate, `Video (AMF)` with codec capabilities table & VCN hardware encode benchmark runner, `Benchmarks`, and `LLM Optimizer` with GGUF header analysis, anti-WDDM-spill VRAM planner, RDNA2 tweak commands, and empirical autotuner).
 
 ---
 

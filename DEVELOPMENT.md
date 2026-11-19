@@ -83,9 +83,15 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 .\target\release\forge.exe monitor --format csv --duration-secs 5 --output ..\telemetry.csv
 .\target\release\forge.exe monitor --format jsonl --device-id 0x73AF --count 5
 
-# Read-only ADLX tuning inspector (ranges, defaults, fan curve, presets)
+# Read-only ADLX tuning inspector (ranges, defaults, active vs factory VBIOS fan curve, external fan manager diagnostics)
 .\target\release\forge.exe tune show
 .\target\release\forge.exe tune show --json
+
+# GGUF LLM Inspector, Anti-WDDM-Spill Memory Planner & RDNA2 Empirical Autotuner
+.\target\release\forge.exe llm discover
+.\target\release\forge.exe llm inspect
+.\target\release\forge.exe llm plan --context 4096
+.\target\release\forge.exe llm autotune --vulkan-bin ..\llama-vk\llama-bench.exe --hip-bin ..\llama-hip\llama-bench.exe --context-depth 2048 --reps 2 --output ..\llm_autotune.json
 
 # Range-validated power limit & factory reset (SAFE DRY-RUN by default; pass --apply to commit)
 .\target\release\forge.exe tune power-limit 5
