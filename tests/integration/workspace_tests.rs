@@ -6,8 +6,11 @@ use forge_core::{
     validate_kernel_execution, ForgeError, GfxTarget, GpuArchitecture, GpuDeviceInfo,
     HardwareProfile, KernelRequirements, AMD_PCI_VENDOR_ID,
 };
+use forge_profiler::{summarize_samples, GpuTelemetrySample};
 use forge_runtime::{
-    compile_wgsl_to_spirv, ref_gemm_f32, GEMM_F32_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
+    compile_wgsl_to_spirv, compile_wgsl_to_spirv_dp4a, ref_gemm_f32, spirv_contains_opcode,
+    GEMM_F32_TILED_VEC4_WGSL, GEMM_F32_WGSL, GEMM_I8_DP4A_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL,
+    SPIRV_OP_SDOT,
 };
 
 fn repo_root() -> PathBuf {
@@ -34,10 +37,54 @@ fn rx6900xt_profile_loads_and_validates() {
 
 #[test]
 fn wgsl_compute_shaders_compile_offline_to_spirv() {
-    for src in [GEMM_F32_WGSL, RMSNORM_F32_WGSL, ROPE_F32_WGSL] {
+    for src in [
+        GEMM_F32_WGSL,
+        GEMM_F32_TILED_VEC4_WGSL,
+        RMSNORM_F32_WGSL,
+        ROPE_F32_WGSL,
+    ] {
         let words = compile_wgsl_to_spirv(src).expect("shader must compile to SPIR-V");
         assert_eq!(words[0], 0x0723_0203);
     }
+
+    let dp4a = compile_wgsl_to_spirv_dp4a(GEMM_I8_DP4A_WGSL)
+        .expect("DP4A shader must compile to SPIR-V 1.6");
+    assert_eq!(dp4a[0], 0x0723_0203);
+    assert!(
+        spirv_contains_opcode(&dp4a, SPIRV_OP_SDOT),
+        "DP4A shader must emit native OpSDot (4450)"
+    );
+}
+
+#[test]
+fn profiler_summary_detects_wddm_vram_pressure_and_competing_load() {
+    let pre = GpuTelemetrySample {
+        gpu_name: "Synthetic RDNA2 GPU".to_string(),
+        pci_device_id: Some(0x73AF),
+        discrete: true,
+        total_vram_mib: Some(16368),
+        timestamp_ms: Some(100),
+        gpu_usage_pct: Some(35.0),
+        gpu_clock_mhz: Some(1200),
+        vram_clock_mhz: Some(1986),
+        gpu_temp_c: Some(45.0),
+        hotspot_temp_c: Some(52.0),
+        gpu_power_w: Some(80.0),
+        board_power_w: None,
+        fan_rpm: Some(1100),
+        vram_used_mib: Some(14000),
+        voltage_mv: Some(900),
+    };
+    let summary = summarize_samples(&[pre.clone()], 250, Some(&pre)).unwrap();
+    assert_eq!(summary.warnings.len(), 2);
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|w| w.contains("WDDM VRAM occupancy")));
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|w| w.contains("Competing GPU workload")));
 }
 
 #[test]

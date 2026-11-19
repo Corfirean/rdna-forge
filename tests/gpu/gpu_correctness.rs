@@ -1,8 +1,12 @@
+use std::time::Duration;
+
 use forge_core::{validate_kernel_execution, ForgeError, KernelRequirements, AMD_PCI_VENDOR_ID};
 use forge_device::discover_gpus;
+use forge_profiler::{snapshot_all_gpus, TelemetryGuard};
 use forge_runtime::{
-    compare_slices, deterministic_f32_data, ref_gemm_f32_exact_f64, ref_rmsnorm_f32, ref_rope_f32,
-    verify_hip_transfer, VulkanComputeEngine,
+    compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
+    pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32,
+    ref_rmsnorm_f32, ref_rope_f32, verify_hip_transfer, VulkanComputeEngine,
 };
 
 #[test]
@@ -163,4 +167,88 @@ fn vulkan_repeated_workload_stability() {
     assert_eq!(rms_timings.len(), 50);
     let acc_r = compare_slices(&rms_out, &expected_rms, 1e-4, 1e-4).unwrap();
     assert!(acc_r.passed && acc_r.all_finite);
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn adlx_live_telemetry_reads_discrete_amd_gpu() {
+    let samples = snapshot_all_gpus().expect("ADLX snapshot should succeed on AMD Windows host");
+    let discrete = samples
+        .iter()
+        .find(|s| s.discrete)
+        .expect("expected a discrete AMD GPU telemetry sample");
+    assert!(discrete.total_vram_mib.unwrap_or(0) > 0);
+    assert!(discrete.gpu_temp_c.is_some());
+    assert!(discrete.gpu_power_w.is_some());
+
+    let guard = TelemetryGuard::start(discrete.pci_device_id, Duration::from_millis(80))
+        .expect("ADLX TelemetryGuard should initialize");
+    std::thread::sleep(Duration::from_millis(250));
+    let summary = guard
+        .stop_and_summarize()
+        .expect("TelemetryGuard should collect at least one sample");
+    assert!(summary.sample_count >= 1);
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_gemm_tiled_vec4_edge_cases_and_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+
+    for (m, k, n) in [
+        (1u32, 1u32, 1u32),
+        (37, 53, 29),
+        (129, 257, 65),
+        (256, 256, 256),
+    ] {
+        let a = deterministic_f32_data((m * k) as usize, 311 + m as u64);
+        let b = deterministic_f32_data((k * n) as usize, 412 + n as u64);
+        let (actual, _timing) = engine
+            .run_gemm_f32_tiled_vec4(&a, &b, m, k, n)
+            .unwrap_or_else(|e| panic!("Tiled vec4 GEMM {m}x{k}x{n} failed: {e}"));
+        let expected = ref_gemm_f32_exact_f64(&a, &b, m as usize, k as usize, n as usize).unwrap();
+        let acc = compare_slices(&actual, &expected, 1e-2, 1e-3).unwrap();
+        assert!(
+            acc.passed,
+            "Tiled vec4 GEMM {m}x{k}x{n} accuracy failed: max_abs={:.3e}, rmse={:.3e}",
+            acc.max_abs_err, acc.rmse
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn vulkan_gemm_i8_dp4a_exact_integer_validation() {
+    let engine = VulkanComputeEngine::new(0).expect("Vulkan compute engine init");
+    assert!(
+        engine.supports_int8_dp4a(),
+        "expected Vulkan 1.3 shader_integer_dot_product on RX 6900 XT"
+    );
+
+    for (m, k, n) in [
+        (1u32, 4u32, 1u32),
+        (37, 52, 29),
+        (129, 256, 65),
+        (256, 256, 256),
+    ] {
+        let a = deterministic_i8_data((m * k) as usize, 501 + m as u64);
+        let b = deterministic_i8_data((k * n) as usize, 602 + n as u64);
+        let a_packed = pack_i8_row_major_k4(&a, m as usize, k as usize).unwrap();
+        let b_t_packed = pack_i8_b_transposed_k4(&b, k as usize, n as usize).unwrap();
+        let (actual, _timing) = engine
+            .run_gemm_i8_dp4a(&a_packed, &b_t_packed, m, k / 4, n)
+            .unwrap_or_else(|e| panic!("INT8 DP4A GEMM {m}x{k}x{n} failed: {e}"));
+        let expected = ref_gemm_i8_to_i32(&a, &b, m as usize, k as usize, n as usize).unwrap();
+        let acc = compare_i32_exact(&actual, &expected).unwrap();
+        assert!(
+            acc.passed && acc.max_abs_err == 0.0,
+            "INT8 DP4A GEMM {m}x{k}x{n} must be bit-exact, got max_abs={}",
+            acc.max_abs_err
+        );
+    }
+
+    assert!(matches!(
+        pack_i8_row_major_k4(&[1, 2, 3], 1, 3),
+        Err(ForgeError::InvalidDimension(_))
+    ));
 }
