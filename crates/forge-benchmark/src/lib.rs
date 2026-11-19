@@ -1,4 +1,5 @@
 pub mod llama;
+pub mod llm_optimizer;
 pub mod memory;
 pub mod stats;
 pub mod triton;
@@ -8,6 +9,12 @@ pub mod vulkan_suite;
 pub use llama::{
     parse_llama_bench_json, run_llama_comparison, BackendRunOutcome, LlamaBenchConfig,
     LlamaBenchEntry, LlamaComparisonReport,
+};
+pub use llm_optimizer::{
+    autotune_llm_model, discover_local_llm_assets, estimate_kv_and_state_bytes,
+    gguf_file_type_name, inspect_gguf_model, plan_llm_configuration, GgufModelMetadata,
+    KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult, LlmAutotuneConfig,
+    LlmAutotuneReport, LlmOptimizationPlan, LlmTweakProfile, LocalLlmAssets,
 };
 pub use memory::peak_process_rss_bytes;
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
@@ -161,5 +168,48 @@ mod tests {
         let parsed = parse_triton_suite_json(sample).unwrap();
         assert_eq!(parsed.provenance.gcn_arch_name.as_deref(), Some("gfx1030"));
         assert_eq!(parsed.benchmarks[0].status, "unsupported");
+    }
+
+    #[test]
+    fn gguf_file_type_and_kv_budget_estimator_work() {
+        assert_eq!(
+            gguf_file_type_name(Some(30), "Huihui-Qwen3.8-27B-UD-IQ4_XS.gguf"),
+            "UD-IQ4_XS"
+        );
+        assert_eq!(gguf_file_type_name(Some(15), "model.gguf"), "Q4_K_M");
+
+        let meta = GgufModelMetadata {
+            file_path: "Qwen3.8-27B-UD-IQ4_XS.gguf".to_string(),
+            file_name: "Qwen3.8-27B-UD-IQ4_XS.gguf".to_string(),
+            file_size_bytes: 14_403_496_864,
+            gguf_version: 3,
+            tensor_count: 866,
+            kv_count: 50,
+            architecture: "qwen35".to_string(),
+            model_name: Some("Qwen3.8-27B".to_string()),
+            size_label: Some("27B".to_string()),
+            quantized_by: Some("Unsloth".to_string()),
+            file_type_code: Some(30),
+            quantization_name: "UD-IQ4_XS".to_string(),
+            block_count: 65,
+            nextn_predict_layers: 1,
+            declared_context_length: 262_144,
+            embedding_length: 5120,
+            feed_forward_length: Some(17408),
+            head_count: 24,
+            head_count_kv: 4,
+            key_length: 256,
+            value_length: 256,
+            full_attention_interval: Some(4),
+            ssm_state_size: Some(128),
+            ssm_inner_size: Some(6144),
+            ssm_group_count: Some(16),
+            bytes_per_layer: 14_403_496_864 / 65,
+        };
+
+        let f16_bytes = estimate_kv_and_state_bytes(&meta, 4096, KvCacheQuant::F16);
+        let q8_bytes = estimate_kv_and_state_bytes(&meta, 4096, KvCacheQuant::Q8_0);
+        let q4_bytes = estimate_kv_and_state_bytes(&meta, 4096, KvCacheQuant::Q4_0);
+        assert!(f16_bytes > q8_bytes && q8_bytes > q4_bytes);
     }
 }
