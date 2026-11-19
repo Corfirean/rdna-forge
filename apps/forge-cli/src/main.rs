@@ -168,6 +168,12 @@ struct TritonBenchArgs {
     warmup: usize,
     #[arg(long, default_value_t = 50)]
     iters: usize,
+    /// Run lightweight 256x256 accuracy verification without heavy full-size GPU sweeps.
+    #[arg(long)]
+    smoke: bool,
+    /// Opt-in pre/post ADLX snapshot around Python ROCm/Triton execution.
+    #[arg(long)]
+    telemetry: bool,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -796,6 +802,8 @@ fn cmd_bench_triton(args: &TritonBenchArgs) -> Result<()> {
         script_path,
         warmup_iters: args.warmup,
         measured_iters: args.iters,
+        smoke: args.smoke,
+        collect_telemetry: args.telemetry,
     };
 
     let report = run_triton_suite(&config).context("Triton suite failed")?;

@@ -17,6 +17,10 @@ pub struct TritonBenchConfig {
     pub script_path: PathBuf,
     pub warmup_iters: usize,
     pub measured_iters: usize,
+    #[serde(default)]
+    pub smoke: bool,
+    #[serde(default)]
+    pub collect_telemetry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,17 +101,26 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
         )));
     }
 
-    let primary_device_id = discover_gpus().first().map(|g| g.device_id);
-    // Avoid polling ADLX in a background thread concurrently with ROCm/HIP JIT & execution.
-    let (output_res, telemetry) = run_with_pre_post_telemetry(primary_device_id, || {
-        Command::new(&config.python_exe)
-            .arg(&config.script_path)
-            .arg("--warmup")
-            .arg(config.warmup_iters.to_string())
-            .arg("--iters")
-            .arg(config.measured_iters.to_string())
-            .output()
-    });
+    let run_cmd = || {
+        let mut cmd = Command::new(&config.python_exe);
+        cmd.arg(&config.script_path);
+        if config.smoke {
+            cmd.arg("--smoke");
+        } else {
+            cmd.arg("--warmup")
+                .arg(config.warmup_iters.to_string())
+                .arg("--iters")
+                .arg(config.measured_iters.to_string());
+        }
+        cmd.output()
+    };
+
+    let (output_res, telemetry) = if config.collect_telemetry {
+        let primary_device_id = discover_gpus().first().map(|g| g.device_id);
+        run_with_pre_post_telemetry(primary_device_id, run_cmd)
+    } else {
+        (run_cmd(), None)
+    };
     let output = output_res.map_err(|e| ForgeError::RuntimeUnavailable {
         runtime: "Python/Triton".to_string(),
         reason: format!("failed to launch '{}': {e}", config.python_exe.display()),
