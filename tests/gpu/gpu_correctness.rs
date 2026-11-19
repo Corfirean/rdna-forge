@@ -11,7 +11,8 @@ use forge_runtime::{
     deterministic_q4_0_weights, deterministic_q4_k_weights, pack_i8_b_transposed_k4,
     pack_i8_row_major_k4, probe_amf_capabilities, ref_flash_attention_f32, ref_gemm_f32_exact_f64,
     ref_gemm_i8_to_i32, ref_gemv_q4_0_f32, ref_gemv_q4_k_f32, ref_gemv_w8a32_f32, ref_rmsnorm_f32,
-    ref_rmsnorm_rope_f32, ref_rope_f32, verify_hip_transfer, AmfAcceleration, AmfCodecDirection,
+    ref_rmsnorm_rope_f32, ref_rope_f32, run_amf_encode_benchmark, verify_hip_transfer,
+    AmfAcceleration, AmfCodecDirection, AmfEncodeBenchConfig, AmfEncodeCodec, AmfQualityPreset,
     VulkanComputeEngine,
 };
 
@@ -579,4 +580,48 @@ fn vulkan_flash_attention_wave32_causal_and_full_validation() {
         ),
         Err(ForgeError::InvalidDimension(_))
     ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn amf_live_vcn_hardware_encode_produces_valid_annex_b_bitstreams() {
+    for codec in [
+        AmfEncodeCodec::H264Avc,
+        AmfEncodeCodec::Hevc,
+        AmfEncodeCodec::Hevc10Bit,
+    ] {
+        let cfg = AmfEncodeBenchConfig {
+            codec,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            target_bitrate_bps: 8_000_000,
+            preset: AmfQualityPreset::Speed,
+            warmup_frames: 5,
+            measured_frames: 30,
+        };
+        let res = run_amf_encode_benchmark(&cfg)
+            .unwrap_or_else(|e| panic!("VCN live encode failed for {codec}: {e}"));
+        assert_eq!(res.submitted_frames, 30);
+        assert_eq!(
+            res.output_packets, 30,
+            "expected 30 output packets for {codec}, got {}",
+            res.output_packets
+        );
+        assert!(
+            res.total_encoded_bytes > 512,
+            "expected non-trivial encoded byte stream for {codec}, got {} B",
+            res.total_encoded_bytes
+        );
+        assert!(
+            res.valid_annex_b,
+            "expected valid Annex-B NAL start code (00 00 00 01 / 00 00 01) for {codec}"
+        );
+        assert!(res.encode_fps > 30.0, "encode_fps={}", res.encode_fps);
+        assert!(
+            res.megapixels_per_sec > 20.0,
+            "megapixels_per_sec={}",
+            res.megapixels_per_sec
+        );
+    }
 }

@@ -222,6 +222,7 @@ fn forge_cli_help_and_profile_show_succeed() {
         &["tune", "--help"][..],
         &["tune", "power-limit", "--help"][..],
         &["video", "caps", "--help"][..],
+        &["video", "bench", "--help"][..],
     ] {
         let out = Command::new(bin)
             .args(args)
