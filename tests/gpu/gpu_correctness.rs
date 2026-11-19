@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use forge_core::{validate_kernel_execution, ForgeError, KernelRequirements, AMD_PCI_VENDOR_ID};
 use forge_device::discover_gpus;
-use forge_profiler::{snapshot_all_gpus, TelemetryGuard};
+use forge_profiler::{
+    read_all_gpu_tuning, reset_gpu_tuning_to_factory, set_gpu_power_limit, snapshot_all_gpus,
+    TelemetryGuard,
+};
 use forge_runtime::{
     compare_i32_exact, compare_slices, deterministic_f32_data, deterministic_i8_data,
     pack_i8_b_transposed_k4, pack_i8_row_major_k4, ref_gemm_f32_exact_f64, ref_gemm_i8_to_i32,
@@ -251,4 +254,48 @@ fn vulkan_gemm_i8_dp4a_exact_integer_validation() {
         pack_i8_row_major_k4(&[1, 2, 3], 1, 3),
         Err(ForgeError::InvalidDimension(_))
     ));
+}
+
+#[test]
+#[ignore = "requires physical AMD GPU"]
+fn adlx_live_tuning_read_only_inspects_discrete_amd_gpu() {
+    let reports = read_all_gpu_tuning().expect("ADLX tuning read must succeed on AMD Windows host");
+    let discrete = reports
+        .iter()
+        .find(|r| r.discrete)
+        .expect("expected a discrete AMD GPU in ADLX tuning report");
+
+    assert!(discrete.capabilities.manual_power);
+    assert!(discrete.capabilities.manual_gfx);
+    assert!(discrete.capabilities.manual_vram);
+    assert!(discrete.capabilities.manual_fan);
+
+    let pwr = discrete.power.as_ref().expect("power tuning info");
+    let pwr_range = pwr.power_limit_range.expect("power limit range");
+    assert!(pwr_range.is_valid());
+    assert!(pwr_range.validate(0, "power_limit_pct").is_ok());
+
+    let gfx = discrete.gfx.as_ref().expect("GFX tuning info");
+    assert!(gfx.max_freq_range.is_some_and(|r| r.is_valid()));
+
+    let vram = discrete.vram.as_ref().expect("VRAM tuning info");
+    assert!(vram.max_freq_range.is_some_and(|r| r.is_valid()));
+
+    let fan = discrete.fan.as_ref().expect("fan tuning info");
+    assert!(fan.speed_range_pct.is_some_and(|r| r.is_valid()));
+
+    // Dry-run ONLY — never mutates user GPU tuning settings during automated tests.
+    let dry_res = set_gpu_power_limit(discrete.pci_device_id, 0, true)
+        .expect("dry-run power-limit check should succeed for 0%");
+    assert!(!dry_res.applied);
+    assert!(dry_res.verified_limit_pct.is_none());
+
+    assert!(matches!(
+        set_gpu_power_limit(discrete.pci_device_id, 999, true),
+        Err(ForgeError::InvalidParameter(_))
+    ));
+
+    let reset_dry = reset_gpu_tuning_to_factory(discrete.pci_device_id, true)
+        .expect("dry-run factory reset check should succeed");
+    assert!(!reset_dry.applied);
 }

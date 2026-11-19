@@ -194,7 +194,21 @@ fn forge_cli_help_and_profile_show_succeed() {
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("bench"));
+    assert!(stdout.contains("monitor"));
+    assert!(stdout.contains("tune"));
     assert!(stdout.contains("profile"));
+
+    for args in [
+        &["monitor", "--help"][..],
+        &["tune", "--help"][..],
+        &["tune", "power-limit", "--help"][..],
+    ] {
+        let out = Command::new(bin)
+            .args(args)
+            .output()
+            .expect("subcommand --help must execute");
+        assert!(out.status.success(), "help failed for {args:?}");
+    }
 
     let profile_path = repo_root().join("profiles/gfx1030/rx6900xt.toml");
     let prof_out = Command::new(bin)
