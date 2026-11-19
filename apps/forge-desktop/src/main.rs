@@ -1,0 +1,32 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod commands;
+
+use commands::{
+    get_diagnostics, get_telemetry_snapshot, get_tuning_report, get_video_caps, reset_tuning,
+    run_live_verification, run_vulkan_benchmark, set_power_limit, AppState,
+};
+use tracing_subscriber::EnvFilter;
+
+fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    tauri::Builder::default()
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            get_diagnostics,
+            run_live_verification,
+            get_telemetry_snapshot,
+            get_tuning_report,
+            set_power_limit,
+            reset_tuning,
+            get_video_caps,
+            run_vulkan_benchmark,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running RDNA Forge Desktop");
+}
