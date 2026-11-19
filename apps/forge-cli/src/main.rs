@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
-    autotune_llm_model, discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes,
-    plan_llm_configuration, resolve_default_triton_script, run_llama_comparison, run_triton_suite,
-    run_video_benchmark_suite, run_vulkan_suite, LlamaBenchConfig, LlmAutotuneConfig,
+    apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
+    discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes, plan_llm_configuration,
+    resolve_default_triton_script, run_llama_comparison, run_triton_suite,
+    run_video_benchmark_suite, run_vulkan_suite, KvCacheQuant, LlamaBenchConfig, LlmAutotuneConfig,
     TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
 };
 use forge_core::{
@@ -331,6 +332,69 @@ enum LlmSubcommand {
     Plan(LlmPlanArgs),
     /// Run empirical llama-bench autotuning across Vulkan/ROCm RDNA2 tweak profiles.
     Autotune(LlmAutotuneArgs),
+    /// Preview (dry-run default) or patch LM Studio per-model config and backend preferences (with .bak backup).
+    ApplyLmstudio(LlmApplyLmstudioArgs),
+    /// Preview (dry-run default) or apply Windows/Ollama user environment variables (HKCU\Environment) & Modelfile.
+    ApplyEnv(LlmApplyEnvArgs),
+}
+
+#[derive(Debug, Args)]
+struct LlmApplyLmstudioArgs {
+    /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Profile ID to apply (e.g. vulkan_wddm_priority, rocm_q4_kv_long_ctx, vulkan_q4_kv_decode, vulkan_strict_zero_spill).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Target context window in tokens.
+    #[arg(long, default_value_t = 4096)]
+    context: u32,
+    /// Safety VRAM margin in MiB.
+    #[arg(long, default_value_t = 512)]
+    safety_margin_mib: u64,
+    /// Actually write changes to LM Studio JSON configs (creates .bak backup first). Defaults to dry-run preview.
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum KvQuantChoice {
+    F16,
+    Q8_0,
+    Q4_0,
+}
+
+impl From<KvQuantChoice> for KvCacheQuant {
+    fn from(value: KvQuantChoice) -> Self {
+        match value {
+            KvQuantChoice::F16 => Self::F16,
+            KvQuantChoice::Q8_0 => Self::Q8_0,
+            KvQuantChoice::Q4_0 => Self::Q4_0,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct LlmApplyEnvArgs {
+    /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Target context window in tokens for the generated Ollama Modelfile.
+    #[arg(long, default_value_t = 4096)]
+    context: u32,
+    /// KV cache quantization type for OLLAMA_KV_CACHE_TYPE.
+    #[arg(long, value_enum, default_value_t = KvQuantChoice::Q8_0)]
+    kv_quant: KvQuantChoice,
+    /// Optional path to write the generated Ollama Modelfile.
+    #[arg(long)]
+    modelfile_out: Option<PathBuf>,
+    /// Actually commit environment variables to HKCU\Environment and write Modelfile. Defaults to dry-run preview.
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -421,6 +485,8 @@ fn main() -> Result<()> {
             LlmSubcommand::Inspect { model, json } => cmd_llm_inspect(model.as_deref(), json),
             LlmSubcommand::Plan(args) => cmd_llm_plan(&args),
             LlmSubcommand::Autotune(args) => cmd_llm_autotune(&args),
+            LlmSubcommand::ApplyLmstudio(args) => cmd_llm_apply_lmstudio(&args),
+            LlmSubcommand::ApplyEnv(args) => cmd_llm_apply_env(&args),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -1146,6 +1212,12 @@ fn cmd_llm_inspect(model: Option<&Path>, json: bool) -> Result<()> {
             interval, meta.ssm_state_size, meta.ssm_inner_size
         );
     }
+    if meta.is_moe {
+        println!(
+            "  Mixture-of-Experts (MoE): {:?} routed experts ({:?} active/token, expert_ffn={:?})",
+            meta.expert_count, meta.expert_used_count, meta.expert_feed_forward_length
+        );
+    }
     Ok(())
 }
 
@@ -1361,6 +1433,92 @@ fn cmd_llm_autotune(args: &LlmAutotuneArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_llm_apply_lmstudio(args: &LlmApplyLmstudioArgs) -> Result<()> {
+    let model_path = resolve_target_gguf_path(args.model.as_deref())?;
+    let res = apply_lm_studio_config(
+        &model_path,
+        args.profile.as_deref(),
+        args.context,
+        args.safety_margin_mib,
+        !args.apply,
+    )
+    .context("failed to build/apply LM Studio configuration")?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+        return Ok(());
+    }
+
+    let mode = if res.applied { "APPLIED" } else { "DRY-RUN" };
+    println!(
+        "[{mode}] LM STUDIO CONFIGURATION PATCHER — {}",
+        res.profile_title
+    );
+    println!("  Profile ID: {}", res.profile_id);
+    println!("  LM Studio Engine: {}", res.selected_lmstudio_backend);
+    println!("  Model Config File: {}", res.model_config_path);
+    if let Some(ref bak) = res.model_config_backup_path {
+        println!("  Model Config Backup: {bak}");
+    }
+    println!("  Backend Prefs File: {}", res.backend_prefs_path);
+    if let Some(ref bak) = res.backend_prefs_backup_path {
+        println!("  Backend Prefs Backup: {bak}");
+    }
+    println!(
+        "  Settings: context={}, offload={}, flash_attn={}, kv={}/{}, threads={}, disable_igpu={}",
+        res.context_length,
+        res.offload_ratio,
+        res.flash_attention,
+        res.cache_type_k,
+        res.cache_type_v,
+        res.cpu_threads,
+        res.disabled_igpu
+    );
+    if !res.applied {
+        println!("  No file was modified (dry-run preview). Pass --apply to write config files with .bak backup.");
+    }
+    Ok(())
+}
+
+fn cmd_llm_apply_env(args: &LlmApplyEnvArgs) -> Result<()> {
+    let model_path = resolve_target_gguf_path(args.model.as_deref())?;
+    let res = apply_windows_and_ollama_env_tweaks(
+        &model_path,
+        args.context,
+        args.kv_quant.into(),
+        args.modelfile_out.as_deref(),
+        !args.apply,
+    )
+    .context("failed to build/apply Windows & Ollama environment tweaks")?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+        return Ok(());
+    }
+
+    let mode = if res.applied { "APPLIED" } else { "DRY-RUN" };
+    println!("[{mode}] WINDOWS USER ENVIRONMENT (HKCU\\Environment) & OLLAMA TWEAKS");
+    for c in &res.env_changes {
+        println!(
+            "  {:<34} : {:<10} -> {}",
+            c.key,
+            c.previous_value.as_deref().unwrap_or("(unset)"),
+            c.new_value
+        );
+    }
+    println!();
+    println!("GENERATED OLLAMA MODELFILE");
+    for line in res.ollama_modelfile_content.lines() {
+        println!("  {line}");
+    }
+    println!("  Import Cmd: {}", res.ollama_create_cmd);
+    if !res.applied {
+        println!();
+        println!("  No registry variable or file was modified (dry-run preview). Pass --apply to commit.");
+    }
+    Ok(())
+}
+
 fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {
     let profile = HardwareProfile::from_file(path)
         .with_context(|| format!("failed to load profile '{}'", path.display()))?;
@@ -1548,6 +1706,48 @@ mod tests {
             } => {
                 assert_eq!(args.context, 8192);
                 assert_eq!(args.safety_margin_mib, 512);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let llm_lms = Cli::try_parse_from([
+            "forge",
+            "llm",
+            "apply-lmstudio",
+            "--profile",
+            "vulkan_wddm_priority",
+            "--context",
+            "4096",
+        ])
+        .expect("llm apply-lmstudio args must parse");
+        match llm_lms.command {
+            Commands::Llm {
+                action: LlmSubcommand::ApplyLmstudio(args),
+            } => {
+                assert_eq!(args.profile.as_deref(), Some("vulkan_wddm_priority"));
+                assert_eq!(args.context, 4096);
+                assert!(!args.apply, "apply-lmstudio must default to dry-run");
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let llm_env = Cli::try_parse_from([
+            "forge",
+            "llm",
+            "apply-env",
+            "--kv-quant",
+            "q4-0",
+            "--context",
+            "8192",
+        ])
+        .expect("llm apply-env args must parse");
+        match llm_env.command {
+            Commands::Llm {
+                action: LlmSubcommand::ApplyEnv(args),
+            } => {
+                assert_eq!(args.kv_quant, KvQuantChoice::Q4_0);
+                assert_eq!(args.context, 8192);
+                assert!(!args.apply, "apply-env must default to dry-run");
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }

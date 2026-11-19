@@ -226,6 +226,8 @@ fn forge_cli_help_and_profile_show_succeed() {
         &["llm", "--help"][..],
         &["llm", "plan", "--help"][..],
         &["llm", "autotune", "--help"][..],
+        &["llm", "apply-lmstudio", "--help"][..],
+        &["llm", "apply-env", "--help"][..],
     ] {
         let out = Command::new(bin)
             .args(args)
