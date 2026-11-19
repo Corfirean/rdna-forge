@@ -287,6 +287,12 @@ fn adlx_live_tuning_read_only_inspects_discrete_amd_gpu() {
 
     let fan = discrete.fan.as_ref().expect("fan tuning info");
     assert!(fan.speed_range_pct.is_some_and(|r| r.is_valid()));
+    assert_eq!(fan.fan_curve.len(), 5, "expected 5 ADLX fan curve points");
+    assert_eq!(
+        fan.default_fan_curve.len(),
+        5,
+        "expected 5 ADLX factory default fan curve points"
+    );
 
     // Dry-run ONLY — never mutates user GPU tuning settings during automated tests.
     let dry_res = set_gpu_power_limit(discrete.pci_device_id, 0, true)

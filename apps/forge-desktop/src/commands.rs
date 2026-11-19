@@ -1,8 +1,11 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use forge_benchmark::{
-    run_video_benchmark_suite, run_vulkan_suite, VideoBenchReport, VideoBenchSuiteConfig,
+    autotune_llm_model, discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration,
+    run_video_benchmark_suite, run_vulkan_suite, LlmAutotuneConfig, LlmAutotuneReport,
+    LlmOptimizationPlan, LocalLlmAssets, VideoBenchReport, VideoBenchSuiteConfig,
     VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
 };
 use forge_core::{CapabilityResult, DiagnosticReport, SupportStatus};
@@ -246,6 +249,27 @@ impl DesktopVideoBenchRequest {
     }
 }
 
+/// Request payload for static GGUF inspection and anti-WDDM-spill VRAM planning in the LLM Optimizer view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopLlmPlanRequest {
+    pub model_path: Option<String>,
+    pub context_tokens: u32,
+    pub safety_margin_mib: u64,
+}
+
+/// Request payload for empirical `llama-bench` RDNA2 autotuning in the LLM Optimizer view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopLlmAutotuneRequest {
+    pub model_path: Option<String>,
+    pub vulkan_bin: Option<String>,
+    pub hip_bin: Option<String>,
+    pub rocm_lib_dir: Option<String>,
+    pub prompt_tokens: u32,
+    pub gen_tokens: u32,
+    pub context_depth: u32,
+    pub reps: u32,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -441,6 +465,79 @@ pub async fn run_video_benchmark(
     })
     .await
     .map_err(|e| format!("VCN video benchmark task failed: {e}"))?
+}
+
+fn resolve_desktop_model_path(explicit: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(s));
+    }
+    let assets = discover_local_llm_assets();
+    assets
+        .gguf_models
+        .first()
+        .map(PathBuf::from)
+        .ok_or_else(|| "No local .gguf model found. Specify a path to a .gguf file.".to_string())
+}
+
+#[tauri::command]
+pub async fn get_llm_assets() -> Result<LocalLlmAssets, String> {
+    tauri::async_runtime::spawn_blocking(discover_local_llm_assets)
+        .await
+        .map_err(|e| format!("LLM asset discovery task failed: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_llm_plan(request: DesktopLlmPlanRequest) -> Result<LlmOptimizationPlan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = resolve_desktop_model_path(request.model_path.as_deref())?;
+        let meta = inspect_gguf_model(&path).map_err(|e| e.to_string())?;
+        plan_llm_configuration(
+            &meta,
+            request.context_tokens.clamp(512, 262_144),
+            request.safety_margin_mib.clamp(0, 4096),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("LLM plan task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn run_llm_autotune(
+    state: State<'_, AppState>,
+    request: DesktopLlmAutotuneRequest,
+) -> Result<LlmAutotuneReport, String> {
+    let guard = state.acquire_gpu("LLM autotuner")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
+        let assets = discover_local_llm_assets();
+        let non_empty = |opt: Option<String>| -> Option<PathBuf> {
+            opt.map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        };
+        let vulkan_bin =
+            non_empty(request.vulkan_bin).or_else(|| assets.vulkan_bench_bin.map(PathBuf::from));
+        let hip_bin =
+            non_empty(request.hip_bin).or_else(|| assets.hip_bench_bin.map(PathBuf::from));
+        let rocm_lib_dir =
+            non_empty(request.rocm_lib_dir).or_else(|| assets.rocm_lib_dir.map(PathBuf::from));
+
+        let cfg = LlmAutotuneConfig {
+            model_path,
+            vulkan_bin,
+            hip_bin,
+            rocm_lib_dir,
+            prompt_tokens: request.prompt_tokens.clamp(32, 2048),
+            gen_tokens: request.gen_tokens.clamp(16, 512),
+            context_depth: request.context_depth.clamp(0, 32_768),
+            reps: request.reps.clamp(1, 5),
+        };
+        autotune_llm_model(&cfg).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("LLM autotuner task failed: {e}"))?
 }
 
 #[cfg(test)]

@@ -3,8 +3,9 @@
 mod commands;
 
 use commands::{
-    get_diagnostics, get_telemetry_snapshot, get_tuning_report, get_video_caps, reset_tuning,
-    run_live_verification, run_video_benchmark, run_vulkan_benchmark, set_power_limit, AppState,
+    get_diagnostics, get_llm_assets, get_llm_plan, get_telemetry_snapshot, get_tuning_report,
+    get_video_caps, reset_tuning, run_live_verification, run_llm_autotune, run_video_benchmark,
+    run_vulkan_benchmark, set_power_limit, AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -27,6 +28,9 @@ fn main() {
             get_video_caps,
             run_video_benchmark,
             run_vulkan_benchmark,
+            get_llm_assets,
+            get_llm_plan,
+            run_llm_autotune,
         ])
         .run(tauri::generate_context!())
         .expect("error while running RDNA Forge Desktop");

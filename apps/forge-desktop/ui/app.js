@@ -1,4 +1,12 @@
-import { patchMonitor, renderBenchmarks, renderMonitor, renderOverview, renderTuning, renderVideo } from "./views.js";
+import {
+  patchMonitor,
+  renderBenchmarks,
+  renderLlmOptimizer,
+  renderMonitor,
+  renderOverview,
+  renderTuning,
+  renderVideo,
+} from "./views.js";
 
 const VIEW_TITLES = {
   overview: "Overview",
@@ -6,6 +14,7 @@ const VIEW_TITLES = {
   tuning: "Tuning",
   video: "Video (AMF)",
   benchmarks: "Benchmarks",
+  llm: "LLM Optimizer",
 };
 
 const CSV_HEADER =
@@ -76,6 +85,22 @@ const state = {
   runningBench: false,
   benchReport: null,
   benchError: null,
+
+  llmAssets: null,
+  llmForm: {
+    model_path: "",
+    context_tokens: 4096,
+    safety_margin_mib: 512,
+    vulkan_bin: "",
+    hip_bin: "",
+    context_depth: 2048,
+  },
+  loadingLlmPlan: false,
+  llmPlan: null,
+  llmError: null,
+  runningLlmAutotune: false,
+  llmAutotuneReport: null,
+  llmAutotuneError: null,
 };
 
 function invokeCommand(cmd, args) {
@@ -187,6 +212,9 @@ function renderActiveView() {
       break;
     case "benchmarks":
       renderBenchmarks(root, state, actions);
+      break;
+    case "llm":
+      renderLlmOptimizer(root, state, actions);
       break;
     default:
       break;
@@ -600,7 +628,100 @@ const actions = {
       "application/json"
     );
   },
+
+  updateLlmField: (key, value, autoRefresh) => {
+    state.llmForm[key] = value;
+    if (autoRefresh) {
+      refreshLlmPlan();
+    }
+  },
+  refreshLlmPlan,
+  runLlmAutotune,
+  copyLlmCommand: (cmdText) => {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(cmdText).then(
+        () => setStatusNote("Copied RDNA2 llama-server launch command to clipboard."),
+        () => setStatusNote("Clipboard copy failed; select and copy command text manually.")
+      );
+    }
+  },
+  exportLlmPlanJson: () => {
+    if (!state.llmPlan) return;
+    downloadTextFile(
+      "rdna-forge-llm-plan.json",
+      JSON.stringify(state.llmPlan, null, 2),
+      "application/json"
+    );
+  },
 };
+
+async function refreshLlmPlan() {
+  if (state.loadingLlmPlan) return;
+  state.loadingLlmPlan = true;
+  state.llmError = null;
+  if (state.activeTab === "llm") renderActiveView();
+
+  try {
+    if (!state.llmAssets) {
+      state.llmAssets = await invokeCommand("get_llm_assets");
+      if (!state.llmForm.model_path && state.llmAssets.gguf_models?.length > 0) {
+        state.llmForm.model_path = state.llmAssets.gguf_models[0];
+      }
+      if (!state.llmForm.vulkan_bin && state.llmAssets.vulkan_bench_bin) {
+        state.llmForm.vulkan_bin = state.llmAssets.vulkan_bench_bin;
+      }
+      if (!state.llmForm.hip_bin && state.llmAssets.hip_bench_bin) {
+        state.llmForm.hip_bin = state.llmAssets.hip_bench_bin;
+      }
+    }
+    state.llmPlan = await invokeCommand("get_llm_plan", {
+      request: {
+        model_path: state.llmForm.model_path || null,
+        context_tokens: Number(state.llmForm.context_tokens) || 4096,
+        safety_margin_mib: Number(state.llmForm.safety_margin_mib) || 512,
+      },
+    });
+    setStatusNote(`Analyzed GGUF model '${state.llmPlan.model.file_name}'.`);
+  } catch (err) {
+    state.llmError = String(err);
+  } finally {
+    state.loadingLlmPlan = false;
+    if (state.activeTab === "llm") renderActiveView();
+  }
+}
+
+async function runLlmAutotune() {
+  if (state.runningLlmAutotune || state.busyOp) return;
+  state.runningLlmAutotune = true;
+  state.busyOp = true;
+  state.llmAutotuneError = null;
+  setStatusNote("Running empirical llama-bench RDNA2 autotuner...");
+  renderActiveView();
+
+  try {
+    state.llmAutotuneReport = await invokeCommand("run_llm_autotune", {
+      request: {
+        model_path: state.llmForm.model_path || null,
+        vulkan_bin: state.llmForm.vulkan_bin || null,
+        hip_bin: state.llmForm.hip_bin || null,
+        rocm_lib_dir: state.llmAssets?.rocm_lib_dir || null,
+        prompt_tokens: 128,
+        gen_tokens: 32,
+        context_depth: Number(state.llmForm.context_depth) || 2048,
+        reps: 2,
+      },
+    });
+    setStatusNote(
+      `Empirical autotuning finished. Best balanced profile: ${state.llmAutotuneReport.best_balanced_profile_id || "n/a"}`
+    );
+  } catch (err) {
+    state.llmAutotuneError = String(err);
+  } finally {
+    state.runningLlmAutotune = false;
+    state.busyOp = false;
+    renderActiveView();
+  }
+}
 
 function switchTab(tab) {
   if (!VIEW_TITLES[tab]) return;
@@ -611,6 +732,8 @@ function switchTab(tab) {
     refreshTuning();
   } else if (tab === "video" && !state.videoCaps && !state.loadingVideo) {
     refreshVideoCaps();
+  } else if (tab === "llm" && !state.llmPlan && !state.loadingLlmPlan) {
+    refreshLlmPlan();
   } else if (tab === "monitor") {
     pollTelemetryOnce();
   }
@@ -636,7 +759,7 @@ function init() {
 
   window.addEventListener("keydown", (e) => {
     if (!e.altKey) return;
-    const tabs = ["overview", "monitor", "tuning", "video", "benchmarks"];
+    const tabs = ["overview", "monitor", "tuning", "video", "benchmarks", "llm"];
     const idx = Number(e.key) - 1;
     if (idx >= 0 && idx < tabs.length) {
       e.preventDefault();

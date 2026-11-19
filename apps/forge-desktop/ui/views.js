@@ -818,18 +818,30 @@ export function renderTuning(root, state, actions) {
   if (!fan) {
     fanContent.appendChild(el("div", { className: "muted-text" }, "Manual fan control is not exposed for this adapter."));
   } else {
+    const pwmMode =
+      fan.flat_pwm_override_pct != null
+        ? `Flat Override (${fan.flat_pwm_override_pct}% across all 5 points)`
+        : "5-Point Curve";
     fanContent.appendChild(
       makeKvTable([
         ["Zero-RPM State", fan.zero_rpm_supported ? `${fan.zero_rpm_enabled ? "Enabled" : "Disabled"} (default ${fan.zero_rpm_default})` : "Unsupported"],
-        ["Min Acoustic Limit", fan.min_acoustic_limit_mhz != null ? `${fan.min_acoustic_limit_mhz} MHz` : "n/a"],
+        ["External Fan Manager", fan.external_controller || "None detected"],
+        ["ADLX PWM Mode", pwmMode],
         ["Fan Speed Range", fmtRange(fan.speed_range_pct, "%")],
         ["Temperature Range", fmtRange(fan.temp_range_c, "C")],
       ])
     );
 
+    if (fan.fan_note) {
+      fanContent.appendChild(
+        el("div", { className: "banner banner-warn", style: "margin-top:8px;margin-bottom:4px" }, fan.fan_note)
+      );
+    }
+
     if (fan.fan_curve && fan.fan_curve.length > 0) {
       const fanCanvas = el("canvas", { className: "fan-canvas", style: "margin-top:10px" });
       fanContent.appendChild(fanCanvas);
+      const defCurve = fan.default_fan_curve || [];
       fanContent.appendChild(
         el(
           "table",
@@ -837,24 +849,35 @@ export function renderTuning(root, state, actions) {
           el(
             "thead",
             {},
-            el("tr", {}, el("th", {}, "Point"), el("th", { className: "num" }, "Temperature"), el("th", { className: "num" }, "Fan PWM"))
+            el(
+              "tr",
+              {},
+              el("th", {}, "Point"),
+              el("th", { className: "num" }, "Temperature"),
+              el("th", { className: "num" }, "Active ADLX PWM"),
+              el("th", { className: "num" }, "Factory VBIOS PWM")
+            )
           ),
           el(
             "tbody",
             {},
-            fan.fan_curve.map((pt, idx) =>
-              el(
+            fan.fan_curve.map((pt, idx) => {
+              const defPt = defCurve[idx];
+              return el(
                 "tr",
                 {},
                 el("td", { className: "mono muted-text" }, `P${idx + 1}`),
                 el("td", { className: "num mono" }, `${pt.temp_c} C`),
-                el("td", { className: "num mono" }, `${pt.speed_pct} %`)
-              )
-            )
+                el("td", { className: "num mono" }, `${pt.speed_pct} %`),
+                el("td", { className: "num mono muted-text" }, defPt ? `${defPt.speed_pct} % (${defPt.temp_c} C)` : "--")
+              );
+            })
           )
         )
       );
-      requestAnimationFrame(() => drawFanCurveChart(fanCanvas, fan.fan_curve, fan.temp_range_c, fan.speed_range_pct));
+      requestAnimationFrame(() =>
+        drawFanCurveChart(fanCanvas, fan.fan_curve, fan.temp_range_c, fan.speed_range_pct, defCurve)
+      );
     }
   }
 
@@ -1513,6 +1536,479 @@ export function renderBenchmarks(root, state, actions) {
           ["All Finite / Correct", `${st.all_finite} / ${st.all_correct}`],
           ["Median Latency", `${st.latency.median_ms.toFixed(4)} ms`],
         ])
+      )
+    );
+  }
+}
+
+/* ---------------- LLM OPTIMIZER TAB ---------------- */
+
+export function renderLlmOptimizer(root, state, actions) {
+  root.replaceChildren();
+  const form = state.llmForm || {
+    model_path: "",
+    context_tokens: 4096,
+    safety_margin_mib: 512,
+    context_depth: 2048,
+    prompt_tokens: 128,
+    gen_tokens: 32,
+  };
+  const assets = state.llmAssets || { gguf_models: [] };
+
+  const modelControls = el(
+    "div",
+    { className: "form-row" },
+    el(
+      "div",
+      { className: "form-field", style: "flex:1;min-width:260px" },
+      el("label", { className: "field-label" }, "Discovered Local GGUF Model"),
+      assets.gguf_models.length > 0
+        ? el(
+            "select",
+            {
+              className: "select-input mono",
+              style: "width:100%",
+              disabled: state.loadingLlmPlan || state.runningLlmAutotune,
+              onChange: (e) => actions.updateLlmField("model_path", e.target.value, true),
+            },
+            assets.gguf_models.map((p) => {
+              const parts = p.split(/[\\/]/);
+              const shortName = parts[parts.length - 1] || p;
+              return el(
+                "option",
+                { value: p, selected: form.model_path === p },
+                shortName
+              );
+            })
+          )
+        : el("input", {
+            type: "text",
+            className: "text-input mono",
+            style: "width:100%",
+            placeholder: "C:\\path\\to\\model.gguf",
+            value: form.model_path || "",
+            onChange: (e) => actions.updateLlmField("model_path", e.target.value, false),
+          })
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Target Context"),
+      el(
+        "select",
+        {
+          className: "select-input mono",
+          disabled: state.loadingLlmPlan || state.runningLlmAutotune,
+          onChange: (e) => actions.updateLlmField("context_tokens", Number(e.target.value), true),
+        },
+        [2048, 4096, 8192, 16384, 32768].map((ctx) =>
+          el("option", { value: String(ctx), selected: Number(form.context_tokens) === ctx }, `${ctx} tokens`)
+        )
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Safety Margin (MiB)"),
+      el("input", {
+        type: "number",
+        className: "text-input mono",
+        style: "width:84px",
+        min: "0",
+        max: "4096",
+        disabled: state.loadingLlmPlan || state.runningLlmAutotune,
+        value: String(form.safety_margin_mib),
+        onChange: (e) => actions.updateLlmField("safety_margin_mib", Number(e.target.value), true),
+      })
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-primary",
+          disabled: state.loadingLlmPlan || state.runningLlmAutotune,
+          onClick: actions.refreshLlmPlan,
+        },
+        state.loadingLlmPlan ? "Analyzing GGUF..." : "Analyze & Plan VRAM"
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: !state.llmPlan,
+          onClick: actions.exportLlmPlanJson,
+        },
+        "Export Plan JSON"
+      )
+    )
+  );
+
+  root.appendChild(
+    makePanel(
+      "GGUF Model Selector & Anti-WDDM-Spill Planner",
+      "Reads GGUF v2/v3 header & live ADLX VRAM occupancy to prevent silent Windows PCIe spilling",
+      modelControls
+    )
+  );
+
+  if (state.llmError) {
+    root.appendChild(el("div", { className: "banner banner-err" }, state.llmError));
+  }
+
+  const plan = state.llmPlan;
+  if (!plan) {
+    root.appendChild(
+      el(
+        "div",
+        { className: "empty-state" },
+        state.loadingLlmPlan
+          ? "Inspecting GGUF model header and live ADLX WDDM VRAM..."
+          : "Select a local GGUF model and click 'Analyze & Plan VRAM' to calculate non-spilling GPU layer budgets and RDNA2 tweaks."
+      )
+    );
+    return;
+  }
+
+  for (const w of plan.warnings || []) {
+    root.appendChild(el("div", { className: "banner banner-warn" }, w));
+  }
+
+  const m = plan.model;
+  const gib = (m.file_size_bytes / (1024 ** 3)).toFixed(2);
+  const mibPerLayer = (m.bytes_per_layer / (1024 ** 2)).toFixed(1);
+
+  root.appendChild(
+    el(
+      "div",
+      { className: "kpi-strip" },
+      el(
+        "div",
+        { className: "kpi-tile" },
+        el("div", { className: "kpi-label" }, "Model & Quant"),
+        el("div", { className: "kpi-value" }, m.model_name || m.file_name),
+        el("div", { className: "kpi-sub" }, `${m.quantization_name} (${gib} GiB)`)
+      ),
+      el(
+        "div",
+        { className: "kpi-tile" },
+        el("div", { className: "kpi-label" }, "Architecture & Layers"),
+        el("div", { className: "kpi-value" }, `${m.architecture} (${m.block_count}L)`),
+        el(
+          "div",
+          { className: "kpi-sub" },
+          m.full_attention_interval
+            ? `Hybrid SSM+Attn (1/${m.full_attention_interval} full attn, ~${mibPerLayer} MiB/L)`
+            : `~${mibPerLayer} MiB/layer`
+        )
+      ),
+      el(
+        "div",
+        { className: "kpi-tile" },
+        el("div", { className: "kpi-label" }, "Free Physical VRAM"),
+        el("div", { className: "kpi-value" }, `${plan.free_vram_mib} MiB`),
+        el("div", { className: "kpi-sub" }, `Used: ${plan.used_vram_mib} / ${plan.total_vram_mib} MiB`)
+      ),
+      el(
+        "div",
+        { className: "kpi-tile" },
+        el("div", { className: "kpi-label" }, "VRAM App Recovery"),
+        el("div", { className: "kpi-value" }, `+${plan.recoverable_layers_if_apps_closed} layers`),
+        el("div", { className: "kpi-sub" }, `Physical CPU Threads: -t ${plan.physical_cpu_cores}`)
+      )
+    )
+  );
+
+  // KV Cache Memory Budget Table
+  const kvRows = (plan.kv_budgets || []).map((b) =>
+    el(
+      "tr",
+      {},
+      el("td", { className: "mono" }, b.kv_quant),
+      el("td", { className: "mono" }, b.requires_flash_attn ? "-fa 1 required" : "optional"),
+      el("td", { className: "num mono" }, `${b.model_weights_mib} MiB`),
+      el("td", { className: "num mono" }, `${b.kv_and_state_mib} MiB`),
+      el("td", { className: "num mono" }, `${b.total_required_mib} MiB`),
+      el(
+        "td",
+        {},
+        b.fits_in_free_vram
+          ? el("span", { className: "badge badge-ok" }, "FITS FREE VRAM")
+          : el("span", { className: "badge badge-warn" }, "EXCEEDS FREE VRAM")
+      ),
+      el(
+        "td",
+        {},
+        b.fits_with_wddm_memory_priority
+          ? el("span", { className: "badge badge-ok" }, "FITS WITH PRIO=1")
+          : el("span", { className: "badge badge-warn" }, "PARTIAL OFFLOAD")
+      ),
+      el(
+        "td",
+        { className: "num mono" },
+        `${b.strict_zero_spill_ngl} / ${b.memory_priority_ngl} of ${m.block_count}`
+      )
+    )
+  );
+
+  root.appendChild(
+    makePanel(
+      `KV Cache & VRAM Fit Analysis (@ ${plan.target_context_tokens} Context Tokens)`,
+      "Strict NGL fits unallocated VRAM; Priority NGL uses GGML_VK_ENABLE_MEMORY_PRIORITY=1",
+      el(
+        "div",
+        { className: "data-table-wrap" },
+        el(
+          "table",
+          { className: "data-table" },
+          el(
+            "thead",
+            {},
+            el(
+              "tr",
+              {},
+              el("th", {}, "KV Cache Type"),
+              el("th", {}, "Flash Attention"),
+              el("th", { className: "num" }, "Weights"),
+              el("th", { className: "num" }, "KV + SSM State"),
+              el("th", { className: "num" }, "Total Required"),
+              el("th", {}, "Unallocated VRAM Fit"),
+              el("th", {}, "WDDM Priority=1 Fit"),
+              el("th", { className: "num" }, "Strict / Prio NGL")
+            )
+          ),
+          el("tbody", {}, kvRows)
+        )
+      ),
+      true
+    )
+  );
+
+  // Recommended RDNA2 Profiles & One-Click Copy Commands
+  const profileCards = (plan.recommended_profiles || []).map((p) => {
+    const envStr = (p.env_vars || []).map(([k, v]) => `${k}=${v}`).join(" | ") || "none";
+    return el(
+      "div",
+      {
+        style:
+          "border:1px solid #2a2e35;background:#16181b;padding:10px 12px;margin-bottom:8px;display:flex;flex-direction:column;gap:6px",
+      },
+      el(
+        "div",
+        { style: "display:flex;justify-content:space-between;align-items:center;gap:12px" },
+        el("strong", { style: "color:#e6e8ec;font-size:12.5px" }, p.title),
+        el(
+          "div",
+          { style: "display:flex;gap:6px;align-items:center" },
+          el("span", { className: "badge badge-ok mono" }, `${p.backend.toUpperCase()} (${p.device_selector})`),
+          el("span", { className: "badge badge-idle mono" }, `ngl=${p.n_gpu_layers}`),
+          el("span", { className: "badge badge-idle mono" }, `fa=${p.flash_attn ? "on" : "off"}`),
+          el("span", { className: "badge badge-idle mono" }, `kv=${p.cache_type_k}/${p.cache_type_v}`),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn",
+              onClick: () => actions.copyLlmCommand(p.llama_server_cmd),
+            },
+            "Copy Launch Cmd"
+          )
+        )
+      ),
+      el("div", { className: "muted-text", style: "font-size:11.5px;line-height:1.4" }, p.rationale),
+      el("div", { className: "mono muted-text", style: "font-size:11px" }, `Env Tweaks: ${envStr}`),
+      el(
+        "pre",
+        {
+          className: "mono",
+          style:
+            "margin:2px 0 0 0;padding:7px 9px;background:#111214;border:1px solid #24272d;font-size:11px;overflow-x:auto;color:#cfd4dc",
+        },
+        p.llama_server_cmd
+      )
+    );
+  });
+
+  root.appendChild(
+    makePanel(
+      `Verified AMD RDNA2 (${plan.gfx_target}) Tweaks & Launch Profiles`,
+      `${plan.gpu_name}`,
+      el("div", {}, profileCards)
+    )
+  );
+
+  // LM Studio Checklist
+  if (plan.lm_studio_tips && plan.lm_studio_tips.length > 0) {
+    root.appendChild(
+      makePanel(
+        "LM Studio & Local Launcher Optimization Checklist",
+        "Applies directly to your installed LM Studio 2.73.0 Vulkan & ROCm backends",
+        el(
+          "div",
+          { style: "display:flex;flex-direction:column;gap:6px" },
+          plan.lm_studio_tips.map((tip) =>
+            el("div", { style: "font-size:12px;line-height:1.45;color:#cfd4dc" }, tip)
+          )
+        )
+      )
+    );
+  }
+
+  // Empirical llama-bench Autotuner Card
+  const autotuneControls = el(
+    "div",
+    { className: "form-row" },
+    el(
+      "div",
+      { className: "form-field", style: "flex:1;min-width:210px" },
+      el("label", { className: "field-label" }, "Vulkan llama-bench.exe Path"),
+      el("input", {
+        type: "text",
+        className: "text-input mono",
+        style: "width:100%",
+        placeholder: "Path to Vulkan llama-bench.exe",
+        disabled: state.runningLlmAutotune,
+        value: form.vulkan_bin || "",
+        onChange: (e) => actions.updateLlmField("vulkan_bin", e.target.value, false),
+      })
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "flex:1;min-width:210px" },
+      el("label", { className: "field-label" }, "ROCm/HIP llama-bench.exe Path (Optional)"),
+      el("input", {
+        type: "text",
+        className: "text-input mono",
+        style: "width:100%",
+        placeholder: "Path to ROCm llama-bench.exe",
+        disabled: state.runningLlmAutotune,
+        value: form.hip_bin || "",
+        onChange: (e) => actions.updateLlmField("hip_bin", e.target.value, false),
+      })
+    ),
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "Context Depth (-d)"),
+      el(
+        "select",
+        {
+          className: "select-input mono",
+          disabled: state.runningLlmAutotune,
+          onChange: (e) => actions.updateLlmField("context_depth", Number(e.target.value), false),
+        },
+        [0, 1024, 2048, 4096].map((d) =>
+          el("option", { value: String(d), selected: Number(form.context_depth) === d }, `d=${d}`)
+        )
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-primary",
+          disabled: state.runningLlmAutotune || state.busyOp,
+          onClick: actions.runLlmAutotune,
+        },
+        state.runningLlmAutotune ? "Autotuning Model..." : "Run Empirical Autotune"
+      )
+    )
+  );
+
+  root.appendChild(
+    makePanel(
+      "Empirical llama-bench Autotuner",
+      "Benchmarks Baseline vs WDDM Priority=1 (-fa 0) vs Q4_0 KV Cache at selected context depth",
+      autotuneControls
+    )
+  );
+
+  if (state.llmAutotuneError) {
+    root.appendChild(el("div", { className: "banner banner-err" }, state.llmAutotuneError));
+  }
+
+  const autoRep = state.llmAutotuneReport;
+  if (autoRep && Array.isArray(autoRep.candidates)) {
+    const arows = autoRep.candidates.map((c) => {
+      const isWinner = c.profile_id === autoRep.best_balanced_profile_id;
+      return el(
+        "tr",
+        {},
+        el(
+          "td",
+          { className: "mono" },
+          c.profile_id,
+          isWinner ? el("span", { className: "badge badge-ok", style: "margin-left:6px" }, "WINNER") : null,
+          el("div", { className: "sub-detail" }, c.title)
+        ),
+        el("td", { className: "mono" }, c.backend.toUpperCase()),
+        el("td", { className: "mono" }, c.flash_attn ? "on" : "off"),
+        el("td", { className: "mono" }, `${c.cache_type_k}/${c.cache_type_v}`),
+        el("td", { className: "mono muted-text" }, c.env_summary),
+        el("td", { className: "num mono" }, c.pp_tok_s != null ? `${c.pp_tok_s.toFixed(2)} tok/s` : "ERR"),
+        el("td", { className: "num mono" }, c.tg_tok_s != null ? `${c.tg_tok_s.toFixed(2)} tok/s` : "ERR"),
+        el(
+          "td",
+          { className: "num mono" },
+          c.tg_speedup_vs_baseline != null ? `${c.tg_speedup_vs_baseline.toFixed(2)}x` : "n/a"
+        ),
+        el(
+          "td",
+          {},
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn",
+              onClick: () => actions.copyLlmCommand(c.llama_server_cmd),
+            },
+            "Copy Cmd"
+          )
+        )
+      );
+    });
+
+    root.appendChild(
+      makePanel(
+        `Empirical Autotune Results (pp${autoRep.prompt_tokens} + tg${autoRep.gen_tokens} @ d=${autoRep.context_depth})`,
+        `Best Balanced: ${autoRep.best_balanced_profile_id || "n/a"}`,
+        el(
+          "div",
+          { className: "data-table-wrap" },
+          el(
+            "table",
+            { className: "data-table" },
+            el(
+              "thead",
+              {},
+              el(
+                "tr",
+                {},
+                el("th", {}, "Profile"),
+                el("th", {}, "Backend"),
+                el("th", {}, "FA"),
+                el("th", {}, "KV Cache"),
+                el("th", {}, "Env Tweaks"),
+                el("th", { className: "num" }, "Prefill (pp)"),
+                el("th", { className: "num" }, "Decode (tg)"),
+                el("th", { className: "num" }, "TG Speedup"),
+                el("th", {}, "Launch")
+              )
+            ),
+            el("tbody", {}, arows)
+          )
+        ),
+        true
       )
     );
   }

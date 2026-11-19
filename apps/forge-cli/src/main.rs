@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
-    peak_process_rss_bytes, resolve_default_triton_script, run_llama_comparison, run_triton_suite,
-    run_video_benchmark_suite, run_vulkan_suite, LlamaBenchConfig, TritonBenchConfig,
-    VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
+    autotune_llm_model, discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes,
+    plan_llm_configuration, resolve_default_triton_script, run_llama_comparison, run_triton_suite,
+    run_video_benchmark_suite, run_vulkan_suite, LlamaBenchConfig, LlmAutotuneConfig,
+    TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
 };
 use forge_core::{
     CapabilityResult, DiagnosticReport, GpuDeviceInfo, HardwareProfile, SupportStatus,
@@ -58,6 +59,11 @@ enum Commands {
     Video {
         #[command(subcommand)]
         action: VideoSubcommand,
+    },
+    /// Inspect GGUF models, calculate anti-WDDM-spill VRAM budgets, and autotune llama.cpp for RDNA2.
+    Llm {
+        #[command(subcommand)]
+        action: LlmSubcommand,
     },
     /// Inspect and validate hardware target profiles.
     Profile {
@@ -306,6 +312,76 @@ enum ProfileSubcommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum LlmSubcommand {
+    /// Discover local GGUF models and llama.cpp Vulkan/ROCm backends on this PC.
+    Discover {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a GGUF v2/v3 model header (architecture, layers, attention/SSM hybrid structure).
+    Inspect {
+        /// Path to the .gguf model file (or omit to inspect the first discovered local GGUF model).
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Calculate anti-WDDM-spill VRAM budgets, KV cache quantization savings, and RDNA2 tweaks.
+    Plan(LlmPlanArgs),
+    /// Run empirical llama-bench autotuning across Vulkan/ROCm RDNA2 tweak profiles.
+    Autotune(LlmAutotuneArgs),
+}
+
+#[derive(Debug, Args)]
+struct LlmPlanArgs {
+    /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Target context window in tokens.
+    #[arg(long, default_value_t = 4096)]
+    context: u32,
+    /// Safety VRAM margin in MiB reserved against Windows WDDM background spikes.
+    #[arg(long, default_value_t = 512)]
+    safety_margin_mib: u64,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct LlmAutotuneArgs {
+    /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Optional path to Vulkan llama-bench.exe.
+    #[arg(long)]
+    vulkan_bin: Option<PathBuf>,
+    /// Optional path to ROCm/HIP llama-bench.exe.
+    #[arg(long)]
+    hip_bin: Option<PathBuf>,
+    /// Optional path to ROCm runtime DLL directory containing hipblas.dll / rocblas.dll.
+    #[arg(long)]
+    rocm_lib_dir: Option<PathBuf>,
+    /// Prompt tokens per probe pass.
+    #[arg(long, default_value_t = 128)]
+    prompt_tokens: u32,
+    /// Generated tokens per probe pass.
+    #[arg(long, default_value_t = 32)]
+    gen_tokens: u32,
+    /// Pre-filled KV cache context depth in tokens (-d) to test WDDM spill & attention scaling.
+    #[arg(long, default_value_t = 2048)]
+    context_depth: u32,
+    /// Repetitions per candidate profile.
+    #[arg(long, default_value_t = 2)]
+    reps: u32,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
 fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt()
@@ -339,6 +415,12 @@ fn main() -> Result<()> {
         Commands::Video { action } => match action {
             VideoSubcommand::Caps { json } => cmd_video_caps(json),
             VideoSubcommand::Bench(args) => cmd_video_bench(&args),
+        },
+        Commands::Llm { action } => match action {
+            LlmSubcommand::Discover { json } => cmd_llm_discover(json),
+            LlmSubcommand::Inspect { model, json } => cmd_llm_inspect(model.as_deref(), json),
+            LlmSubcommand::Plan(args) => cmd_llm_plan(&args),
+            LlmSubcommand::Autotune(args) => cmd_llm_autotune(&args),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -969,6 +1051,316 @@ fn cmd_video_bench(args: &VideoBenchArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_target_gguf_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    let assets = discover_local_llm_assets();
+    if let Some(first) = assets.gguf_models.first() {
+        Ok(PathBuf::from(first))
+    } else {
+        anyhow::bail!("no local .gguf model found automatically; pass --model <PATH_TO_MODEL.gguf>")
+    }
+}
+
+fn cmd_llm_discover(json: bool) -> Result<()> {
+    let assets = discover_local_llm_assets();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&assets)?);
+        return Ok(());
+    }
+
+    println!("RDNA FORGE LOCAL LLM ASSET DISCOVERY");
+    println!("  Discovered GGUF Models ({}):", assets.gguf_models.len());
+    if assets.gguf_models.is_empty() {
+        println!("    (none found in .lmstudio/models or standard directories)");
+    } else {
+        for m in &assets.gguf_models {
+            println!("    - {m}");
+        }
+    }
+    println!(
+        "  Vulkan llama-server: {}",
+        assets.vulkan_server_bin.as_deref().unwrap_or("not found")
+    );
+    println!(
+        "  ROCm/HIP llama-server: {}",
+        assets.hip_server_bin.as_deref().unwrap_or("not found")
+    );
+    println!(
+        "  ROCm Runtime DLL Dir (hipblas.dll): {}",
+        assets.rocm_lib_dir.as_deref().unwrap_or("not found")
+    );
+    Ok(())
+}
+
+fn cmd_llm_inspect(model: Option<&Path>, json: bool) -> Result<()> {
+    let path = resolve_target_gguf_path(model)?;
+    let meta = inspect_gguf_model(&path)
+        .with_context(|| format!("failed to inspect GGUF model '{}'", path.display()))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&meta)?);
+        return Ok(());
+    }
+
+    println!("RDNA FORGE GGUF MODEL INSPECTOR");
+    println!(
+        "  File: {} ({:.2} GiB / {} MiB)",
+        meta.file_name,
+        gib(meta.file_size_bytes),
+        meta.file_size_bytes.div_ceil(1024 * 1024)
+    );
+    println!("  Path: {}", meta.file_path);
+    println!(
+        "  Model: {} ({}) | Quant: {} (quantized by {})",
+        meta.model_name.as_deref().unwrap_or("unknown"),
+        meta.size_label.as_deref().unwrap_or("n/a"),
+        meta.quantization_name,
+        meta.quantized_by.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  GGUF: v{} | Tensors: {} | Architecture: {}",
+        meta.gguf_version, meta.tensor_count, meta.architecture
+    );
+    println!(
+        "  Layers: {} blocks (+{} MTP) | ~{:.1} MiB/layer | Declared Max Context: {} tokens",
+        meta.block_count,
+        meta.nextn_predict_layers,
+        meta.bytes_per_layer as f64 / (1024.0 * 1024.0),
+        meta.declared_context_length
+    );
+    println!(
+        "  Dimensions: embd={}, ffn={}, heads={} (kv={}), head_dim=({}/{})",
+        meta.embedding_length,
+        meta.feed_forward_length
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        meta.head_count,
+        meta.head_count_kv,
+        meta.key_length,
+        meta.value_length
+    );
+    if let Some(interval) = meta.full_attention_interval {
+        println!(
+            "  Hybrid SSM/Attention: full attention every {} layers (ssm_state={:?}, ssm_inner={:?})",
+            interval, meta.ssm_state_size, meta.ssm_inner_size
+        );
+    }
+    Ok(())
+}
+
+fn cmd_llm_plan(args: &LlmPlanArgs) -> Result<()> {
+    let path = resolve_target_gguf_path(args.model.as_deref())?;
+    let meta = inspect_gguf_model(&path)
+        .with_context(|| format!("failed to inspect GGUF model '{}'", path.display()))?;
+    let plan = plan_llm_configuration(&meta, args.context, args.safety_margin_mib)
+        .context("failed to build LLM optimization plan")?;
+    let json_text = serde_json::to_string_pretty(&plan)?;
+    write_optional_output(args.output.as_deref(), &json_text)?;
+
+    if args.json {
+        println!("{json_text}");
+        return Ok(());
+    }
+
+    println!("RDNA FORGE LLM OPTIMIZATION & ANTI-WDDM-SPILL PLAN");
+    println!(
+        "  Model: {} ({}, {:.2} GiB, {} layers, arch={})",
+        plan.model.file_name,
+        plan.model.quantization_name,
+        gib(plan.model.file_size_bytes),
+        plan.model.block_count,
+        plan.model.architecture
+    );
+    println!(
+        "  Target GPU: {} ({}) | Physical CPU Cores: {}",
+        plan.gpu_name, plan.gfx_target, plan.physical_cpu_cores
+    );
+    println!(
+        "  Live WDDM VRAM: Total={} MiB | Used={} MiB | Free={} MiB | Safety Margin={} MiB",
+        plan.total_vram_mib, plan.used_vram_mib, plan.free_vram_mib, plan.safety_margin_mib
+    );
+    if plan.recoverable_layers_if_apps_closed > 0 {
+        println!(
+            "  VRAM Recovery Potential: Closing background apps holding VRAM recovers up to +{} GPU layer(s).",
+            plan.recoverable_layers_if_apps_closed
+        );
+    }
+
+    if !plan.warnings.is_empty() {
+        println!();
+        println!("WARNINGS & HARDWARE TRAPS");
+        for w in &plan.warnings {
+            println!("  ! {w}");
+        }
+    }
+
+    println!();
+    println!(
+        "KV CACHE & VRAM BUDGETS (@ {} context tokens)",
+        plan.target_context_tokens
+    );
+    println!(
+        "  {:<8} {:<8} {:<12} {:<11} {:<11} {:<13} {:<14} {:<12}",
+        "KV Type",
+        "Req FA",
+        "Weights(MiB)",
+        "KV+SSM(MiB)",
+        "Total(MiB)",
+        "FreeVRAM Fit",
+        "WDDM Prio Fit",
+        "Strict/Prio NGL"
+    );
+    for b in &plan.kv_budgets {
+        println!(
+            "  {:<8} {:<8} {:<12} {:<11} {:<11} {:<13} {:<14} {}/{}/{}",
+            b.kv_quant,
+            if b.requires_flash_attn { "yes" } else { "no" },
+            b.model_weights_mib,
+            b.kv_and_state_mib,
+            b.total_required_mib,
+            if b.fits_in_free_vram {
+                "YES"
+            } else {
+                "OVERFLOW"
+            },
+            if b.fits_with_wddm_memory_priority {
+                "YES (Prio=1)"
+            } else {
+                "PARTIAL"
+            },
+            b.strict_zero_spill_ngl,
+            b.memory_priority_ngl,
+            plan.model.block_count
+        );
+    }
+
+    println!();
+    println!("RECOMMENDED RDNA2 EXECUTION PROFILES");
+    for (idx, p) in plan.recommended_profiles.iter().enumerate() {
+        println!(
+            "  [{}] {} (backend={}, dev={}, ngl={}, fa={}, kv={}/{})",
+            idx + 1,
+            p.title,
+            p.backend,
+            p.device_selector,
+            p.n_gpu_layers,
+            p.flash_attn,
+            p.cache_type_k,
+            p.cache_type_v
+        );
+        println!("      Why: {}", p.rationale);
+        println!("      Cmd: {}", p.llama_server_cmd);
+    }
+
+    println!();
+    println!("LM STUDIO & LAUNCHER CHECKLIST");
+    for tip in &plan.lm_studio_tips {
+        println!("  {tip}");
+    }
+
+    Ok(())
+}
+
+fn cmd_llm_autotune(args: &LlmAutotuneArgs) -> Result<()> {
+    let model_path = resolve_target_gguf_path(args.model.as_deref())?;
+    let assets = discover_local_llm_assets();
+    let vulkan_bin = args
+        .vulkan_bin
+        .clone()
+        .or_else(|| assets.vulkan_bench_bin.map(PathBuf::from));
+    let hip_bin = args
+        .hip_bin
+        .clone()
+        .or_else(|| assets.hip_bench_bin.map(PathBuf::from));
+    let rocm_lib_dir = args
+        .rocm_lib_dir
+        .clone()
+        .or_else(|| assets.rocm_lib_dir.map(PathBuf::from));
+
+    let cfg = LlmAutotuneConfig {
+        model_path,
+        vulkan_bin,
+        hip_bin,
+        rocm_lib_dir,
+        prompt_tokens: args.prompt_tokens,
+        gen_tokens: args.gen_tokens,
+        context_depth: args.context_depth,
+        reps: args.reps,
+    };
+
+    let report = autotune_llm_model(&cfg).context("failed to execute LLM empirical autotuner")?;
+    let json_text = serde_json::to_string_pretty(&report)?;
+    write_optional_output(args.output.as_deref(), &json_text)?;
+
+    if args.json {
+        println!("{json_text}");
+        return Ok(());
+    }
+
+    println!("RDNA FORGE EMPIRICAL LLM AUTOTUNER REPORT");
+    println!(
+        "  Model: {} ({}, {:.2} GiB) | Probe: pp{} + tg{} @ depth d={}",
+        report.plan.model.file_name,
+        report.plan.model.quantization_name,
+        gib(report.plan.model.file_size_bytes),
+        report.prompt_tokens,
+        report.gen_tokens,
+        report.context_depth
+    );
+    println!();
+    println!(
+        "  {:<28} {:<7} {:<4} {:<10} {:<14} {:<14} {:<10}",
+        "Profile ID", "Backend", "FA", "KV Cache", "Prefill(tok/s)", "Decode(tok/s)", "TG Speedup"
+    );
+    for c in &report.candidates {
+        let pp = c
+            .pp_tok_s
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "ERR".to_string());
+        let tg = c
+            .tg_tok_s
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "ERR".to_string());
+        let spd = c
+            .tg_speedup_vs_baseline
+            .map(|v| format!("{v:.2}x"))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!(
+            "  {:<28} {:<7} {:<4} {:<10} {:<14} {:<14} {:<10}",
+            c.profile_id,
+            c.backend,
+            if c.flash_attn { "on" } else { "off" },
+            format!("{}/{}", c.cache_type_k, c.cache_type_v),
+            pp,
+            tg,
+            spd
+        );
+    }
+
+    println!();
+    println!(
+        "  Winner (Fastest Token Generation): {}",
+        report.best_decode_profile_id.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  Winner (Fastest Prompt Ingestion): {}",
+        report.best_prefill_profile_id.as_deref().unwrap_or("n/a")
+    );
+    println!(
+        "  Winner (Best Overall Balanced):    {}",
+        report.best_balanced_profile_id.as_deref().unwrap_or("n/a")
+    );
+    if let Some(best_id) = &report.best_balanced_profile_id {
+        if let Some(best) = report.candidates.iter().find(|c| &c.profile_id == best_id) {
+            println!("  Recommended Command:");
+            println!("    {}", best.llama_server_cmd);
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {
     let profile = HardwareProfile::from_file(path)
         .with_context(|| format!("failed to load profile '{}'", path.display()))?;
@@ -1144,6 +1536,18 @@ mod tests {
                 assert_eq!(args.height, 2160);
                 assert_eq!(args.preset, VideoPresetChoice::Speed);
                 assert_eq!(args.frames, 120);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let llm_plan = Cli::try_parse_from(["forge", "llm", "plan", "--context", "8192"])
+            .expect("llm plan args must parse");
+        match llm_plan.command {
+            Commands::Llm {
+                action: LlmSubcommand::Plan(args),
+            } => {
+                assert_eq!(args.context, 8192);
+                assert_eq!(args.safety_margin_mib, 512);
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }

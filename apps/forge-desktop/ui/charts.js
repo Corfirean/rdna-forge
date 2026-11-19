@@ -167,10 +167,11 @@ export function drawStripChart(canvas, seriesList, opts = {}) {
  * @param {Array<{temp_c: number, speed_pct: number}>} points
  * @param {{min: number, max: number}|null} tempRange
  * @param {{min: number, max: number}|null} speedRange
+ * @param {Array<{temp_c: number, speed_pct: number}>} [defaultPoints]
  */
-export function drawFanCurveChart(canvas, points, tempRange, speedRange) {
-  const { ctx, width, height } = setupCanvas(canvas, 185);
-  const pad = { top: 14, right: 14, bottom: 26, left: 42 };
+export function drawFanCurveChart(canvas, points, tempRange, speedRange, defaultPoints = []) {
+  const { ctx, width, height } = setupCanvas(canvas, 195);
+  const pad = { top: 22, right: 14, bottom: 26, left: 42 };
   const plotW = Math.max(40, width - pad.left - pad.right);
   const plotH = Math.max(40, height - pad.top - pad.bottom);
 
@@ -180,6 +181,21 @@ export function drawFanCurveChart(canvas, points, tempRange, speedRange) {
   const sMax = speedRange ? Math.max(100, speedRange.max) : 100;
 
   ctx.font = '10px "Cascadia Mono", Consolas, monospace';
+
+  // Top legend
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#c93b3b";
+  ctx.fillRect(pad.left, 6, 7, 7);
+  ctx.fillStyle = "#9aa1ac";
+  ctx.fillText("Active ADLX", pad.left + 11, 4);
+  if (defaultPoints && defaultPoints.length > 0) {
+    const leg2X = pad.left + 96;
+    ctx.fillStyle = "#7d8594";
+    ctx.fillRect(leg2X, 6, 7, 7);
+    ctx.fillStyle = "#9aa1ac";
+    ctx.fillText("Factory VBIOS", leg2X + 11, 4);
+  }
 
   // Grid
   for (let i = 0; i <= 4; i++) {
@@ -218,16 +234,39 @@ export function drawFanCurveChart(canvas, points, tempRange, speedRange) {
     return;
   }
 
-  const coords = points.map((p) => {
-    const tx = Math.max(tMin, Math.min(tMax, p.temp_c));
-    const sy = Math.max(sMin, Math.min(sMax, p.speed_pct));
-    return {
-      x: pad.left + ((tx - tMin) / Math.max(1, tMax - tMin)) * plotW,
-      y: pad.top + plotH - ((sy - sMin) / Math.max(1, sMax - sMin)) * plotH,
-      label: `${p.temp_c}C/${p.speed_pct}%`,
-    };
-  });
+  const toCoords = (arr) =>
+    arr.map((p) => {
+      const tx = Math.max(tMin, Math.min(tMax, p.temp_c));
+      const sy = Math.max(sMin, Math.min(sMax, p.speed_pct));
+      return {
+        x: pad.left + ((tx - tMin) / Math.max(1, tMax - tMin)) * plotW,
+        y: pad.top + plotH - ((sy - sMin) / Math.max(1, sMax - sMin)) * plotH,
+      };
+    });
 
+  if (defaultPoints && defaultPoints.length > 0) {
+    const dCoords = toCoords(defaultPoints);
+    ctx.save();
+    ctx.strokeStyle = "#7d8594";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    dCoords.forEach((pt, idx) => {
+      if (idx === 0) ctx.moveTo(pt.x, pt.y);
+      else ctx.lineTo(pt.x, pt.y);
+    });
+    ctx.stroke();
+    ctx.restore();
+    for (const pt of dCoords) {
+      ctx.fillStyle = "#1b1d20";
+      ctx.strokeStyle = "#7d8594";
+      ctx.lineWidth = 1.2;
+      ctx.fillRect(pt.x - 2.5, pt.y - 2.5, 5, 5);
+      ctx.strokeRect(pt.x - 2.5, pt.y - 2.5, 5, 5);
+    }
+  }
+
+  const coords = toCoords(points);
   ctx.strokeStyle = "#c93b3b";
   ctx.lineWidth = 2;
   ctx.beginPath();
