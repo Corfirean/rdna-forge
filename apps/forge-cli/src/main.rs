@@ -16,8 +16,8 @@ use forge_core::{
 };
 use forge_device::discover_all;
 use forge_profiler::{
-    check_competing_workload_warning, check_vram_pressure_warning, snapshot_all_gpus,
-    GpuTelemetrySample, TelemetrySummary,
+    check_competing_workload_warning, check_vram_pressure_warning, query_top_vram_processes,
+    snapshot_all_gpus, GpuTelemetrySample, TelemetrySummary,
 };
 use forge_runtime::{
     default_untested_capabilities, probe_all_backends, probe_amf_capabilities,
@@ -73,6 +73,18 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileSubcommand,
     },
+    /// Show Top-N Windows processes consuming dedicated and shared GPU VRAM.
+    VramTop(VramTopArgs),
+}
+
+#[derive(Debug, Args)]
+struct VramTopArgs {
+    /// Maximum number of VRAM-consuming processes to display.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Emit machine-readable JSON instead of a human-readable table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -520,6 +532,7 @@ fn main() -> Result<()> {
             ProfileSubcommand::List { json } => cmd_profile_list(json),
             ProfileSubcommand::Match { device, json } => cmd_profile_match(device, json),
         },
+        Commands::VramTop(args) => cmd_vram_top(&args),
     }
 }
 
@@ -1393,6 +1406,25 @@ fn cmd_llm_plan(args: &LlmPlanArgs) -> Result<()> {
         println!("      Cmd: {}", p.llama_server_cmd);
     }
 
+    if !plan.top_vram_processes.is_empty() {
+        println!();
+        println!("TOP VRAM CONSUMERS (WDDM GPU PROCESS MEMORY)");
+        println!(
+            "  {:<8} {:<30} {:>14} {:>12} {:>18}",
+            "PID", "Process", "Dedicated(MiB)", "Shared(MiB)", "Recoverable Layers"
+        );
+        for p in &plan.top_vram_processes {
+            println!(
+                "  {:<8} {:<30} {:>14} {:>12} {:>18}",
+                p.pid,
+                p.process_name,
+                p.dedicated_vram_mib,
+                p.shared_vram_mib,
+                format!("+{} layers", p.recoverable_gpu_layers)
+            );
+        }
+    }
+
     println!();
     println!("LM STUDIO & LAUNCHER CHECKLIST");
     for tip in &plan.lm_studio_tips {
@@ -1588,6 +1620,45 @@ fn cmd_llm_apply_env(args: &LlmApplyEnvArgs) -> Result<()> {
         println!();
         println!("  No registry variable or file was modified (dry-run preview). Pass --apply to commit.");
     }
+    Ok(())
+}
+
+fn cmd_vram_top(args: &VramTopArgs) -> Result<()> {
+    let limit = args.limit.clamp(1, 100);
+    let rows =
+        query_top_vram_processes(limit).context("failed to query Windows per-process GPU VRAM")?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    println!("RDNA FORGE TOP VRAM CONSUMERS (WDDM)");
+    if rows.is_empty() {
+        println!("  No processes currently report GPU VRAM usage.");
+        return Ok(());
+    }
+
+    println!(
+        "  {:<8} {:<32} {:>14} {:>12} {:<24}",
+        "PID", "Process", "Dedicated(MiB)", "Shared(MiB)", "Adapter LUID"
+    );
+    let mut total_ded_mib = 0u64;
+    for r in &rows {
+        total_ded_mib = total_ded_mib.saturating_add(r.dedicated_vram_mib);
+        println!(
+            "  {:<8} {:<32} {:>14} {:>12} {:<24}",
+            r.pid,
+            r.process_name,
+            r.dedicated_vram_mib,
+            r.shared_vram_mib,
+            r.adapter_luid.as_deref().unwrap_or("--")
+        );
+    }
+    println!(
+        "  Sum across top {} processes: {} MiB dedicated VRAM",
+        rows.len(),
+        total_ded_mib
+    );
     Ok(())
 }
 

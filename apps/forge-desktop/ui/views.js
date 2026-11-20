@@ -430,6 +430,15 @@ export function renderMonitor(root, state, actions) {
           onClick: actions.clearMonitorHistory,
         },
         "Clear History"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          onClick: actions.refreshVramProcesses,
+        },
+        "Refresh Processes"
       )
     ),
     el(
@@ -502,6 +511,8 @@ export function renderMonitor(root, state, actions) {
       makePanel("Load & WDDM VRAM Occupancy (%)", "50% WDDM threshold", cUtil)
     )
   );
+
+  root.appendChild(el("div", { id: "monitor-vram-procs" }));
 
   patchMonitor(root, state);
 }
@@ -578,6 +589,65 @@ export function patchMonitor(root, state) {
       thresholdY: 50,
       thresholdLabel: "50% WDDM limit",
     });
+  }
+
+  const procsHost = root.querySelector("#monitor-vram-procs");
+  if (procsHost) {
+    if (state.monitor.vramProcsError) {
+      procsHost.replaceChildren(
+        el("div", { className: "banner banner-warn" }, state.monitor.vramProcsError)
+      );
+    } else {
+      const procs = state.monitor.topVramProcs || [];
+      const totalDedMib = procs.reduce((acc, p) => acc + (p.dedicated_vram_mib || 0), 0);
+      const body = procs.length
+        ? el(
+            "div",
+            { className: "data-table-wrap" },
+            el(
+              "table",
+              { className: "data-table" },
+              el(
+                "thead",
+                {},
+                el(
+                  "tr",
+                  {},
+                  el("th", { className: "num" }, "PID"),
+                  el("th", {}, "Process"),
+                  el("th", { className: "num" }, "Dedicated VRAM"),
+                  el("th", { className: "num" }, "Shared VRAM"),
+                  el("th", {}, "Adapter LUID")
+                )
+              ),
+              el(
+                "tbody",
+                {},
+                procs.map((p) =>
+                  el(
+                    "tr",
+                    {},
+                    el("td", { className: "num mono muted-text" }, String(p.pid)),
+                    el("td", { className: "mono" }, p.process_name),
+                    el("td", { className: "num mono" }, `${p.dedicated_vram_mib} MiB`),
+                    el("td", { className: "num mono muted-text" }, `${p.shared_vram_mib} MiB`),
+                    el("td", { className: "mono muted-text" }, p.adapter_luid || "--")
+                  )
+                )
+              )
+            )
+          )
+        : el("div", { className: "muted-text", style: "padding:10px 12px" }, "Collecting Windows PDH GPU process memory counters...");
+
+      procsHost.replaceChildren(
+        makePanel(
+          "Top VRAM Consumers (Per-Process WDDM)",
+          procs.length ? `Top ${procs.length} | ${totalDedMib} MiB dedicated` : "PDH counter",
+          body,
+          procs.length > 0
+        )
+      );
+    }
   }
 }
 
@@ -1754,6 +1824,55 @@ export function renderLlmOptimizer(root, state, actions) {
       )
     )
   );
+
+  if (plan.top_vram_processes && plan.top_vram_processes.length > 0) {
+    const pRows = plan.top_vram_processes.map((p) =>
+      el(
+        "tr",
+        {},
+        el("td", { className: "num mono muted-text" }, String(p.pid)),
+        el("td", { className: "mono" }, p.process_name),
+        el("td", { className: "num mono" }, `${p.dedicated_vram_mib} MiB`),
+        el("td", { className: "num mono muted-text" }, `${p.shared_vram_mib} MiB`),
+        el(
+          "td",
+          { className: "num mono" },
+          p.recoverable_gpu_layers > 0
+            ? `+${p.recoverable_gpu_layers} GPU layers if closed`
+            : "0 layers (<1 layer size)"
+        )
+      )
+    );
+    root.appendChild(
+      makePanel(
+        "Top VRAM Consumers Blocking Model Layers",
+        `Closing heavy desktop apps frees ~${mibPerLayer} MiB/layer`,
+        el(
+          "div",
+          { className: "data-table-wrap" },
+          el(
+            "table",
+            { className: "data-table" },
+            el(
+              "thead",
+              {},
+              el(
+                "tr",
+                {},
+                el("th", { className: "num" }, "PID"),
+                el("th", {}, "Process"),
+                el("th", { className: "num" }, "Dedicated VRAM"),
+                el("th", { className: "num" }, "Shared VRAM"),
+                el("th", { className: "num" }, "Layer Recovery Potential")
+              )
+            ),
+            el("tbody", {}, pRows)
+          )
+        ),
+        true
+      )
+    );
+  }
 
   // KV Cache Memory Budget Table
   const kvRows = (plan.kv_budgets || []).map((b) =>

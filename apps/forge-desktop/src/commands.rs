@@ -16,9 +16,10 @@ use forge_core::{
 };
 use forge_device::discover_all;
 use forge_profiler::{
-    check_competing_workload_warning, check_vram_pressure_warning, read_all_gpu_tuning,
-    reset_gpu_tuning_to_factory, set_gpu_power_limit, snapshot_all_gpus, GpuTelemetrySample,
-    GpuTuningReport, PowerLimitChangeResult, TuningResetResult,
+    check_competing_workload_warning, check_vram_pressure_warning, query_top_vram_processes,
+    read_all_gpu_tuning, reset_gpu_tuning_to_factory, set_gpu_power_limit, snapshot_all_gpus,
+    GpuTelemetrySample, GpuTuningReport, PowerLimitChangeResult, ProcessVramUsage,
+    TuningResetResult,
 };
 use forge_runtime::{
     default_untested_capabilities, probe_all_backends, probe_amf_capabilities,
@@ -460,6 +461,16 @@ pub async fn get_telemetry_snapshot(
     })
     .await
     .map_err(|e| format!("Telemetry snapshot task failed: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_top_vram_processes(limit: Option<usize>) -> Result<Vec<ProcessVramUsage>, String> {
+    let clamped = limit.unwrap_or(10).clamp(1, 50);
+    tauri::async_runtime::spawn_blocking(move || {
+        query_top_vram_processes(clamped).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Top VRAM process query task failed: {e}"))?
 }
 
 #[tauri::command]

@@ -4,6 +4,7 @@ mod adlx_tuning;
 pub mod sampler;
 pub mod tuning;
 pub mod types;
+pub mod vram_processes;
 
 pub use adlx_ffi::AdlxSession;
 pub use sampler::{
@@ -20,6 +21,10 @@ pub use types::{
     format_sample_table_row, parse_pci_device_id, summarize_samples, GpuTelemetrySample,
     MetricSummary, MonitorRecord, TelemetrySummary, COMPETING_GPU_USAGE_PCT, TELEMETRY_CSV_HEADER,
     TELEMETRY_TABLE_HEADER, WDDM_VRAM_PRESSURE_PCT,
+};
+pub use vram_processes::{
+    aggregate_process_vram_samples, parse_gpu_process_instance_name, query_top_vram_processes,
+    ProcessVramUsage,
 };
 
 #[cfg(test)]

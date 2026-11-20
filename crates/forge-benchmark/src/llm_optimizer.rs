@@ -6,7 +6,7 @@ use std::process::Command;
 
 use forge_core::{match_profile_for_device, ForgeError, ForgeResult, GpuArchitecture};
 use forge_device::discover_all;
-use forge_profiler::snapshot_all_gpus;
+use forge_profiler::{query_top_vram_processes, snapshot_all_gpus};
 use serde::{Deserialize, Serialize};
 
 use crate::llama::parse_llama_bench_json;
@@ -125,6 +125,16 @@ pub struct LlmTweakProfile {
     pub llama_server_cmd: String,
 }
 
+/// Per-process VRAM consumption impact relative to the target LLM model's layer size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessVramImpact {
+    pub pid: u32,
+    pub process_name: String,
+    pub dedicated_vram_mib: u64,
+    pub shared_vram_mib: u64,
+    pub recoverable_gpu_layers: u32,
+}
+
 /// Complete static analysis, VRAM anti-spill budget, and hardware-aware tweak recommendations for a GGUF model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmOptimizationPlan {
@@ -156,6 +166,8 @@ pub struct LlmOptimizationPlan {
     pub safety_margin_mib: u64,
     pub target_context_tokens: u32,
     pub recoverable_layers_if_apps_closed: u32,
+    #[serde(default)]
+    pub top_vram_processes: Vec<ProcessVramImpact>,
     pub warnings: Vec<String>,
     pub kv_budgets: Vec<KvCacheMemoryBudget>,
     pub recommended_profiles: Vec<LlmTweakProfile>,
@@ -961,12 +973,26 @@ pub fn plan_llm_configuration_for_device(
         used_vram_mib,
     };
 
-    Ok(plan_llm_configuration_for_gpu(
-        model,
-        &ctx,
-        target_context_tokens,
-        safety_margin_mib,
-    ))
+    let mut plan =
+        plan_llm_configuration_for_gpu(model, &ctx, target_context_tokens, safety_margin_mib);
+
+    let model_weights_mib = model.file_size_bytes.div_ceil(1024 * 1024);
+    let mib_per_layer = (model_weights_mib as f64 / f64::from(model.block_count.max(1))).max(1.0);
+    plan.top_vram_processes = query_top_vram_processes(6)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.dedicated_vram_mib >= 16)
+        .map(|p| ProcessVramImpact {
+            pid: p.pid,
+            process_name: p.process_name,
+            dedicated_vram_mib: p.dedicated_vram_mib,
+            shared_vram_mib: p.shared_vram_mib,
+            recoverable_gpu_layers: ((p.dedicated_vram_mib as f64 / mib_per_layer).floor() as u32)
+                .min(model.block_count),
+        })
+        .collect();
+
+    Ok(plan)
 }
 
 /// Pure multi-GPU LLM memory & launch planner over an explicit `LlmTargetGpuContext`.
@@ -1443,6 +1469,7 @@ pub fn plan_llm_configuration_for_gpu(
         safety_margin_mib,
         target_context_tokens: target_ctx,
         recoverable_layers_if_apps_closed,
+        top_vram_processes: Vec::new(),
         warnings,
         kv_budgets,
         recommended_profiles,

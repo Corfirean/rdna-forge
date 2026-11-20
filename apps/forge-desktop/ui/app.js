@@ -45,6 +45,9 @@ const state = {
     rawLog: [],
     timerId: null,
     inFlight: false,
+    topVramProcs: [],
+    vramProcTick: 0,
+    vramProcsError: null,
   },
 
   tuningReports: null,
@@ -294,6 +297,18 @@ function ingestTelemetrySamples(samples, warnings, pausedReason, error) {
   }
 }
 
+async function refreshVramProcesses() {
+  try {
+    state.monitor.topVramProcs = await invokeCommand("get_top_vram_processes", { limit: 10 });
+    state.monitor.vramProcsError = null;
+  } catch (err) {
+    state.monitor.vramProcsError = String(err);
+  }
+  if (state.activeTab === "monitor") {
+    patchMonitor(document.getElementById("view-root"), state);
+  }
+}
+
 async function pollTelemetryOnce() {
   if (!state.monitor.running || state.monitor.inFlight) return;
   if (state.busyOp) {
@@ -312,6 +327,17 @@ async function pollTelemetryOnce() {
       state.monitor.pausedReason = resp.pause_reason || "Paused while GPU busy.";
     } else {
       ingestTelemetrySamples(resp.samples, resp.warnings, null, resp.error);
+    }
+    if (state.activeTab === "monitor") {
+      state.monitor.vramProcTick = (state.monitor.vramProcTick + 1) % 3;
+      if (state.monitor.vramProcTick === 1 || state.monitor.topVramProcs.length === 0) {
+        try {
+          state.monitor.topVramProcs = await invokeCommand("get_top_vram_processes", { limit: 10 });
+          state.monitor.vramProcsError = null;
+        } catch (procErr) {
+          state.monitor.vramProcsError = String(procErr);
+        }
+      }
     }
     updateHeaderAndRail();
     if (state.activeTab === "monitor") {
@@ -540,6 +566,7 @@ const actions = {
     state.monitor.rawLog = [];
     renderActiveView();
   },
+  refreshVramProcesses,
   exportMonitorCsv: () => {
     const lines = [CSV_HEADER];
     for (const s of state.monitor.rawLog) {
@@ -817,6 +844,7 @@ function switchTab(tab) {
     refreshLlmPlan();
   } else if (tab === "monitor") {
     pollTelemetryOnce();
+    refreshVramProcesses();
   }
 }
 

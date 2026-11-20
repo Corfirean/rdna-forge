@@ -17,7 +17,7 @@ pub use llm_optimizer::{
     plan_llm_configuration_for_device, plan_llm_configuration_for_gpu, EnvAndOllamaPatchResult,
     EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult,
     LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LlmTargetGpuContext,
-    LlmTweakProfile, LmStudioPatchResult, LocalLlmAssets,
+    LlmTweakProfile, LmStudioPatchResult, LocalLlmAssets, ProcessVramImpact,
 };
 pub use memory::peak_process_rss_bytes;
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
