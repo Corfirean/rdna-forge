@@ -5,7 +5,7 @@
 ### Core Rust & Vulkan Development (Required)
 - **OS**: Windows 11 (x86_64)
 - **GPU Driver**: AMD Software: Adrenalin Edition (`26.11.2` tested; provides `vulkan-1.dll`, `amdhip64_6.dll`, `amdadlx64.dll`)
-- **Rust Toolchain**: Stable (`rustc 1.87+`; `rust-toolchain.toml` specifies `stable` with `rustfmt` and `clippy`)
+- **Rust Toolchain**: Stable (`rust-toolchain.toml` specifies `stable` with `rustfmt` and `clippy`). Minimum supported Rust versions, verified by building with real toolchains: **1.88** for the libraries and CLI (`libloading` 0.9 requires it) and **1.90** for `forge-desktop` (Tauri 2.12 requires it). Rust 1.87, which earlier versions of this repository declared, cannot build the locked dependency graph.
 - **Build Tools**: Visual Studio Build Tools (`MSVC` x64 linker)
 
 Note: `glslc` / LunarG Vulkan SDK is **not** required to build or run RDNA Forge. WGSL shaders compile to SPIR-V in pure Rust via `naga`.
@@ -69,7 +69,9 @@ python -m py_compile modules/ai/triton/bench_suite.py
 - All third-party actions are pinned to commit SHAs (the comment next to each is the release it came from). To update one, resolve the new tag to its commit SHA, review the diff between releases, and change both together. Do not replace a SHA with a tag.
 - Dependency policy lives in `deny.toml` (`cargo install cargo-deny --locked`, then `cargo deny check`): RustSec advisories fail the check, only permissive licenses (plus MPL-2.0) are allowed, and only crates.io is an accepted source. `Cargo.lock` is committed and CI builds with `--locked`; dependency changes must update it in the same commit and be justified in the commit message.
 - Hardware qualification is a separate, manual workflow (`.github/workflows/hardware-qualification.yml`) for a self-hosted Windows runner labelled `self-hosted, windows, amd-gpu`. Locally the equivalent is `cargo test -p forge-cli --test gpu_correctness -- --ignored --test-threads=1`. Record the GPU, driver and result when reporting qualification; a skipped test is not a pass.
-- The declared MSRV is Rust `1.87` (`workspace.package.rust-version`); CI builds with current stable and does not yet verify the MSRV.
+- MSRV is checked by the `msrv` job: `cargo check --workspace --exclude forge-desktop --all-targets --locked` on Rust `1.88.0`, and `cargo check --workspace --all-targets --locked` on Rust `1.90.0` (desktop included). The same commands were run locally with those toolchains. Raising a dependency past these versions requires raising `rust-version` and the CI matrix together.
+- The `linux-compile` job runs `cargo check` and `clippy -D warnings` for the libraries and CLI on Linux. It exists to keep the non-Windows branches (for example in `forge-core::loader`) compiling; it runs no tests and does not mean Linux is supported. `forge-desktop` is excluded.
+- None of the workflows in `.github/workflows/` had been executed on GitHub when this was written; they were validated as YAML and their commands were run locally.
 
 ### Portable Windows Release Workflow
 `.github/workflows/release.yml` packages tagged `v*` releases (and manual `workflow_dispatch` runs) into a portable Windows `x64` `.zip` bundle (`RDNA-Forge-<tag>-win-x64.zip` with `SHA256SUMS.txt`) containing `forge.exe`, `forge-desktop.exe`, `profiles/`, `README.md`, `COMPATIBILITY.md`, `BENCHMARKS.md`, `CHANGELOG.md`, and `LICENSE`.

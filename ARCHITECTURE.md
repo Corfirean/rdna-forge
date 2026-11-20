@@ -42,6 +42,7 @@ Crate dependency flow (`forge-cli`, `forge-desktop` -> `forge-benchmark` -> {`fo
 - **`profile`**: Parses, validates, and embeds all 18 TOML hardware profiles (`BuiltinProfileInfo`, `builtin_profiles`, `builtin_profile_by_id`) plus token/CU/VRAM-disambiguated auto-matching (`match_profile_for_device`).
 - **`policy`**: Enforces `validate_kernel_execution` (checks vendor, `maxBufferSize`, VRAM budget, FP16/BF16/FP8/INT8/WMMA/MFMA flags) and `select_preferred_device` (deterministic ordering: discrete AMD > integrated AMD > other, breaking ties by VRAM).
 - **`error`**: Typed `ForgeError` enum using `thiserror` across all library crates.
+- **`exec`**: Validation and resolution of the user-supplied Python interpreter (`resolve_python_executable`): explicit paths must be regular files, bare names come from `PATH` only, Windows batch files are refused.
 - **`loader`**: The single place that loads native libraries (`load_system_library`, `load_vendor_library`): System32-only resolution for system/driver DLLs, trusted-root validation for vendor SDK DLLs, module-path read-back, and typed `NotFound` / `Untrusted` / `LoadFailed` errors. `forge-device`, `forge-profiler` and `forge-runtime` call it instead of `libloading::Library::new` directly.
 
 ### `forge-device`

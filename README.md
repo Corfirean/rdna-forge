@@ -14,7 +14,7 @@ RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contr
 
 ### Maturity at a Glance
 - **Hardware-tested**: RX 6900 XT (`gfx1030`) on Windows 11 / Adrenalin `26.11.2`: discovery, Vulkan compute kernels, HIP memory round-trip, ADLX telemetry and read-only tuning, AMF encode/decode (18 hardware tests pass via `cargo test -p forge-cli --test gpu_correctness -- --ignored --test-threads=1`).
-- **Experimental / unverified on hardware**: RDNA1, RDNA3, RDNA3.5 and RDNA4 profiles and planners; AV1 hardware encode; ROCm and `triton-windows` paths on `gfx1030` (partial); ADLX `tune ... --apply` (mutating path not exercised in qualification; dry-run and read-back verification only).
+- **Experimental / unverified on hardware**: RDNA1, RDNA3, RDNA3.5 and RDNA4 profiles and planners; AV1 hardware encode; ROCm and `triton-windows` paths on `gfx1030` (partial); ADLX `tune ... --apply`: the verify-and-roll-back logic is tested against a fake backend only and no mutating call has been run on real hardware (dry runs and read-only inspection have).
 - **Estimates, not measurements**: LLM memory plans are computed from GGUF tensor metadata and are estimates of llama.cpp placement, not allocator predictions. Kernel `GB/s` figures are *logical* bandwidth, not VRAM bandwidth (see [BENCHMARKS.md](BENCHMARKS.md)).
 - **Safe by default**: anything that changes GPU or application configuration (`tune`, `llm apply-*`, `llm rollback`) is a dry run unless `--apply` is passed.
 
@@ -73,7 +73,7 @@ Download the latest `RDNA-Forge-v0.1.0-win-x64.zip` archive from [GitHub Release
 
 ### Prerequisites
 - Windows 11 (x64) with AMD Adrenalin driver (`26.11.2` tested)
-- Rust stable toolchain (`1.87+` with `rustfmt` and `clippy`, matching [rust-toolchain.toml](rust-toolchain.toml))
+- Rust stable toolchain (`rustfmt` and `clippy`, matching [rust-toolchain.toml](rust-toolchain.toml)); minimum supported version `1.88` for the CLI and libraries, `1.90` for the desktop app
 - Visual Studio Build Tools (MSVC linker)
 - Optional: Python `3.11` with `torch[device-gfx1030]==2.15.0` and `triton-windows<3.10` (see [DEVELOPMENT.md](DEVELOPMENT.md))
 - Optional: official `llama.cpp` Windows Vulkan/ROCm binaries
