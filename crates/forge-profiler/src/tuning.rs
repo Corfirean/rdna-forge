@@ -264,11 +264,11 @@ pub enum OperationStatus {
     /// No change was made (dry run, nothing to do, or the driver rejected the request).
     #[default]
     NotApplied,
-    /// The driver accepted the request but the new state could not be read back.
-    Applied,
     /// The driver accepted the request and the read-back matches it.
     Confirmed,
-    /// The driver accepted the request but the read-back contradicts it.
+    /// A change was requested but the resulting state is not proven to match it: the read-back
+    /// contradicts the request, or could not be read at all. There is deliberately no
+    /// "applied but unverified" status: an unproven change must never read as a success.
     NotConfirmed,
 }
 
@@ -276,7 +276,6 @@ impl fmt::Display for OperationStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NotApplied => "NOT APPLIED",
-            Self::Applied => "APPLIED (UNVERIFIED)",
             Self::Confirmed => "CONFIRMED",
             Self::NotConfirmed => "NOT CONFIRMED",
         })
@@ -340,8 +339,10 @@ pub struct PowerLimitOutcome {
 /// request, or a rejected write left the value changed or unknown, write the original value back
 /// and read it back again. A pre-validation failure returns `Err` and the hardware is never
 /// written. An unreadable read-back after an accepted write is reported as
-/// [`OperationStatus::Applied`] (unverified) and is *not* rolled back, because nothing shows that
-/// the change failed.
+/// [`OperationStatus::NotConfirmed`] (the state is unknown) and the original value is written
+/// back, so the GPU is returned to the last known-good value instead of being left in an
+/// unproven one. If that restore cannot be read back either, the rollback is reported as
+/// [`RollbackStatus::Attempted`].
 pub fn change_power_limit(
     ctl: &mut dyn PowerLimitControl,
     range: &IntRange,
@@ -398,12 +399,12 @@ pub fn change_power_limit(
                 true
             }
             None => {
-                out.status = OperationStatus::Applied;
-                out.error = Some(
-                    "the driver accepted the request but the value could not be read back"
-                        .to_string(),
-                );
-                false
+                out.status = OperationStatus::NotConfirmed;
+                out.error = Some(format!(
+                    "the driver accepted the request but the value could not be read back; \
+                     the change is not confirmed and the previous value ({previous}%) is being restored"
+                ));
+                true
             }
         },
     };
@@ -622,7 +623,7 @@ impl PowerLimitChangeResult {
         match self.status {
             OperationStatus::Confirmed => true,
             OperationStatus::NotApplied => self.error.is_none(),
-            OperationStatus::Applied | OperationStatus::NotConfirmed => false,
+            OperationStatus::NotConfirmed => false,
         }
     }
 }
@@ -661,7 +662,7 @@ impl TuningResetResult {
         match self.status {
             OperationStatus::Confirmed => true,
             OperationStatus::NotApplied => self.error.is_none(),
-            OperationStatus::Applied | OperationStatus::NotConfirmed => false,
+            OperationStatus::NotConfirmed => false,
         }
     }
 }
@@ -681,6 +682,8 @@ mod tests {
         unreadable: bool,
         /// Reads after this many `write` calls are unavailable (None); `usize::MAX` = never.
         unreadable_after_writes: usize,
+        /// Reads become available again once this many `write` calls were made.
+        readable_again_after_writes: Option<usize>,
     }
 
     #[derive(Clone, Copy)]
@@ -705,13 +708,18 @@ mod tests {
                 script,
                 unreadable: false,
                 unreadable_after_writes: usize::MAX,
+                readable_again_after_writes: None,
             }
         }
     }
 
     impl PowerLimitControl for FakePower {
         fn read(&mut self) -> Option<i32> {
-            if self.unreadable || self.writes.len() >= self.unreadable_after_writes {
+            let recovered = self
+                .readable_again_after_writes
+                .is_some_and(|n| self.writes.len() >= n);
+            if self.unreadable || (self.writes.len() >= self.unreadable_after_writes && !recovered)
+            {
                 return None;
             }
             self.value
@@ -863,14 +871,47 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_readback_after_an_accepted_write_is_applied_unverified_without_rollback() {
+    fn unreadable_readback_after_an_accepted_write_is_not_confirmed_and_restored() {
+        // Reads stay unavailable after the first write, so neither the change nor the restore can
+        // be verified: NOT CONFIRMED + ROLLBACK ATTEMPTED, never a success-shaped status.
         let mut f = FakePower::new(0, vec![]);
         f.unreadable_after_writes = 1;
         let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
-        assert_eq!(o.status, OperationStatus::Applied);
-        assert_eq!(f.writes, vec![5]);
-        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(f.writes, vec![5, 0], "the original value is written back");
+        assert_eq!(o.rollback, RollbackStatus::Attempted);
+        assert_eq!(o.rollback_verified_pct, None);
+        assert_eq!(o.verified_pct, None);
         assert!(o.error.unwrap().contains("could not be read back"));
+        assert!(!o.status.to_string().contains("APPLIED"));
+    }
+
+    #[test]
+    fn unreadable_readback_then_readable_restore_is_confirmed_rollback() {
+        // Reads are unavailable only for the first read-back; the restore can be verified.
+        let mut f = FakePower::new(0, vec![]);
+        f.unreadable_after_writes = 1;
+        f.readable_again_after_writes = Some(2);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.rollback, RollbackStatus::Confirmed);
+        assert_eq!(o.rollback_verified_pct, Some(0));
+        assert!(!PowerLimitChangeResult {
+            gpu_name: String::new(),
+            pci_device_id: None,
+            previous_limit_pct: 0,
+            requested_limit_pct: 5,
+            allowed_range: range(),
+            default_limit_pct: None,
+            applied: true,
+            verified_limit_pct: o.verified_pct,
+            confirmed: false,
+            status: o.status,
+            rollback: o.rollback,
+            rollback_verified_limit_pct: o.rollback_verified_pct,
+            error: o.error,
+        }
+        .succeeded());
     }
 
     /// What `is_at_factory()` reports after `reset()` has been called.
@@ -958,7 +999,6 @@ mod tests {
             (ApiResult::Accepted, OperationStatus::NotConfirmed)
         );
         assert_eq!(o.now_at_factory, None);
-        assert_ne!(o.status, OperationStatus::Applied);
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
         let e = o.error.unwrap();
         assert!(e.contains("could not be read back") && e.contains("not confirmed"));
@@ -1080,11 +1120,8 @@ mod tests {
                     OperationStatus::NotConfirmed
                 };
                 assert_eq!(o.status, expected, "rc {rc}, readback {readback:?}");
-                // `Applied` / `NotApplied` are never produced once a reset was requested.
-                assert!(!matches!(
-                    o.status,
-                    OperationStatus::Applied | OperationStatus::NotApplied
-                ));
+                // `NotApplied` is never produced once a reset was requested.
+                assert_ne!(o.status, OperationStatus::NotApplied);
                 assert_eq!(o.rollback, RollbackStatus::Unsupported);
                 // Unknown or contradicting state must carry a diagnostic.
                 assert_eq!(o.error.is_none(), readback == Some(true) && accepted);
@@ -1123,10 +1160,9 @@ mod tests {
         // Everything else is a failure.
         assert!(!reset_result(Accepted, NotConfirmed, Some("x")).succeeded());
         assert!(!reset_result(Rejected, NotConfirmed, Some("x")).succeeded());
-        assert!(!reset_result(Accepted, Applied, None).succeeded());
         assert!(!reset_result(NotCalled, NotApplied, Some("x")).succeeded());
         // An accepted API call alone is never success.
-        for status in [NotApplied, Applied, NotConfirmed] {
+        for status in [NotApplied, NotConfirmed] {
             assert!(
                 !reset_result(Accepted, status, Some("e")).succeeded(),
                 "{status:?} must not be success"
@@ -1194,8 +1230,12 @@ mod tests {
         assert!(base(OperationStatus::Confirmed, None).succeeded());
         assert!(base(OperationStatus::NotApplied, None).succeeded()); // dry run
         assert!(!base(OperationStatus::NotApplied, Some("rejected")).succeeded());
-        assert!(!base(OperationStatus::Applied, None).succeeded());
         assert!(!base(OperationStatus::NotConfirmed, None).succeeded());
+        // No status label may read as a success unless the state was confirmed.
+        for s in [OperationStatus::NotApplied, OperationStatus::NotConfirmed] {
+            assert!(!s.to_string().contains("APPLIED") || s == OperationStatus::NotApplied);
+        }
+        assert_eq!(OperationStatus::NotConfirmed.to_string(), "NOT CONFIRMED");
     }
 
     #[test]

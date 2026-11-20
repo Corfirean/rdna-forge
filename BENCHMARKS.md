@@ -281,6 +281,28 @@ Empirical evaluation of a borderline 16 GiB VRAM model (**`Qwen3.8-27B` `UD-IQ4_
 | **Tuned Vulkan Long-Context (`q4_0` KV)** | `Vulkan0` | `GGML_VK_ENABLE_MEMORY_PRIORITY=1`, `GGML_VK_VISIBLE_DEVICES=0` | `1` | `q4_0/q4_0` | 374.22 tok/s | 26.39 tok/s | 251.61 tok/s (**+52%**) | 20.06–26.04 tok/s | 12.13 tok/s | **25.63 tok/s** (**+61%**) |
 | **Tuned ROCm/HIP Long-Context (`q4_0` KV)** | `ROCm0` | `HIP_VISIBLE_DEVICES=0` + ROCm `PATH` | `1` | `q4_0/q4_0` | **522.57 tok/s** (**+38%**) | **27.20 tok/s** | **260.08 tok/s** | **22.13 tok/s** | **246.22 tok/s** (**20.3x**) | **18.99 tok/s** |
 
+### 11.3 VRAM Planner vs `llama.cpp` Allocation Report (`forge llm plan`, Vulkan, `Qwen3.8-27B` `UD-IQ4_XS`)
+
+`forge llm plan` estimates were compared with the per-device buffer sizes that `llama.cpp` `b12532` (Vulkan) prints when it loads the same model (`-fit off -sm none -dev Vulkan0`, `GGML_VK_VISIBLE_DEVICES=0`, `GGML_VK_ENABLE_MEMORY_PRIORITY=1`, `-v --log-file`). Each configuration loaded the model and generated 4 tokens; no GPU setting was changed. Values are MiB; "diff" is planner minus `llama.cpp` (positive = planner over-estimates, i.e. errs on the safe side).
+
+| Configuration | Weights (planner / real) | KV + state (planner / real) | Compute (planner / real) | Total (planner / real) | Diff |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `-c 4096`, `f16` KV, `-fa off`, `-ngl 99` | 13205.0 / 12870.0 | 440 / 405.6 | 384 / 280.0 | 14029 / 13555.7 | +473 (+3.5%) |
+| `-c 16384`, `q8_0` KV, `-fa on`, `-ngl 99` | 13205.0 / 12870.0 | 746 / 693.6 | 384 / 168.0 | 14335 / 13731.7 | +603 (+4.4%) |
+| `-c 16384`, `q4_0` KV, `-fa on`, `-ngl 99` | 13205.0 / 12870.0 | 474 / 437.6 | 384 / 168.0 | 14063 / 13475.7 | +587 (+4.4%) |
+| `-c 4096`, `f16` KV, `-fa off`, `-ngl 40` | 8727.3 / 8392.6 | 440 / 247.3 | 384 / 299.8 | 9551 / 8939.6 | +612 (+6.8%) |
+
+Findings:
+1. **No under-estimate in any measured configuration** (total +3.5% to +6.8%). The planner's "does not fit" verdict at `-c 4096` (14029 MiB needed vs 13125 MiB free when measured) agreed with the observed spill: generation ran at about 6-14 tok/s instead of `~27 tok/s`.
+2. **Weights are over-estimated by a constant ~335 MiB.** That is exactly the size of block 64, the multi-token-prediction (`nextn_predict_layers = 1`) layer (`351,008,768` B). `llama.cpp` `b12532` did not allocate it on the GPU in this configuration, while the planner counts it. The token embedding (`521 MiB`) is correctly kept off the GPU by both. The planner was deliberately **not** changed: whether the MTP tensors are loaded depends on the `llama.cpp` build and on whether MTP/speculative decoding is enabled, so the over-estimate is the safe direction.
+3. **KV + state** is over-estimated by about 8% at full offload (the recurrent-state part: `184 MiB` estimated vs `149.6 MiB` allocated). With partial offload (`-ngl 40`) the planner keeps the full-offload figure, although `llama.cpp` places the KV of CPU layers in host memory, so it is conservative there (+78%).
+4. **Compute scratch** is a fixed `384 MiB` in the planner; `llama.cpp` allocated `168-300 MiB` depending on flash attention and offload. Conservative, not context-aware.
+5. The planner's `fits_with_wddm_memory_priority = true` was also consistent: with memory priority enabled the model loaded with all 66/66 layers on the GPU while `llama.cpp` reported only `204 MiB` free (`unaccounted 2608 MiB` held by Windows and other apps).
+
+Limits of this validation: one model (a hybrid SSM/attention dense model; no MoE, no dense non-hybrid model), one GPU (RX 6900 XT, `gfx1030`), one `llama.cpp` build, Vulkan only (no ROCm/HIP). The numbers are `llama.cpp`'s own allocation report, not an independent measurement of WDDM residency.
+
+Reproduce with the commands in section 12 plus `llama-cli -m <model> -c <ctx> -ngl <n> -dev Vulkan0 -sm none -fit off -v --log-file <file> -p Hello -n 4 -st` and compare the `Vulkan0 model buffer`, `KV buffer`, `RS buffer` and `compute buffer` lines (or the final `memory breakdown` table) with `forge llm plan --context <ctx> --json`.
+
 ---
 
 ## 12. Reproduction Commands
