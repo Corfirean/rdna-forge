@@ -2,40 +2,93 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/**", "fix/**", "perf/**"]
+    branches: [main, "feat/**", "fix/**", "perf/**", "hardening/**"]
   pull_request:
     branches: [main]
+
+# Least privilege: no job in this workflow writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
+# All third-party actions are pinned to reviewed commit SHAs (the trailing comment is the
+# release the SHA corresponds to). Update them deliberately, not through floating tags.
 jobs:
-  windows-ci:
-    name: Build, Lint, and Hardware-Independent Tests (Windows)
+  lint:
+    name: Format and Clippy (Windows)
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch tip
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run hardware-independent unit and integration tests
-        run: cargo test --workspace
+  test:
+    name: Hardware-independent tests (Windows)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - name: Setup Node.js for UI syntax check
-        uses: actions/setup-node@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch tip
+        with:
+          toolchain: stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Run unit and integration tests
+        run: cargo test --workspace --locked
+
+      - name: Report GPU test status
+        shell: pwsh
+        run: |
+          # GPU correctness tests are #[ignore]d: GitHub-hosted runners have no AMD GPU.
+          # They are NOT run here and must not be counted as passed. See
+          # .github/workflows/hardware-qualification.yml and DEVELOPMENT.md.
+          "GPU correctness tests: NOT RUN (require an AMD GPU; hardware qualification workflow)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+  scripts:
+    name: Desktop UI and Python syntax checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
@@ -45,10 +98,27 @@ jobs:
           node --check apps/forge-desktop/ui/views.js
           node --check apps/forge-desktop/ui/charts.js
 
-      - name: Check Python benchmark suite syntax
-        uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
       - name: Validate Python syntax
         run: python -m py_compile modules/ai/triton/bench_suite.py
+
+  security:
+    name: Dependency audit (advisories, licenses, sources)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Policy lives in deny.toml: RustSec advisories, license allow-list, crates.io-only sources.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          command: check
