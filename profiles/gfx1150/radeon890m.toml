@@ -1,0 +1,30 @@
+[device]
+name = "AMD Radeon 890M Graphics"
+gfx_target = "gfx1150"
+architecture = "RDNA3.5"
+pci_vendor_id = "0x1002"
+pci_device_ids = ["0x150E"]
+discrete = false
+
+[compute]
+compute_units = 16
+wgp_count = 8
+simds_per_cu = 2
+wave_sizes = [32, 64]
+lds_bytes_per_cu = 65536
+vulkan_max_shared_memory_bytes = 32768
+
+[memory]
+vram_bytes = 8589934592
+bus_width_bits = 128
+l2_cache_bytes = 2097152
+infinity_cache_bytes = 0
+
+[capabilities]
+fp16 = true
+bf16 = true
+fp8 = false
+dp4a_i8 = true
+dot8_i4 = true
+wmma = true
+mfma = false

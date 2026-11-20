@@ -139,6 +139,37 @@ impl GpuArchitecture {
             },
         }
     }
+
+    /// Returns `true` when upstream `hipBLASLt` targets this architecture natively.
+    pub const fn supports_hipblaslt(self) -> bool {
+        matches!(
+            self,
+            Self::Rdna3 | Self::Rdna35 | Self::Rdna4 | Self::Cdna2 | Self::Cdna3 | Self::Cdna4
+        )
+    }
+
+    /// Returns `true` when `rocWMMA` matrix-core FlashAttention is supported in `llama.cpp` / HIP.
+    pub const fn supports_rocwmma_fattn(self) -> bool {
+        matches!(self, Self::Rdna3 | Self::Rdna35 | Self::Rdna4)
+    }
+
+    /// Returns `true` when the hardware VCN block supports hardware AV1 video encoding.
+    pub const fn supports_av1_encode(self) -> bool {
+        matches!(self, Self::Rdna3 | Self::Rdna35 | Self::Rdna4)
+    }
+
+    /// Returns the canonical AMD Video Core Next (VCN) hardware generation for this architecture.
+    pub const fn vcn_generation(self) -> &'static str {
+        match self {
+            Self::Rdna1 => "VCN 2.0",
+            Self::Rdna2 => "VCN 3.0",
+            Self::Rdna3 | Self::Rdna35 => "VCN 4.0",
+            Self::Rdna4 => "VCN 5.0",
+            Self::Cdna1 | Self::Cdna2 => "VCN 2.x",
+            Self::Cdna3 | Self::Cdna4 => "VCN 4.0",
+            Self::Unknown => "Unknown",
+        }
+    }
 }
 
 /// Validated AMD LLVM/ROCm target identifier (for example `gfx1030` or `gfx1030:xnack-`).
@@ -274,6 +305,34 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
             architecture: GpuArchitecture::Rdna2,
             discrete: true,
         }),
+        0x73A5 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon RX 6950 XT",
+            gfx_target: "gfx1030",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
+        0x73A3 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W6800",
+            gfx_target: "gfx1030",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
+        0x73AB => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W6800X",
+            gfx_target: "gfx1030",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
+        0x73AE => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO V620",
+            gfx_target: "gfx1030",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
         0x73BF => Some(KnownAmdGpu {
             device_id,
             canonical_name: "AMD Radeon RX 6800 / 6800 XT / 6900 XT",
@@ -288,9 +347,23 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
             architecture: GpuArchitecture::Rdna2,
             discrete: true,
         }),
+        0x73E1 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W6600M",
+            gfx_target: "gfx1032",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
         0x73E3 => Some(KnownAmdGpu {
             device_id,
             canonical_name: "AMD Radeon PRO W6600 / RX 6700",
+            gfx_target: "gfx1032",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
+        0x73EF => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon RX 6650 XT",
             gfx_target: "gfx1032",
             architecture: GpuArchitecture::Rdna2,
             discrete: true,
@@ -299,6 +372,13 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
             device_id,
             canonical_name: "AMD Radeon RX 6600 / 6600 XT / 6650 XT",
             gfx_target: "gfx1032",
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+        }),
+        0x7422 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W6400",
+            gfx_target: "gfx1034",
             architecture: GpuArchitecture::Rdna2,
             discrete: true,
         }),
@@ -323,10 +403,24 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
             architecture: GpuArchitecture::Rdna2,
             discrete: false,
         }),
+        0x7448 | 0x7449 | 0x744B => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W7900 / W7800",
+            gfx_target: "gfx1100",
+            architecture: GpuArchitecture::Rdna3,
+            discrete: true,
+        }),
         0x744C => Some(KnownAmdGpu {
             device_id,
             canonical_name: "AMD Radeon RX 7900 XT / XTX / GRE",
             gfx_target: "gfx1100",
+            architecture: GpuArchitecture::Rdna3,
+            discrete: true,
+        }),
+        0x7470 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W7700",
+            gfx_target: "gfx1101",
             architecture: GpuArchitecture::Rdna3,
             discrete: true,
         }),
@@ -344,6 +438,20 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
             architecture: GpuArchitecture::Rdna3,
             discrete: true,
         }),
+        0x7483 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon RX 7600M / 7700S",
+            gfx_target: "gfx1102",
+            architecture: GpuArchitecture::Rdna3,
+            discrete: true,
+        }),
+        0x7489 | 0x748B => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon PRO W7500 / W7500M",
+            gfx_target: "gfx1102",
+            architecture: GpuArchitecture::Rdna3,
+            discrete: true,
+        }),
         0x15BF | 0x1900 => Some(KnownAmdGpu {
             device_id,
             canonical_name: "AMD Radeon 780M / 760M Graphics",
@@ -351,10 +459,24 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
             architecture: GpuArchitecture::Rdna3,
             discrete: false,
         }),
-        0x150E | 0x1586 => Some(KnownAmdGpu {
+        0x150E => Some(KnownAmdGpu {
             device_id,
-            canonical_name: "AMD Radeon 890M / 8060S Graphics",
+            canonical_name: "AMD Radeon 890M / 880M Graphics (Strix Point)",
+            gfx_target: "gfx1150",
+            architecture: GpuArchitecture::Rdna35,
+            discrete: false,
+        }),
+        0x1586 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon 8060S / 8050S Graphics (Strix Halo)",
             gfx_target: "gfx1151",
+            architecture: GpuArchitecture::Rdna35,
+            discrete: false,
+        }),
+        0x1114 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon 860M / 840M Graphics (Krackan Point)",
+            gfx_target: "gfx1152",
             architecture: GpuArchitecture::Rdna35,
             discrete: false,
         }),
@@ -368,6 +490,13 @@ pub const fn lookup_amd_pci_device(device_id: u32) -> Option<KnownAmdGpu> {
         0x7550 => Some(KnownAmdGpu {
             device_id,
             canonical_name: "AMD Radeon RX 9070 / 9070 XT",
+            gfx_target: "gfx1201",
+            architecture: GpuArchitecture::Rdna4,
+            discrete: true,
+        }),
+        0x7551 => Some(KnownAmdGpu {
+            device_id,
+            canonical_name: "AMD Radeon AI PRO R9700",
             gfx_target: "gfx1201",
             architecture: GpuArchitecture::Rdna4,
             discrete: true,

@@ -1,0 +1,30 @@
+[device]
+name = "AMD Radeon RX 9070"
+gfx_target = "gfx1201"
+architecture = "RDNA4"
+pci_vendor_id = "0x1002"
+pci_device_ids = ["0x7550"]
+discrete = true
+
+[compute]
+compute_units = 56
+wgp_count = 28
+simds_per_cu = 2
+wave_sizes = [32, 64]
+lds_bytes_per_cu = 65536
+vulkan_max_shared_memory_bytes = 32768
+
+[memory]
+vram_bytes = 17179869184
+bus_width_bits = 256
+l2_cache_bytes = 8388608
+infinity_cache_bytes = 67108864
+
+[capabilities]
+fp16 = true
+bf16 = true
+fp8 = true
+dp4a_i8 = true
+dot8_i4 = true
+wmma = true
+mfma = false

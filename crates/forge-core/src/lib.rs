@@ -10,7 +10,10 @@ pub use architecture::{
 };
 pub use error::{ForgeError, ForgeResult};
 pub use policy::{select_preferred_device, validate_kernel_execution, KernelRequirements};
-pub use profile::HardwareProfile;
+pub use profile::{
+    builtin_profile_by_id, builtin_profiles, match_profile_for_device, BuiltinProfileInfo,
+    HardwareProfile,
+};
 pub use status::{
     BackendKind, BackendStatus, CapabilityResult, DiagnosticReport, GpuDeviceInfo, SupportStatus,
     SystemInfo,
@@ -225,5 +228,207 @@ mod tests {
             select_preferred_device(&[]),
             Err(ForgeError::DeviceNotFound(_))
         ));
+    }
+
+    #[test]
+    fn all_builtin_profiles_parse_and_validate() {
+        let profiles = builtin_profiles();
+        assert_eq!(profiles.len(), 18);
+
+        for entry in &profiles {
+            let target = entry
+                .profile
+                .validate()
+                .expect("built-in profile must validate");
+            match target.architecture {
+                GpuArchitecture::Rdna2 => {
+                    assert!(!entry.profile.capabilities.wmma, "{}", entry.id);
+                    assert!(!entry.profile.capabilities.bf16, "{}", entry.id);
+                    assert!(!entry.profile.capabilities.fp8, "{}", entry.id);
+                }
+                GpuArchitecture::Rdna3 | GpuArchitecture::Rdna35 => {
+                    assert!(entry.profile.capabilities.wmma, "{}", entry.id);
+                    assert!(entry.profile.capabilities.bf16, "{}", entry.id);
+                    assert!(!entry.profile.capabilities.fp8, "{}", entry.id);
+                }
+                GpuArchitecture::Rdna4 => {
+                    assert!(entry.profile.capabilities.wmma, "{}", entry.id);
+                    assert!(entry.profile.capabilities.bf16, "{}", entry.id);
+                    assert!(entry.profile.capabilities.fp8, "{}", entry.id);
+                }
+                other => panic!(
+                    "unexpected built-in profile architecture {other} for {}",
+                    entry.id
+                ),
+            }
+        }
+
+        assert!(builtin_profile_by_id("RX7900XTX").is_some());
+        assert!(builtin_profile_by_id("nonexistent_gpu").is_none());
+    }
+
+    #[test]
+    fn pci_lookup_covers_rdna2_rdna3_rdna35_rdna4_and_workstation() {
+        let strix_point = lookup_amd_pci_device(0x150E).expect("0x150E should map Strix Point");
+        assert_eq!(strix_point.gfx_target, "gfx1150");
+        assert_eq!(strix_point.architecture, GpuArchitecture::Rdna35);
+        assert!(!strix_point.discrete);
+
+        let strix_halo = lookup_amd_pci_device(0x1586).expect("0x1586 should map Strix Halo");
+        assert_eq!(strix_halo.gfx_target, "gfx1151");
+        assert_eq!(strix_halo.architecture, GpuArchitecture::Rdna35);
+        assert!(!strix_halo.discrete);
+
+        let krackan = lookup_amd_pci_device(0x1114).expect("0x1114 should map Krackan Point");
+        assert_eq!(krackan.gfx_target, "gfx1152");
+        assert_eq!(krackan.architecture, GpuArchitecture::Rdna35);
+
+        for (id, gfx, arch) in [
+            (0x73A5u32, "gfx1030", GpuArchitecture::Rdna2),
+            (0x7449, "gfx1100", GpuArchitecture::Rdna3),
+            (0x7551, "gfx1201", GpuArchitecture::Rdna4),
+            (0x7550, "gfx1201", GpuArchitecture::Rdna4),
+            (0x7590, "gfx1200", GpuArchitecture::Rdna4),
+        ] {
+            let info = lookup_amd_pci_device(id).expect("PCI ID must be known");
+            assert_eq!(info.gfx_target, gfx);
+            assert_eq!(info.architecture, arch);
+            assert!(info.discrete);
+        }
+    }
+
+    #[test]
+    fn profile_matcher_disambiguates_shared_pci_ids_and_rejects_non_amd() {
+        let mut xtx = sample_device(
+            0,
+            "AMD Radeon RX 7900 XTX",
+            AMD_PCI_VENDOR_ID,
+            0x744C,
+            GpuArchitecture::Rdna3,
+            true,
+            24 * 1024 * 1024 * 1024,
+        );
+        xtx.compute_units = Some(96);
+        assert_eq!(match_profile_for_device(&xtx).unwrap().id, "rx7900xtx");
+
+        let mut xt = sample_device(
+            0,
+            "AMD Radeon RX 7900 XT",
+            AMD_PCI_VENDOR_ID,
+            0x744C,
+            GpuArchitecture::Rdna3,
+            true,
+            20 * 1024 * 1024 * 1024,
+        );
+        xt.compute_units = Some(84);
+        assert_eq!(match_profile_for_device(&xt).unwrap().id, "rx7900xt");
+
+        let mut rx7800 = sample_device(
+            0,
+            "AMD Radeon RX 7800 XT",
+            AMD_PCI_VENDOR_ID,
+            0x747E,
+            GpuArchitecture::Rdna3,
+            true,
+            16 * 1024 * 1024 * 1024,
+        );
+        rx7800.compute_units = Some(60);
+        assert_eq!(match_profile_for_device(&rx7800).unwrap().id, "rx7800xt");
+
+        let mut rx7700 = sample_device(
+            0,
+            "AMD Radeon RX 7700 XT",
+            AMD_PCI_VENDOR_ID,
+            0x747E,
+            GpuArchitecture::Rdna3,
+            true,
+            12 * 1024 * 1024 * 1024,
+        );
+        rx7700.compute_units = Some(54);
+        assert_eq!(match_profile_for_device(&rx7700).unwrap().id, "rx7700xt");
+
+        let mut rx9070xt = sample_device(
+            0,
+            "AMD Radeon RX 9070 XT",
+            AMD_PCI_VENDOR_ID,
+            0x7550,
+            GpuArchitecture::Rdna4,
+            true,
+            16 * 1024 * 1024 * 1024,
+        );
+        rx9070xt.compute_units = Some(64);
+        assert_eq!(match_profile_for_device(&rx9070xt).unwrap().id, "rx9070xt");
+
+        let mut rx9070 = sample_device(
+            0,
+            "AMD Radeon RX 9070",
+            AMD_PCI_VENDOR_ID,
+            0x7550,
+            GpuArchitecture::Rdna4,
+            true,
+            16 * 1024 * 1024 * 1024,
+        );
+        rx9070.compute_units = Some(56);
+        assert_eq!(match_profile_for_device(&rx9070).unwrap().id, "rx9070");
+
+        let mut rx6900 = sample_device(
+            0,
+            "AMD Radeon RX 6900 XT",
+            AMD_PCI_VENDOR_ID,
+            0x73BF,
+            GpuArchitecture::Rdna2,
+            true,
+            16 * 1024 * 1024 * 1024,
+        );
+        rx6900.compute_units = Some(80);
+        // Even on shared PCI ID 0x73BF, RX 6900 XT must match rx6900xt over rx6800xt
+        assert_eq!(match_profile_for_device(&rx6900).unwrap().id, "rx6900xt");
+
+        let mut rx6800xt = sample_device(
+            0,
+            "AMD Radeon RX 6800 XT",
+            AMD_PCI_VENDOR_ID,
+            0x73BF,
+            GpuArchitecture::Rdna2,
+            true,
+            16 * 1024 * 1024 * 1024,
+        );
+        rx6800xt.compute_units = Some(72);
+        assert_eq!(match_profile_for_device(&rx6800xt).unwrap().id, "rx6800xt");
+
+        let mut halo = sample_device(
+            0,
+            "AMD Radeon(TM) 8060S Graphics",
+            AMD_PCI_VENDOR_ID,
+            0x1586,
+            GpuArchitecture::Rdna35,
+            false,
+            512 * 1024 * 1024,
+        );
+        halo.compute_units = Some(40);
+        assert_eq!(match_profile_for_device(&halo).unwrap().id, "radeon8060s");
+
+        let mut strix = sample_device(
+            0,
+            "AMD Radeon 890M Graphics",
+            AMD_PCI_VENDOR_ID,
+            0x150E,
+            GpuArchitecture::Rdna35,
+            false,
+            512 * 1024 * 1024,
+        );
+        strix.compute_units = Some(16);
+        assert_eq!(match_profile_for_device(&strix).unwrap().id, "radeon890m");
+
+        let non_amd = sample_device(
+            0,
+            "Other Discrete GPU",
+            0x10DE,
+            0x2684,
+            GpuArchitecture::Unknown,
+            true,
+            24 * 1024 * 1024 * 1024,
+        );
+        assert!(match_profile_for_device(&non_amd).is_none());
     }
 }

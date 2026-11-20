@@ -1,0 +1,30 @@
+[device]
+name = "AMD Radeon RX 7900 XTX"
+gfx_target = "gfx1100"
+architecture = "RDNA3"
+pci_vendor_id = "0x1002"
+pci_device_ids = ["0x744C"]
+discrete = true
+
+[compute]
+compute_units = 96
+wgp_count = 48
+simds_per_cu = 2
+wave_sizes = [32, 64]
+lds_bytes_per_cu = 65536
+vulkan_max_shared_memory_bytes = 32768
+
+[memory]
+vram_bytes = 25769803776
+bus_width_bits = 384
+l2_cache_bytes = 6291456
+infinity_cache_bytes = 100663296
+
+[capabilities]
+fp16 = true
+bf16 = true
+fp8 = false
+dp4a_i8 = true
+dot8_i4 = true
+wmma = true
+mfma = false
