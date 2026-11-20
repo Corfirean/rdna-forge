@@ -12,9 +12,11 @@ pub use sampler::{
     snapshot_for_device, TelemetryGuard,
 };
 pub use tuning::{
+    adlx_result_name, adlx_succeeded, change_power_limit, reset_to_factory, FactoryResetControl,
     FanCurvePoint, FanTuningInfo, GfxTuningInfo, GpuTuningReport, IntRange, MemoryTimingMode,
-    PowerLimitChangeResult, PowerTuningInfo, PresetTuningInfo, TuningCapabilities,
-    TuningResetResult, VramTuningInfo,
+    OperationStatus, PowerLimitChangeResult, PowerLimitControl, PowerLimitOutcome, PowerTuningInfo,
+    PresetTuningInfo, ResetOutcome, RollbackStatus, TuningCapabilities, TuningResetResult,
+    VramTuningInfo,
 };
 pub use types::{
     check_competing_workload_warning, check_vram_pressure_warning, format_sample_csv_row,

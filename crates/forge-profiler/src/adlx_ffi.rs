@@ -22,8 +22,8 @@ mod imp {
 
     #[repr(C)]
     pub(crate) struct IAdlxInterfaceVtbl {
-        pub(crate) acquire: unsafe extern "system" fn(*mut IAdlxInterface) -> isize, // [0]
-        pub(crate) release: unsafe extern "system" fn(*mut IAdlxInterface) -> isize, // [1]
+        pub(crate) acquire: unsafe extern "system" fn(*mut IAdlxInterface) -> i32, // [0]
+        pub(crate) release: unsafe extern "system" fn(*mut IAdlxInterface) -> i32, // [1]
         pub(crate) query_interface:
             unsafe extern "system" fn(*mut IAdlxInterface, *const u16, *mut *mut c_void) -> i32, // [2]
     }
@@ -59,17 +59,17 @@ mod imp {
 
     #[repr(C)]
     struct IAdlxGpuListVtbl {
-        acquire: unsafe extern "system" fn(*mut IAdlxGpuList) -> isize, // [0]
-        release: unsafe extern "system" fn(*mut IAdlxGpuList) -> isize, // [1]
-        query_interface: *const c_void,                                 // [2]
-        size: unsafe extern "system" fn(*mut IAdlxGpuList) -> u32,      // [3]
-        empty: *const c_void,                                           // [4]
-        begin: *const c_void,                                           // [5]
-        end: *const c_void,                                             // [6]
-        at: *const c_void,                                              // [7]
-        clear: *const c_void,                                           // [8]
-        remove_back: *const c_void,                                     // [9]
-        add_back: *const c_void,                                        // [10]
+        acquire: unsafe extern "system" fn(*mut IAdlxGpuList) -> i32, // [0]
+        release: unsafe extern "system" fn(*mut IAdlxGpuList) -> i32, // [1]
+        query_interface: *const c_void,                               // [2]
+        size: unsafe extern "system" fn(*mut IAdlxGpuList) -> u32,    // [3]
+        empty: *const c_void,                                         // [4]
+        begin: *const c_void,                                         // [5]
+        end: *const c_void,                                           // [6]
+        at: *const c_void,                                            // [7]
+        clear: *const c_void,                                         // [8]
+        remove_back: *const c_void,                                   // [9]
+        add_back: *const c_void,                                      // [10]
         at_gpu_list: unsafe extern "system" fn(*mut IAdlxGpuList, u32, *mut *mut IAdlxGpu) -> i32, // [11]
         add_back_gpu_list: *const c_void, // [12]
     }
@@ -81,24 +81,24 @@ mod imp {
 
     #[repr(C)]
     struct IAdlxGpuVtbl {
-        acquire: unsafe extern "system" fn(*mut IAdlxGpu) -> isize, // [0]
-        release: unsafe extern "system" fn(*mut IAdlxGpu) -> isize, // [1]
-        query_interface: *const c_void,                             // [2]
-        vendor_id: *const c_void,                                   // [3]
-        asic_family_type: *const c_void,                            // [4]
+        acquire: unsafe extern "system" fn(*mut IAdlxGpu) -> i32, // [0]
+        release: unsafe extern "system" fn(*mut IAdlxGpu) -> i32, // [1]
+        query_interface: *const c_void,                           // [2]
+        vendor_id: *const c_void,                                 // [3]
+        asic_family_type: *const c_void,                          // [4]
         gpu_type: unsafe extern "system" fn(*mut IAdlxGpu, *mut i32) -> i32, // [5]
-        is_external: *const c_void,                                 // [6]
+        is_external: *const c_void,                               // [6]
         name: unsafe extern "system" fn(*mut IAdlxGpu, *mut *const c_char) -> i32, // [7]
-        driver_path: *const c_void,                                 // [8]
-        pnp_string: *const c_void,                                  // [9]
-        has_desktops: *const c_void,                                // [10]
+        driver_path: *const c_void,                               // [8]
+        pnp_string: *const c_void,                                // [9]
+        has_desktops: *const c_void,                              // [10]
         total_vram: unsafe extern "system" fn(*mut IAdlxGpu, *mut u32) -> i32, // [11]
-        vram_type: *const c_void,                                   // [12]
-        bios_info: *const c_void,                                   // [13]
+        vram_type: *const c_void,                                 // [12]
+        bios_info: *const c_void,                                 // [13]
         device_id: unsafe extern "system" fn(*mut IAdlxGpu, *mut *const c_char) -> i32, // [14]
-        revision_id: *const c_void,                                 // [15]
-        sub_system_id: *const c_void,                               // [16]
-        sub_system_vendor_id: *const c_void,                        // [17]
+        revision_id: *const c_void,                               // [15]
+        sub_system_id: *const c_void,                             // [16]
+        sub_system_vendor_id: *const c_void,                      // [17]
         unique_id: unsafe extern "system" fn(*mut IAdlxGpu, *mut i32) -> i32, // [18]
     }
 
@@ -109,24 +109,24 @@ mod imp {
 
     #[repr(C)]
     struct IAdlxPerfMonVtbl {
-        acquire: unsafe extern "system" fn(*mut IAdlxPerfMon) -> isize, // [0]
-        release: unsafe extern "system" fn(*mut IAdlxPerfMon) -> isize, // [1]
-        query_interface: *const c_void,                                 // [2]
-        get_sampling_interval_range: *const c_void,                     // [3]
-        set_sampling_interval: *const c_void,                           // [4]
-        get_sampling_interval: *const c_void,                           // [5]
-        get_max_perf_metrics_history_size_range: *const c_void,         // [6]
-        set_max_perf_metrics_history_size: *const c_void,               // [7]
-        get_max_perf_metrics_history_size: *const c_void,               // [8]
-        clear_perf_metrics_history: *const c_void,                      // [9]
-        get_current_perf_metrics_history_size: *const c_void,           // [10]
-        start_perf_metrics_tracking: *const c_void,                     // [11]
-        stop_perf_metrics_tracking: *const c_void,                      // [12]
-        get_all_metrics_history: *const c_void,                         // [13]
-        get_gpu_metrics_history: *const c_void,                         // [14]
-        get_system_metrics_history: *const c_void,                      // [15]
-        get_fps_history: *const c_void,                                 // [16]
-        get_current_all_metrics: *const c_void,                         // [17]
+        acquire: unsafe extern "system" fn(*mut IAdlxPerfMon) -> i32, // [0]
+        release: unsafe extern "system" fn(*mut IAdlxPerfMon) -> i32, // [1]
+        query_interface: *const c_void,                               // [2]
+        get_sampling_interval_range: *const c_void,                   // [3]
+        set_sampling_interval: *const c_void,                         // [4]
+        get_sampling_interval: *const c_void,                         // [5]
+        get_max_perf_metrics_history_size_range: *const c_void,       // [6]
+        set_max_perf_metrics_history_size: *const c_void,             // [7]
+        get_max_perf_metrics_history_size: *const c_void,             // [8]
+        clear_perf_metrics_history: *const c_void,                    // [9]
+        get_current_perf_metrics_history_size: *const c_void,         // [10]
+        start_perf_metrics_tracking: *const c_void,                   // [11]
+        stop_perf_metrics_tracking: *const c_void,                    // [12]
+        get_all_metrics_history: *const c_void,                       // [13]
+        get_gpu_metrics_history: *const c_void,                       // [14]
+        get_system_metrics_history: *const c_void,                    // [15]
+        get_fps_history: *const c_void,                               // [16]
+        get_current_all_metrics: *const c_void,                       // [17]
         get_current_gpu_metrics: unsafe extern "system" fn(
             *mut IAdlxPerfMon,
             *mut IAdlxGpu,
@@ -141,9 +141,9 @@ mod imp {
 
     #[repr(C)]
     struct IAdlxGpuMetricsVtbl {
-        acquire: unsafe extern "system" fn(*mut IAdlxGpuMetrics) -> isize, // [0]
-        release: unsafe extern "system" fn(*mut IAdlxGpuMetrics) -> isize, // [1]
-        query_interface: *const c_void,                                    // [2]
+        acquire: unsafe extern "system" fn(*mut IAdlxGpuMetrics) -> i32, // [0]
+        release: unsafe extern "system" fn(*mut IAdlxGpuMetrics) -> i32, // [1]
+        query_interface: *const c_void,                                  // [2]
         time_stamp: unsafe extern "system" fn(*mut IAdlxGpuMetrics, *mut i64) -> i32, // [3]
         gpu_usage: unsafe extern "system" fn(*mut IAdlxGpuMetrics, *mut f64) -> i32, // [4]
         gpu_clock_speed: unsafe extern "system" fn(*mut IAdlxGpuMetrics, *mut i32) -> i32, // [5]
@@ -312,10 +312,13 @@ mod imp {
 
             let mut system_ptr: *mut IAdlxSystem = ptr::null_mut();
             let init_rc = unsafe { init_fn(full_ver, &mut system_ptr) };
-            if init_rc != ADLX_OK || system_ptr.is_null() {
+            if !crate::tuning::adlx_succeeded(init_rc) || system_ptr.is_null() {
                 return Err(ForgeError::RuntimeUnavailable {
                     runtime: "ADLX".to_string(),
-                    reason: format!("ADLXInitialize failed with code {init_rc}"),
+                    reason: format!(
+                        "ADLXInitialize failed: {}",
+                        crate::tuning::adlx_result_name(init_rc)
+                    ),
                 });
             }
 
@@ -520,6 +523,113 @@ mod imp {
     ) -> Option<f64> {
         let mut v = 0.0f64;
         (f(m, &mut v) == ADLX_OK && v.is_finite()).then_some(v)
+    }
+
+    // ABI layout tests. Slot numbers come from AMD's ADLX SDK headers (ISystem.h,
+    // IPerformanceMonitoring.h, ADLXDefines.h; branch `main`): each `slot!` is one verified
+    // C-vtable index. They fail if a field is reordered, removed or retyped.
+    #[cfg(test)]
+    mod abi_tests {
+        use super::*;
+        /// Asserts that a vtable field sits at the C vtable slot given by the upstream ADLX header.
+        macro_rules! slot {
+            ($t:ty, $f:ident, $i:expr) => {
+                assert_eq!(
+                    std::mem::offset_of!($t, $f),
+                    $i * std::mem::size_of::<usize>(),
+                    concat!(stringify!($t), "::", stringify!($f))
+                );
+            };
+        }
+
+        /// `adlx_long` is C `long`: 32-bit on Windows x64 (LLP64). Compile-time check that
+        /// Acquire/Release are declared with an `i32` return, not a pointer-sized integer.
+        #[allow(dead_code)]
+        fn acquire_release_return_32_bit(
+            v: &IAdlxInterfaceVtbl,
+        ) -> (
+            unsafe extern "system" fn(*mut IAdlxInterface) -> i32,
+            unsafe extern "system" fn(*mut IAdlxInterface) -> i32,
+        ) {
+            (v.acquire, v.release)
+        }
+
+        #[test]
+        fn interface_and_list_vtables_match_the_header() {
+            slot!(IAdlxInterfaceVtbl, acquire, 0);
+            slot!(IAdlxInterfaceVtbl, release, 1);
+            slot!(IAdlxInterfaceVtbl, query_interface, 2);
+            assert_eq!(std::mem::size_of::<IAdlxInterfaceVtbl>(), 3 * 8);
+
+            // IADLXGPUList: IADLXList members at 3..=10, typed At_GPUList at 11, Add_Back at 12.
+            slot!(IAdlxGpuListVtbl, acquire, 0);
+            slot!(IAdlxGpuListVtbl, release, 1);
+            slot!(IAdlxGpuListVtbl, size, 3);
+            slot!(IAdlxGpuListVtbl, at_gpu_list, 11);
+            slot!(IAdlxGpuListVtbl, add_back_gpu_list, 12);
+            assert_eq!(std::mem::size_of::<IAdlxGpuListVtbl>(), 13 * 8);
+        }
+
+        #[test]
+        fn system_vtable_matches_the_header_and_has_no_iunknown_prefix() {
+            // IADLXSystem does NOT derive from IADLXInterface: slot 0 is GetHybridGraphicsType.
+            slot!(IAdlxSystemVtbl, get_hybrid_graphics_type, 0);
+            slot!(IAdlxSystemVtbl, get_gpus, 1);
+            slot!(IAdlxSystemVtbl, query_interface, 2);
+            slot!(IAdlxSystemVtbl, get_displays_services, 3);
+            slot!(IAdlxSystemVtbl, get_desktops_services, 4);
+            slot!(IAdlxSystemVtbl, get_gpus_changed_handling, 5);
+            slot!(IAdlxSystemVtbl, enable_log, 6);
+            slot!(IAdlxSystemVtbl, get_3d_settings_services, 7);
+            slot!(IAdlxSystemVtbl, get_gpu_tuning_services, 8);
+            slot!(IAdlxSystemVtbl, get_performance_monitoring_services, 9);
+            slot!(IAdlxSystemVtbl, total_system_ram, 10);
+            slot!(IAdlxSystemVtbl, get_i2c, 11);
+            assert_eq!(std::mem::size_of::<IAdlxSystemVtbl>(), 12 * 8);
+        }
+
+        #[test]
+        fn gpu_vtable_matches_the_header() {
+            slot!(IAdlxGpuVtbl, vendor_id, 3);
+            slot!(IAdlxGpuVtbl, asic_family_type, 4);
+            slot!(IAdlxGpuVtbl, gpu_type, 5);
+            slot!(IAdlxGpuVtbl, is_external, 6);
+            slot!(IAdlxGpuVtbl, name, 7);
+            slot!(IAdlxGpuVtbl, driver_path, 8);
+            slot!(IAdlxGpuVtbl, pnp_string, 9);
+            slot!(IAdlxGpuVtbl, has_desktops, 10);
+            slot!(IAdlxGpuVtbl, total_vram, 11);
+            slot!(IAdlxGpuVtbl, vram_type, 12);
+            slot!(IAdlxGpuVtbl, bios_info, 13);
+            slot!(IAdlxGpuVtbl, device_id, 14);
+            slot!(IAdlxGpuVtbl, revision_id, 15);
+            slot!(IAdlxGpuVtbl, sub_system_id, 16);
+            slot!(IAdlxGpuVtbl, sub_system_vendor_id, 17);
+            slot!(IAdlxGpuVtbl, unique_id, 18);
+            assert_eq!(std::mem::size_of::<IAdlxGpuVtbl>(), 19 * 8);
+            // ADLXDefines.h: GPUTYPE_UNDEFINED=0, GPUTYPE_INTEGRATED=1, GPUTYPE_DISCRETE=2.
+            assert_eq!(ADLX_GPU_TYPE_DISCRETE, 2);
+        }
+
+        #[test]
+        fn performance_monitoring_vtables_match_the_header() {
+            // IADLXPerformanceMonitoringServices: GetCurrentGPUMetrics is slot 18 (23 slots total).
+            slot!(IAdlxPerfMonVtbl, get_current_gpu_metrics, 18);
+            assert_eq!(std::mem::size_of::<IAdlxPerfMonVtbl>(), 19 * 8);
+
+            slot!(IAdlxGpuMetricsVtbl, time_stamp, 3);
+            slot!(IAdlxGpuMetricsVtbl, gpu_usage, 4);
+            slot!(IAdlxGpuMetricsVtbl, gpu_clock_speed, 5);
+            slot!(IAdlxGpuMetricsVtbl, gpu_vram_clock_speed, 6);
+            slot!(IAdlxGpuMetricsVtbl, gpu_temperature, 7);
+            slot!(IAdlxGpuMetricsVtbl, gpu_hotspot_temperature, 8);
+            slot!(IAdlxGpuMetricsVtbl, gpu_power, 9);
+            slot!(IAdlxGpuMetricsVtbl, gpu_total_board_power, 10);
+            slot!(IAdlxGpuMetricsVtbl, gpu_fan_speed, 11);
+            slot!(IAdlxGpuMetricsVtbl, gpu_vram, 12);
+            slot!(IAdlxGpuMetricsVtbl, gpu_voltage, 13);
+            assert_eq!(std::mem::size_of::<IAdlxGpuMetricsVtbl>(), 14 * 8);
+        }
     }
 }
 

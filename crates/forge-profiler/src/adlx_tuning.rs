@@ -7,9 +7,10 @@ use forge_core::{ForgeError, ForgeResult};
 
 use crate::adlx_ffi::{AdlxSession, IAdlxGpu, IAdlxInterface, OwnedGpu, OwnedInterface, ADLX_OK};
 use crate::tuning::{
-    check_power_limit_readback, check_reset_readback, FanCurvePoint, FanTuningInfo, GfxTuningInfo,
-    GpuTuningReport, IntRange, MemoryTimingMode, PowerLimitChangeResult, PowerTuningInfo,
-    PresetTuningInfo, TuningCapabilities, TuningResetResult, VramTuningInfo,
+    adlx_succeeded, change_power_limit, reset_to_factory, FactoryResetControl, FanCurvePoint,
+    FanTuningInfo, GfxTuningInfo, GpuTuningReport, IntRange, MemoryTimingMode, OperationStatus,
+    PowerLimitChangeResult, PowerLimitControl, PowerTuningInfo, PresetTuningInfo,
+    TuningCapabilities, TuningResetResult, VramTuningInfo,
 };
 
 #[repr(C)]
@@ -262,6 +263,54 @@ unsafe fn read_bool(
 ) -> Option<bool> {
     let mut v: u8 = 0;
     (f(obj.as_raw().cast(), &mut v) == ADLX_OK).then_some(v != 0)
+}
+
+/// Real ADLX implementation of [`PowerLimitControl`] over `IADLXManualPowerTuning(1)`.
+struct AdlxPowerControl<'a> {
+    obj: &'a OwnedInterface,
+    vt: &'a IAdlxManualPowerTuning1Vtbl,
+}
+
+impl PowerLimitControl for AdlxPowerControl<'_> {
+    fn read(&mut self) -> Option<i32> {
+        // SAFETY: `vt` was derived from `obj`, which keeps the COM object alive for `'a`.
+        unsafe { read_i32(self.obj, self.vt.get_power_limit) }
+    }
+
+    fn write(&mut self, value_pct: i32) -> Result<(), i32> {
+        // SAFETY: slot [5] of IADLXManualPowerTuning is `SetPowerLimit(adlx_int)`; verified against
+        // the upstream header (see the ABI layout tests).
+        let rc = unsafe { (self.vt.set_power_limit)(self.obj.as_raw().cast(), value_pct) };
+        if adlx_succeeded(rc) {
+            Ok(())
+        } else {
+            Err(rc)
+        }
+    }
+}
+
+/// Real ADLX implementation of [`FactoryResetControl`] over `IADLXGPUTuningServices`.
+struct AdlxResetControl<'a> {
+    svc_ptr: *mut c_void,
+    vt: &'a IAdlxGpuTuningServicesVtbl,
+    gpu: *mut IAdlxGpu,
+}
+
+impl FactoryResetControl for AdlxResetControl<'_> {
+    fn is_at_factory(&mut self) -> Option<bool> {
+        // SAFETY: `svc_ptr`/`gpu` are live COM pointers owned by the caller's session.
+        unsafe { call_gpu_bool(self.vt, self.svc_ptr, self.vt.is_at_factory, self.gpu) }
+    }
+
+    fn reset(&mut self) -> Result<(), i32> {
+        // SAFETY: slot [5] of IADLXGPUTuningServices is `ResetToFactory(IADLXGPU*)`.
+        let rc = unsafe { (self.vt.reset_to_factory)(self.svc_ptr, self.gpu) };
+        if adlx_succeeded(rc) {
+            Ok(())
+        } else {
+            Err(rc)
+        }
+    }
 }
 
 unsafe fn read_i32(
@@ -890,48 +939,30 @@ impl AdlxSession {
                 "ADLX did not expose a valid power limit range for {gpu_name}"
             ))
         })?;
-        let previous_limit_pct = info.power_limit_pct.ok_or_else(|| {
-            ForgeError::ExecutionFailed(format!("ADLX GetPowerLimit failed for {gpu_name}"))
-        })?;
 
-        allowed_range.validate(limit_pct, "power_limit_pct")?;
-
-        if dry_run {
-            return Ok(PowerLimitChangeResult {
-                gpu_name,
-                pci_device_id: dev_id,
-                previous_limit_pct,
-                requested_limit_pct: limit_pct,
-                allowed_range,
-                default_limit_pct: info.power_limit_default_pct,
-                applied: false,
-                verified_limit_pct: None,
-                confirmed: false,
-            });
-        }
-
+        // Read -> validate -> (dry run stops) -> write -> read back -> compare -> restore on
+        // contradiction. That logic lives in `change_power_limit` and is tested against a fake
+        // backend; this adapter only forwards to ADLX.
         let pvt = unsafe { vtbl::<IAdlxManualPowerTuning1Vtbl>(&power_obj) };
-        let rc = unsafe { (pvt.set_power_limit)(power_obj.as_raw().cast(), limit_pct) };
-        if rc != ADLX_OK {
-            return Err(ForgeError::ExecutionFailed(format!(
-                "ADLX SetPowerLimit({limit_pct}%) failed on {gpu_name} with code {rc}"
-            )));
-        }
-
-        let verified_limit_pct = unsafe { read_i32(&power_obj, pvt.get_power_limit) };
-        // A mismatching read-back is an error: the request must not be reported as successful.
-        let confirmed =
-            check_power_limit_readback(limit_pct, previous_limit_pct, verified_limit_pct)?;
+        let mut control = AdlxPowerControl {
+            obj: &power_obj,
+            vt: pvt,
+        };
+        let outcome = change_power_limit(&mut control, &allowed_range, limit_pct, dry_run)?;
         Ok(PowerLimitChangeResult {
             gpu_name,
             pci_device_id: dev_id,
-            previous_limit_pct,
+            previous_limit_pct: outcome.previous_pct,
             requested_limit_pct: limit_pct,
             allowed_range,
             default_limit_pct: info.power_limit_default_pct,
-            applied: true,
-            verified_limit_pct,
-            confirmed,
+            applied: outcome.status != OperationStatus::NotApplied,
+            verified_limit_pct: outcome.verified_pct,
+            confirmed: outcome.status == OperationStatus::Confirmed,
+            status: outcome.status,
+            rollback: outcome.rollback,
+            rollback_verified_limit_pct: outcome.rollback_verified_pct,
+            error: outcome.error,
         })
     }
 
@@ -950,33 +981,215 @@ impl AdlxSession {
             TuningCapabilities::any_supported,
         )?;
 
-        if dry_run {
-            return Ok(TuningResetResult {
-                gpu_name,
-                pci_device_id: dev_id,
-                was_at_factory,
-                applied: false,
-                now_at_factory: was_at_factory,
-                confirmed: false,
-            });
-        }
-
-        let rc = unsafe { (vt.reset_to_factory)(svc_ptr, gpu.0) };
-        if rc != ADLX_OK {
-            return Err(ForgeError::ExecutionFailed(format!(
-                "ADLX ResetToFactory failed on {gpu_name} with code {rc}"
-            )));
-        }
-
-        let now_at_factory = unsafe { call_gpu_bool(vt, svc_ptr, vt.is_at_factory, gpu.0) };
-        let confirmed = check_reset_readback(now_at_factory)?;
+        let mut control = AdlxResetControl {
+            svc_ptr,
+            vt,
+            gpu: gpu.0,
+        };
+        let outcome = reset_to_factory(&mut control, dry_run)?;
+        let _ = was_at_factory; // the control re-reads the state itself
         Ok(TuningResetResult {
             gpu_name,
             pci_device_id: dev_id,
-            was_at_factory,
-            applied: true,
-            now_at_factory,
-            confirmed,
+            was_at_factory: outcome.was_at_factory,
+            applied: outcome.status != OperationStatus::NotApplied,
+            now_at_factory: outcome.now_at_factory,
+            confirmed: outcome.status == OperationStatus::Confirmed,
+            status: outcome.status,
+            rollback: outcome.rollback,
+            error: outcome.error,
         })
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    //! ABI layout tests. Slot numbers come from AMD's ADLX SDK headers (IGPUTuning.h,
+    //! IGPUManualPowerTuning.h, IGPUManualGFXTuning.h, IGPUManualVRAMTuning.h,
+    //! IGPUManualFanTuning.h, IGPUPresetTuning.h, ICollections.h; branch `main`). Each `slot!` is
+    //! one verified C-vtable index; they fail if a field is reordered, removed or retyped.
+    use super::*;
+
+    /// Asserts that a vtable field sits at the C vtable slot given by the upstream ADLX header.
+    macro_rules! slot {
+        ($t:ty, $f:ident, $i:expr) => {
+            assert_eq!(
+                std::mem::offset_of!($t, $f),
+                $i * std::mem::size_of::<usize>(),
+                concat!(stringify!($t), "::", stringify!($f))
+            );
+        };
+    }
+
+    #[test]
+    fn gpu_tuning_services_vtable_matches_the_header() {
+        slot!(IAdlxGpuTuningServicesVtbl, is_at_factory, 4);
+        slot!(IAdlxGpuTuningServicesVtbl, reset_to_factory, 5);
+        slot!(IAdlxGpuTuningServicesVtbl, is_supported_auto_tuning, 6);
+        slot!(IAdlxGpuTuningServicesVtbl, is_supported_preset_tuning, 7);
+        slot!(
+            IAdlxGpuTuningServicesVtbl,
+            is_supported_manual_gfx_tuning,
+            8
+        );
+        slot!(
+            IAdlxGpuTuningServicesVtbl,
+            is_supported_manual_vram_tuning,
+            9
+        );
+        slot!(
+            IAdlxGpuTuningServicesVtbl,
+            is_supported_manual_fan_tuning,
+            10
+        );
+        slot!(
+            IAdlxGpuTuningServicesVtbl,
+            is_supported_manual_power_tuning,
+            11
+        );
+        slot!(IAdlxGpuTuningServicesVtbl, get_preset_tuning, 13);
+        slot!(IAdlxGpuTuningServicesVtbl, get_manual_gfx_tuning, 14);
+        slot!(IAdlxGpuTuningServicesVtbl, get_manual_vram_tuning, 15);
+        slot!(IAdlxGpuTuningServicesVtbl, get_manual_fan_tuning, 16);
+        slot!(IAdlxGpuTuningServicesVtbl, get_manual_power_tuning, 17);
+        assert_eq!(std::mem::size_of::<IAdlxGpuTuningServicesVtbl>(), 18 * 8);
+    }
+
+    #[test]
+    fn power_tuning_vtable_matches_the_header() {
+        // IADLXManualPowerTuning1: 0-2 IADLXInterface, 3-9 inherited, 10-11 own.
+        slot!(IAdlxManualPowerTuning1Vtbl, get_power_limit_range, 3);
+        slot!(IAdlxManualPowerTuning1Vtbl, get_power_limit, 4);
+        slot!(IAdlxManualPowerTuning1Vtbl, set_power_limit, 5);
+        slot!(IAdlxManualPowerTuning1Vtbl, is_supported_tdc_limit, 6);
+        slot!(IAdlxManualPowerTuning1Vtbl, get_tdc_limit_range, 7);
+        slot!(IAdlxManualPowerTuning1Vtbl, get_tdc_limit, 8);
+        slot!(IAdlxManualPowerTuning1Vtbl, get_power_limit_default, 10);
+        slot!(IAdlxManualPowerTuning1Vtbl, get_tdc_limit_default, 11);
+        assert_eq!(std::mem::size_of::<IAdlxManualPowerTuning1Vtbl>(), 12 * 8);
+    }
+
+    #[test]
+    fn preset_graphics_and_vram_vtables_match_the_header() {
+        // IADLXGPUPresetTuning (Set* methods 13-17 are intentionally not declared/called).
+        slot!(IAdlxGpuPresetTuningVtbl, is_supported_power_saver, 3);
+        slot!(IAdlxGpuPresetTuningVtbl, is_supported_rage, 7);
+        slot!(IAdlxGpuPresetTuningVtbl, is_current_power_saver, 8);
+        slot!(IAdlxGpuPresetTuningVtbl, is_current_rage, 12);
+
+        // IADLXManualGraphicsTuning2_1: 3-11 from Tuning2, defaults at 12-14.
+        slot!(
+            IAdlxManualGraphicsTuning2_1Vtbl,
+            get_gpu_min_frequency_range,
+            3
+        );
+        slot!(IAdlxManualGraphicsTuning2_1Vtbl, get_gpu_min_frequency, 4);
+        slot!(
+            IAdlxManualGraphicsTuning2_1Vtbl,
+            get_gpu_max_frequency_range,
+            6
+        );
+        slot!(IAdlxManualGraphicsTuning2_1Vtbl, get_gpu_max_frequency, 7);
+        slot!(IAdlxManualGraphicsTuning2_1Vtbl, get_gpu_voltage_range, 9);
+        slot!(IAdlxManualGraphicsTuning2_1Vtbl, get_gpu_voltage, 10);
+        slot!(
+            IAdlxManualGraphicsTuning2_1Vtbl,
+            get_gpu_min_frequency_default,
+            12
+        );
+        slot!(
+            IAdlxManualGraphicsTuning2_1Vtbl,
+            get_gpu_max_frequency_default,
+            13
+        );
+        slot!(
+            IAdlxManualGraphicsTuning2_1Vtbl,
+            get_gpu_voltage_default,
+            14
+        );
+        assert_eq!(
+            std::mem::size_of::<IAdlxManualGraphicsTuning2_1Vtbl>(),
+            15 * 8
+        );
+
+        // IADLXManualVRAMTuning2_1: 3-9 from VRAMTuning2, default at 10.
+        slot!(IAdlxManualVramTuning2_1Vtbl, is_supported_memory_timing, 3);
+        slot!(
+            IAdlxManualVramTuning2_1Vtbl,
+            get_supported_memory_timing_description_list,
+            4
+        );
+        slot!(
+            IAdlxManualVramTuning2_1Vtbl,
+            get_memory_timing_description,
+            5
+        );
+        slot!(
+            IAdlxManualVramTuning2_1Vtbl,
+            get_max_vram_frequency_range,
+            7
+        );
+        slot!(IAdlxManualVramTuning2_1Vtbl, get_max_vram_frequency, 8);
+        slot!(
+            IAdlxManualVramTuning2_1Vtbl,
+            get_max_vram_frequency_default,
+            10
+        );
+        assert_eq!(std::mem::size_of::<IAdlxManualVramTuning2_1Vtbl>(), 11 * 8);
+
+        // IADLXMemoryTimingDescriptionList (IADLXList + At_MemoryTimingDescriptionList=11) and
+        // IADLXMemoryTimingDescription::GetDescription=3.
+        slot!(IAdlxMemoryTimingDescriptionListVtbl, size, 3);
+        slot!(IAdlxMemoryTimingDescriptionListVtbl, at_list, 11);
+        slot!(IAdlxMemoryTimingDescriptionVtbl, get_description, 3);
+    }
+
+    #[test]
+    fn fan_vtables_match_the_header() {
+        // IADLXManualFanTuning1: 3-22 inherited from IADLXManualFanTuning, 23-27 own.
+        slot!(IAdlxManualFanTuning1Vtbl, get_fan_tuning_ranges, 3);
+        slot!(IAdlxManualFanTuning1Vtbl, get_fan_tuning_states, 4);
+        slot!(IAdlxManualFanTuning1Vtbl, is_supported_zero_rpm, 8);
+        slot!(IAdlxManualFanTuning1Vtbl, get_zero_rpm_state, 9);
+        slot!(
+            IAdlxManualFanTuning1Vtbl,
+            is_supported_min_acoustic_limit,
+            11
+        );
+        slot!(IAdlxManualFanTuning1Vtbl, get_min_acoustic_limit_range, 12);
+        slot!(IAdlxManualFanTuning1Vtbl, get_min_acoustic_limit, 13);
+        slot!(IAdlxManualFanTuning1Vtbl, is_supported_min_fan_speed, 15);
+        slot!(IAdlxManualFanTuning1Vtbl, get_min_fan_speed_range, 16);
+        slot!(IAdlxManualFanTuning1Vtbl, get_min_fan_speed, 17);
+        slot!(IAdlxManualFanTuning1Vtbl, is_supported_target_fan_speed, 19);
+        slot!(IAdlxManualFanTuning1Vtbl, get_target_fan_speed_range, 20);
+        slot!(IAdlxManualFanTuning1Vtbl, get_target_fan_speed, 21);
+        slot!(IAdlxManualFanTuning1Vtbl, get_default_fan_tuning_states, 23);
+        slot!(
+            IAdlxManualFanTuning1Vtbl,
+            get_min_acoustic_limit_default,
+            24
+        );
+        slot!(IAdlxManualFanTuning1Vtbl, get_min_fan_speed_default, 25);
+        slot!(IAdlxManualFanTuning1Vtbl, get_target_fan_speed_default, 26);
+        slot!(IAdlxManualFanTuning1Vtbl, get_default_zero_rpm_state, 27);
+        assert_eq!(std::mem::size_of::<IAdlxManualFanTuning1Vtbl>(), 28 * 8);
+
+        // IADLXManualFanTuningStateList: IADLXList 3-10, At_ManualFanTuningStateList=11.
+        slot!(IAdlxManualFanTuningStateListVtbl, size, 3);
+        slot!(IAdlxManualFanTuningStateListVtbl, at_list, 11);
+        // IADLXManualFanTuningState: GetFanSpeed=3, SetFanSpeed=4, GetTemperature=5.
+        slot!(IAdlxManualFanTuningStateVtbl, get_fan_speed, 3);
+        slot!(IAdlxManualFanTuningStateVtbl, get_temperature, 5);
+    }
+
+    #[test]
+    fn int_range_matches_adlx_intrange() {
+        // ADLX_IntRange { adlx_int minValue, maxValue, step } with adlx_int = int32.
+        assert_eq!(std::mem::size_of::<AdlxIntRange>(), 12);
+        assert_eq!(std::mem::align_of::<AdlxIntRange>(), 4);
+        assert_eq!(std::mem::offset_of!(AdlxIntRange, min_value), 0);
+        assert_eq!(std::mem::offset_of!(AdlxIntRange, max_value), 4);
+        assert_eq!(std::mem::offset_of!(AdlxIntRange, step), 8);
     }
 }

@@ -214,6 +214,313 @@ pub struct GpuTuningReport {
     pub fan: Option<FanTuningInfo>,
 }
 
+// ---------------------------------------------------------------------------------------------
+// ADLX result codes (ADLXDefines.h `ADLX_RESULT`, a plain C enum, 32-bit on MSVC).
+// Values 0..=10 are explicit in the header; 11..=18 follow by C sequential numbering.
+// ---------------------------------------------------------------------------------------------
+
+/// `ADLX_SUCCEEDED(x)`: `ADLX_OK`, `ADLX_ALREADY_ENABLED` or `ADLX_ALREADY_INITIALIZED`.
+pub fn adlx_succeeded(rc: i32) -> bool {
+    matches!(rc, 0..=2)
+}
+
+/// Human-readable `ADLX_RESULT` name, e.g. `ADLX_RESET_NEEDED (18)`.
+pub fn adlx_result_name(rc: i32) -> String {
+    const NAMES: [&str; 19] = [
+        "ADLX_OK",
+        "ADLX_ALREADY_ENABLED",
+        "ADLX_ALREADY_INITIALIZED",
+        "ADLX_FAIL",
+        "ADLX_INVALID_ARGS",
+        "ADLX_BAD_VER",
+        "ADLX_UNKNOWN_INTERFACE",
+        "ADLX_TERMINATED",
+        "ADLX_ADL_INIT_ERROR",
+        "ADLX_NOT_FOUND",
+        "ADLX_INVALID_OBJECT",
+        "ADLX_ORPHAN_OBJECTS",
+        "ADLX_NOT_SUPPORTED",
+        "ADLX_PENDING_OPERATION",
+        "ADLX_GPU_INACTIVE",
+        "ADLX_GPU_IN_USE",
+        "ADLX_TIMEOUT_OPERATION",
+        "ADLX_NOT_ACTIVE",
+        "ADLX_RESET_NEEDED",
+    ];
+    match usize::try_from(rc).ok().and_then(|i| NAMES.get(i)) {
+        Some(name) => format!("{name} ({rc})"),
+        None => format!("ADLX_RESULT({rc})"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Change / rollback state machine
+// ---------------------------------------------------------------------------------------------
+
+/// What happened to a requested change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    /// No change was made (dry run, nothing to do, or the driver rejected the request).
+    #[default]
+    NotApplied,
+    /// The driver accepted the request but the new state could not be read back.
+    Applied,
+    /// The driver accepted the request and the read-back matches it.
+    Confirmed,
+    /// The driver accepted the request but the read-back contradicts it.
+    NotConfirmed,
+}
+
+impl fmt::Display for OperationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotApplied => "NOT APPLIED",
+            Self::Applied => "APPLIED (UNVERIFIED)",
+            Self::Confirmed => "CONFIRMED",
+            Self::NotConfirmed => "NOT CONFIRMED",
+        })
+    }
+}
+
+/// What happened to the attempt to restore the previous value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackStatus {
+    /// No restore was needed (nothing changed, or the change is not known to have failed).
+    #[default]
+    NotNeeded,
+    /// This operation cannot be restored automatically.
+    Unsupported,
+    /// A restore request was issued but its result could not be read back.
+    Attempted,
+    /// The previous value was restored and read back.
+    Confirmed,
+    /// The restore request failed or the read-back still differs from the previous value.
+    Failed,
+}
+
+impl fmt::Display for RollbackStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotNeeded => "ROLLBACK NOT NEEDED",
+            Self::Unsupported => "ROLLBACK UNSUPPORTED",
+            Self::Attempted => "ROLLBACK ATTEMPTED (UNVERIFIED)",
+            Self::Confirmed => "ROLLBACK CONFIRMED",
+            Self::Failed => "ROLLBACK FAILED",
+        })
+    }
+}
+
+/// Minimal hardware surface needed to change and restore a power limit. The real implementation
+/// talks to ADLX; tests use a scripted fake, so the state machine is verified without a GPU.
+pub trait PowerLimitControl {
+    /// Reads the current limit (percent), or `None` if it cannot be read.
+    fn read(&mut self) -> Option<i32>;
+    /// Requests a new limit. `Err` carries the raw `ADLX_RESULT`.
+    fn write(&mut self, value_pct: i32) -> Result<(), i32>;
+}
+
+/// Result of [`change_power_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerLimitOutcome {
+    pub previous_pct: i32,
+    pub requested_pct: i32,
+    pub status: OperationStatus,
+    pub verified_pct: Option<i32>,
+    pub rollback: RollbackStatus,
+    pub rollback_verified_pct: Option<i32>,
+    pub error: Option<String>,
+}
+
+/// Validates, applies, verifies and (on a contradicting result) restores a power limit.
+///
+/// Order: read the original value -> validate the request against the hardware range ->
+/// (dry run stops here) -> write -> read back -> compare -> if the read-back contradicts the
+/// request, or a rejected write left the value changed or unknown, write the original value back
+/// and read it back again. A pre-validation failure returns `Err` and the hardware is never
+/// written. An unreadable read-back after an accepted write is reported as
+/// [`OperationStatus::Applied`] (unverified) and is *not* rolled back, because nothing shows that
+/// the change failed.
+pub fn change_power_limit(
+    ctl: &mut dyn PowerLimitControl,
+    range: &IntRange,
+    requested_pct: i32,
+    dry_run: bool,
+) -> ForgeResult<PowerLimitOutcome> {
+    let previous = ctl.read().ok_or_else(|| {
+        ForgeError::ExecutionFailed(
+            "cannot read the current power limit; refusing to change it without a restore point"
+                .to_string(),
+        )
+    })?;
+    range.validate(requested_pct, "power_limit_pct")?;
+
+    let mut out = PowerLimitOutcome {
+        previous_pct: previous,
+        requested_pct,
+        status: OperationStatus::NotApplied,
+        verified_pct: None,
+        rollback: RollbackStatus::NotNeeded,
+        rollback_verified_pct: None,
+        error: None,
+    };
+    if dry_run || requested_pct == previous {
+        return Ok(out);
+    }
+
+    let needs_rollback = match ctl.write(requested_pct) {
+        Err(rc) => {
+            let after = ctl.read();
+            out.verified_pct = after;
+            out.error = Some(format!(
+                "SetPowerLimit({requested_pct}%) was rejected: {}",
+                adlx_result_name(rc)
+            ));
+            if after == Some(previous) {
+                return Ok(out); // rejected, state unchanged: NOT APPLIED
+            }
+            out.status = OperationStatus::NotConfirmed;
+            true // value changed despite the error, or its state is unknown
+        }
+        Ok(()) => match ctl.read() {
+            Some(v) if v == requested_pct => {
+                out.status = OperationStatus::Confirmed;
+                out.verified_pct = Some(v);
+                false
+            }
+            Some(v) => {
+                out.status = OperationStatus::NotConfirmed;
+                out.verified_pct = Some(v);
+                out.error = Some(format!(
+                    "SetPowerLimit({requested_pct}%) was accepted but the driver reports {v}%"
+                ));
+                true
+            }
+            None => {
+                out.status = OperationStatus::Applied;
+                out.error = Some(
+                    "the driver accepted the request but the value could not be read back"
+                        .to_string(),
+                );
+                false
+            }
+        },
+    };
+
+    if needs_rollback {
+        match ctl.write(previous) {
+            Err(rc) => {
+                let after = ctl.read();
+                out.rollback_verified_pct = after;
+                out.rollback = if after == Some(previous) {
+                    RollbackStatus::Confirmed
+                } else {
+                    RollbackStatus::Failed
+                };
+                if out.rollback == RollbackStatus::Failed {
+                    append_error(
+                        &mut out.error,
+                        format!(
+                            "restoring {previous}% failed: {}; the GPU may still be at a changed power limit",
+                            adlx_result_name(rc)
+                        ),
+                    );
+                }
+            }
+            Ok(()) => {
+                let after = ctl.read();
+                out.rollback_verified_pct = after;
+                out.rollback = match after {
+                    Some(v) if v == previous => RollbackStatus::Confirmed,
+                    Some(v) => {
+                        append_error(
+                            &mut out.error,
+                            format!(
+                                "restore to {previous}% was accepted but the driver reports {v}%"
+                            ),
+                        );
+                        RollbackStatus::Failed
+                    }
+                    None => RollbackStatus::Attempted,
+                };
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn append_error(slot: &mut Option<String>, msg: String) {
+    *slot = Some(match slot.take() {
+        Some(existing) => format!("{existing}; {msg}"),
+        None => msg,
+    });
+}
+
+/// Minimal hardware surface for a factory reset.
+pub trait FactoryResetControl {
+    fn is_at_factory(&mut self) -> Option<bool>;
+    /// Requests the reset. `Err` carries the raw `ADLX_RESULT`.
+    fn reset(&mut self) -> Result<(), i32>;
+}
+
+/// Result of [`reset_to_factory`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetOutcome {
+    pub was_at_factory: Option<bool>,
+    pub now_at_factory: Option<bool>,
+    pub status: OperationStatus,
+    pub rollback: RollbackStatus,
+    pub error: Option<String>,
+}
+
+/// Requests a factory reset and verifies it by reading `IsAtFactory` back.
+///
+/// A reset discards the user's tuning profile and the previous profile is not captured, so there
+/// is nothing to restore: `rollback` is always [`RollbackStatus::Unsupported`] when a reset was
+/// requested. Dry runs and "already at factory" never write.
+pub fn reset_to_factory(
+    ctl: &mut dyn FactoryResetControl,
+    dry_run: bool,
+) -> ForgeResult<ResetOutcome> {
+    let was = ctl.is_at_factory();
+    let mut out = ResetOutcome {
+        was_at_factory: was,
+        now_at_factory: was,
+        status: OperationStatus::NotApplied,
+        rollback: RollbackStatus::NotNeeded,
+        error: None,
+    };
+    if dry_run || was == Some(true) {
+        return Ok(out);
+    }
+    out.rollback = RollbackStatus::Unsupported;
+    if let Err(rc) = ctl.reset() {
+        out.error = Some(format!(
+            "ResetToFactory was rejected: {}",
+            adlx_result_name(rc)
+        ));
+        return Ok(out);
+    }
+    out.now_at_factory = ctl.is_at_factory();
+    match out.now_at_factory {
+        Some(true) => out.status = OperationStatus::Confirmed,
+        Some(false) => {
+            out.status = OperationStatus::NotConfirmed;
+            out.error = Some(
+                "ResetToFactory was accepted but ADLX still reports non-factory tuning".to_string(),
+            );
+        }
+        None => {
+            out.status = OperationStatus::Applied;
+            out.error = Some(
+                "the reset was accepted but the factory state could not be read back".to_string(),
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Outcome of validating (dry-run) or applying a GPU power limit change via ADLX.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerLimitChangeResult {
@@ -223,13 +530,34 @@ pub struct PowerLimitChangeResult {
     pub requested_limit_pct: i32,
     pub allowed_range: IntRange,
     pub default_limit_pct: Option<i32>,
-    /// The driver accepted the change request (`SetPowerLimit` returned OK). Not proof of state.
+    /// The driver accepted a change request (`status` is not `NotApplied`).
     pub applied: bool,
-    /// Value read back from the driver after the request, if the read succeeded.
+    /// Value read back after the request, if the read succeeded.
     pub verified_limit_pct: Option<i32>,
-    /// True only when the read-back value equals the requested value.
+    /// True only when the read-back equals the requested value.
     #[serde(default)]
     pub confirmed: bool,
+    #[serde(default)]
+    pub status: OperationStatus,
+    #[serde(default)]
+    pub rollback: RollbackStatus,
+    /// Value read back after a rollback attempt, if any.
+    #[serde(default)]
+    pub rollback_verified_limit_pct: Option<i32>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl PowerLimitChangeResult {
+    /// True when the outcome is what the caller asked for: a confirmed change, or a dry run /
+    /// no-op that did not fail. Everything else must be reported as a failure.
+    pub fn succeeded(&self) -> bool {
+        match self.status {
+            OperationStatus::Confirmed => true,
+            OperationStatus::NotApplied => self.error.is_none(),
+            OperationStatus::Applied | OperationStatus::NotConfirmed => false,
+        }
+    }
 }
 
 /// Outcome of validating (dry-run) or executing an ADLX factory tuning reset.
@@ -238,43 +566,29 @@ pub struct TuningResetResult {
     pub gpu_name: String,
     pub pci_device_id: Option<u32>,
     pub was_at_factory: Option<bool>,
-    /// The driver accepted the reset request (`ResetToFactory` returned OK). Not proof of state.
+    /// The driver accepted a reset request (`status` is not `NotApplied`).
     pub applied: bool,
     /// State read back after the request, if the read succeeded.
     pub now_at_factory: Option<bool>,
     /// True only when the read-back reports the GPU is at factory settings.
     #[serde(default)]
     pub confirmed: bool,
+    #[serde(default)]
+    pub status: OperationStatus,
+    #[serde(default)]
+    pub rollback: RollbackStatus,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
-/// Interprets the read-back after a power-limit request.
-///
-/// `Ok(true)` = confirmed, `Ok(false)` = read-back unavailable (outcome unknown, must be shown
-/// as unconfirmed), `Err` = the driver reports a different value, i.e. the change did not take
-/// effect as requested.
-pub fn check_power_limit_readback(
-    requested_pct: i32,
-    previous_pct: i32,
-    readback: Option<i32>,
-) -> ForgeResult<bool> {
-    match readback {
-        Some(v) if v == requested_pct => Ok(true),
-        Some(v) => Err(ForgeError::ExecutionFailed(format!(
-            "SetPowerLimit({requested_pct}%) was accepted but the driver now reports {v}% (previous value was {previous_pct}%); the GPU power limit is not as requested"
-        ))),
-        None => Ok(false),
-    }
-}
-
-/// Interprets the read-back after a factory-reset request (see [`check_power_limit_readback`]).
-pub fn check_reset_readback(now_at_factory: Option<bool>) -> ForgeResult<bool> {
-    match now_at_factory {
-        Some(true) => Ok(true),
-        Some(false) => Err(ForgeError::ExecutionFailed(
-            "ResetToFactory was accepted but ADLX still reports non-factory tuning; the reset is not confirmed"
-                .to_string(),
-        )),
-        None => Ok(false),
+impl TuningResetResult {
+    /// See [`PowerLimitChangeResult::succeeded`].
+    pub fn succeeded(&self) -> bool {
+        match self.status {
+            OperationStatus::Confirmed => true,
+            OperationStatus::NotApplied => self.error.is_none(),
+            OperationStatus::Applied | OperationStatus::NotConfirmed => false,
+        }
     }
 }
 
@@ -282,21 +596,329 @@ pub fn check_reset_readback(now_at_factory: Option<bool>) -> ForgeResult<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn power_limit_readback_distinguishes_confirmed_mismatch_and_unknown() {
-        assert!(check_power_limit_readback(10, 0, Some(10)).unwrap());
-        assert!(!check_power_limit_readback(10, 0, None).unwrap());
-        let err = check_power_limit_readback(10, 0, Some(0))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not as requested") && err.contains("previous value was 0%"));
+    /// Scripted fake: models a power-limit register with configurable misbehavior.
+    struct FakePower {
+        value: Option<i32>,
+        /// Number of `write` calls and the values written, in order.
+        writes: Vec<i32>,
+        /// Per-write behavior, consumed in order; `Honor` once exhausted.
+        script: Vec<Write>,
+        /// When true, `read` returns None (sensor/read-back unavailable).
+        unreadable: bool,
+        /// Reads after this many `write` calls are unavailable (None); `usize::MAX` = never.
+        unreadable_after_writes: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Write {
+        /// Accept and store the value.
+        Honor,
+        /// Return OK but silently keep the old value (driver ignored it).
+        Ignore,
+        /// Return OK and store a different value.
+        StoreOther(i32),
+        /// Return this error and keep the old value.
+        Reject(i32),
+        /// Return this error but store the value anyway.
+        RejectButStore(i32),
+    }
+
+    impl FakePower {
+        fn new(value: i32, script: Vec<Write>) -> Self {
+            Self {
+                value: Some(value),
+                writes: Vec::new(),
+                script,
+                unreadable: false,
+                unreadable_after_writes: usize::MAX,
+            }
+        }
+    }
+
+    impl PowerLimitControl for FakePower {
+        fn read(&mut self) -> Option<i32> {
+            if self.unreadable || self.writes.len() >= self.unreadable_after_writes {
+                return None;
+            }
+            self.value
+        }
+        fn write(&mut self, v: i32) -> Result<(), i32> {
+            let step = if self.script.is_empty() {
+                Write::Honor
+            } else {
+                self.script.remove(0)
+            };
+            self.writes.push(v);
+            match step {
+                Write::Honor => {
+                    self.value = Some(v);
+                    Ok(())
+                }
+                Write::Ignore => Ok(()),
+                Write::StoreOther(o) => {
+                    self.value = Some(o);
+                    Ok(())
+                }
+                Write::Reject(rc) => Err(rc),
+                Write::RejectButStore(rc) => {
+                    self.value = Some(v);
+                    Err(rc)
+                }
+            }
+        }
+    }
+
+    fn range() -> IntRange {
+        IntRange::from_adlx(-10, 12, 1).unwrap()
     }
 
     #[test]
-    fn reset_readback_distinguishes_confirmed_mismatch_and_unknown() {
-        assert!(check_reset_readback(Some(true)).unwrap());
-        assert!(!check_reset_readback(None).unwrap());
-        assert!(check_reset_readback(Some(false)).is_err());
+    fn dry_run_never_writes_even_when_the_request_is_valid() {
+        let mut f = FakePower::new(0, vec![]);
+        let o = change_power_limit(&mut f, &range(), 5, true).unwrap();
+        assert!(f.writes.is_empty());
+        assert_eq!(o.status, OperationStatus::NotApplied);
+        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
+        assert_eq!(f.value, Some(0));
+    }
+
+    #[test]
+    fn invalid_or_unrestorable_requests_fail_before_any_write() {
+        let mut f = FakePower::new(0, vec![]);
+        assert!(change_power_limit(&mut f, &range(), 13, false).is_err()); // out of range
+        assert!(change_power_limit(&mut f, &range(), -11, false).is_err());
+        assert!(f.writes.is_empty());
+        // Without a readable original value there is no restore point: refuse.
+        let mut g = FakePower::new(0, vec![]);
+        g.unreadable = true;
+        let err = change_power_limit(&mut g, &range(), 5, false).unwrap_err();
+        assert!(err.to_string().contains("restore point"));
+        assert!(g.writes.is_empty());
+    }
+
+    #[test]
+    fn confirmed_change_needs_no_rollback() {
+        let mut f = FakePower::new(0, vec![]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(f.writes, vec![5]);
+        assert_eq!(o.status, OperationStatus::Confirmed);
+        assert_eq!(o.verified_pct, Some(5));
+        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
+        assert!(o.error.is_none());
+    }
+
+    #[test]
+    fn same_value_is_a_no_op_without_a_write() {
+        let mut f = FakePower::new(3, vec![]);
+        let o = change_power_limit(&mut f, &range(), 3, false).unwrap();
+        assert!(f.writes.is_empty());
+        assert_eq!(o.status, OperationStatus::NotApplied);
+        assert!(o.error.is_none());
+    }
+
+    #[test]
+    fn rejected_write_with_unchanged_state_is_not_applied_and_not_rolled_back() {
+        let mut f = FakePower::new(0, vec![Write::Reject(3)]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(f.writes, vec![5]); // no restore write: state never changed
+        assert_eq!(o.status, OperationStatus::NotApplied);
+        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
+        assert!(o.error.as_deref().unwrap().contains("ADLX_FAIL (3)"));
+    }
+
+    #[test]
+    fn contradicting_readback_triggers_a_confirmed_rollback() {
+        // Driver says OK but keeps the old value (ignored) -> NotConfirmed, restore is a no-op write.
+        let mut f = FakePower::new(0, vec![Write::Ignore]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.verified_pct, Some(0));
+        assert_eq!(f.writes, vec![5, 0]);
+        assert_eq!(o.rollback, RollbackStatus::Confirmed);
+        assert_eq!(f.value, Some(0));
+
+        // Driver stores a different value than requested -> restored to the original.
+        let mut f = FakePower::new(0, vec![Write::StoreOther(9)]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.verified_pct, Some(9));
+        assert_eq!(o.rollback, RollbackStatus::Confirmed);
+        assert_eq!(o.rollback_verified_pct, Some(0));
+        assert_eq!(f.value, Some(0));
+    }
+
+    #[test]
+    fn write_error_that_still_changed_the_value_is_rolled_back() {
+        let mut f = FakePower::new(0, vec![Write::RejectButStore(3)]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(f.writes, vec![5, 0]);
+        assert_eq!(o.rollback, RollbackStatus::Confirmed);
+        assert_eq!(f.value, Some(0));
+        assert!(o.error.as_deref().unwrap().contains("rejected"));
+    }
+
+    #[test]
+    fn failed_rollback_is_reported_as_failed_not_hidden() {
+        // Change is ignored AND the restore write is rejected while the value is wrong.
+        let mut f = FakePower::new(0, vec![Write::StoreOther(9), Write::Reject(12)]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.rollback, RollbackStatus::Failed);
+        assert_eq!(o.rollback_verified_pct, Some(9));
+        let e = o.error.unwrap();
+        assert!(e.contains("restoring 0% failed") && e.contains("ADLX_NOT_SUPPORTED (12)"));
+
+        // Restore accepted but the value stays wrong -> also FAILED.
+        let mut f = FakePower::new(0, vec![Write::StoreOther(9), Write::StoreOther(7)]);
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.rollback, RollbackStatus::Failed);
+        assert_eq!(o.rollback_verified_pct, Some(7));
+    }
+
+    #[test]
+    fn rollback_that_cannot_be_read_back_is_attempted_not_confirmed() {
+        // First read-back (after write 1) contradicts; reads become unavailable after the restore write.
+        let mut f = FakePower::new(0, vec![Write::StoreOther(9)]);
+        f.unreadable_after_writes = 2;
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(f.writes, vec![5, 0]);
+        assert_eq!(o.rollback, RollbackStatus::Attempted);
+        assert_eq!(o.rollback_verified_pct, None);
+    }
+
+    #[test]
+    fn unreadable_readback_after_an_accepted_write_is_applied_unverified_without_rollback() {
+        let mut f = FakePower::new(0, vec![]);
+        f.unreadable_after_writes = 1;
+        let o = change_power_limit(&mut f, &range(), 5, false).unwrap();
+        assert_eq!(o.status, OperationStatus::Applied);
+        assert_eq!(f.writes, vec![5]);
+        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
+        assert!(o.error.unwrap().contains("could not be read back"));
+    }
+
+    struct FakeReset {
+        at_factory: Option<bool>,
+        resets: usize,
+        behavior: ResetBehavior,
+    }
+    enum ResetBehavior {
+        Honor,
+        Reject(i32),
+        Ignore,
+        Unreadable,
+    }
+    impl FactoryResetControl for FakeReset {
+        fn is_at_factory(&mut self) -> Option<bool> {
+            if matches!(self.behavior, ResetBehavior::Unreadable) && self.resets > 0 {
+                return None;
+            }
+            self.at_factory
+        }
+        fn reset(&mut self) -> Result<(), i32> {
+            self.resets += 1;
+            match self.behavior {
+                ResetBehavior::Honor | ResetBehavior::Unreadable => {
+                    self.at_factory = Some(true);
+                    Ok(())
+                }
+                ResetBehavior::Reject(rc) => Err(rc),
+                ResetBehavior::Ignore => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn reset_states_are_distinct_and_rollback_is_unsupported() {
+        let mk = |b| FakeReset {
+            at_factory: Some(false),
+            resets: 0,
+            behavior: b,
+        };
+        // Dry run and already-at-factory never reset.
+        let mut f = mk(ResetBehavior::Honor);
+        let o = reset_to_factory(&mut f, true).unwrap();
+        assert_eq!((f.resets, o.status), (0, OperationStatus::NotApplied));
+        let mut g = FakeReset {
+            at_factory: Some(true),
+            resets: 0,
+            behavior: ResetBehavior::Honor,
+        };
+        assert_eq!(
+            reset_to_factory(&mut g, false).unwrap().status,
+            OperationStatus::NotApplied
+        );
+        assert_eq!(g.resets, 0);
+
+        let mut f = mk(ResetBehavior::Honor);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(o.status, OperationStatus::Confirmed);
+        assert_eq!(o.rollback, RollbackStatus::Unsupported);
+
+        let mut f = mk(ResetBehavior::Ignore);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.rollback, RollbackStatus::Unsupported);
+
+        let mut f = mk(ResetBehavior::Reject(18));
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(o.status, OperationStatus::NotApplied);
+        assert!(o.error.unwrap().contains("ADLX_RESET_NEEDED (18)"));
+
+        let mut f = mk(ResetBehavior::Unreadable);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(o.status, OperationStatus::Applied);
+    }
+
+    #[test]
+    fn result_helpers_follow_the_adlx_header() {
+        assert!(adlx_succeeded(0) && adlx_succeeded(1) && adlx_succeeded(2));
+        assert!(!adlx_succeeded(3) && !adlx_succeeded(-1) && !adlx_succeeded(18));
+        assert_eq!(adlx_result_name(3), "ADLX_FAIL (3)");
+        assert_eq!(adlx_result_name(18), "ADLX_RESET_NEEDED (18)");
+        assert_eq!(adlx_result_name(99), "ADLX_RESULT(99)");
+        assert_eq!(adlx_result_name(-5), "ADLX_RESULT(-5)");
+    }
+
+    #[test]
+    fn succeeded_requires_confirmation_for_applied_changes() {
+        let base = |status, error: Option<&str>| PowerLimitChangeResult {
+            gpu_name: "g".into(),
+            pci_device_id: None,
+            previous_limit_pct: 0,
+            requested_limit_pct: 5,
+            allowed_range: range(),
+            default_limit_pct: None,
+            applied: status != OperationStatus::NotApplied,
+            verified_limit_pct: None,
+            confirmed: status == OperationStatus::Confirmed,
+            status,
+            rollback: RollbackStatus::NotNeeded,
+            rollback_verified_limit_pct: None,
+            error: error.map(str::to_string),
+        };
+        assert!(base(OperationStatus::Confirmed, None).succeeded());
+        assert!(base(OperationStatus::NotApplied, None).succeeded()); // dry run
+        assert!(!base(OperationStatus::NotApplied, Some("rejected")).succeeded());
+        assert!(!base(OperationStatus::Applied, None).succeeded());
+        assert!(!base(OperationStatus::NotConfirmed, None).succeeded());
+    }
+
+    #[test]
+    fn memory_timing_codes_match_the_adlx_enum() {
+        // ADLXDefines.h ADLX_MEMORYTIMING_DESCRIPTION: DEFAULT=0 .. MEMORYTIMING_LEVEL_2=5
+        assert_eq!(MemoryTimingMode::from_adlx(0), MemoryTimingMode::Default);
+        assert_eq!(MemoryTimingMode::from_adlx(1), MemoryTimingMode::FastTiming);
+        assert_eq!(
+            MemoryTimingMode::from_adlx(2),
+            MemoryTimingMode::FastTimingLevel2
+        );
+        assert_eq!(MemoryTimingMode::from_adlx(3), MemoryTimingMode::Automatic);
+        assert_eq!(MemoryTimingMode::from_adlx(4), MemoryTimingMode::Level1);
+        assert_eq!(MemoryTimingMode::from_adlx(5), MemoryTimingMode::Level2);
+        assert_eq!(MemoryTimingMode::from_adlx(6), MemoryTimingMode::Unknown(6));
     }
 
     #[test]

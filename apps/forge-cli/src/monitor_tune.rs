@@ -597,42 +597,51 @@ pub fn cmd_tune_power_limit(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&res)?);
-        return Ok(());
+    } else {
+        let mode = if apply {
+            res.status.to_string()
+        } else {
+            "DRY-RUN".to_string()
+        };
+        let dev_hex = res
+            .pci_device_id
+            .map(|id| format!(" (0x{id:04X})"))
+            .unwrap_or_default();
+        println!("[{mode}] {}{} Power Limit", res.gpu_name, dev_hex);
+        println!("  Previous: {}%", res.previous_limit_pct);
+        println!("  Requested: {}%", res.requested_limit_pct);
+        println!(
+            "  Allowed Range: {} (default={})",
+            res.allowed_range,
+            res.default_limit_pct
+                .map(|d| format!("{d}%"))
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        if let Some(verified) = res.verified_limit_pct {
+            println!("  Read-Back: {verified}%");
+        }
+        if !apply {
+            println!("  No GPU setting was modified. Pass --apply to commit via ADLX.");
+        } else {
+            println!("  Operation: {}", res.status);
+            println!("  Rollback:  {}", res.rollback);
+            if let Some(v) = res.rollback_verified_limit_pct {
+                println!("  Rollback read-back: {v}%");
+            }
+        }
+        if let Some(err) = &res.error {
+            println!("  Detail: {err}");
+        }
     }
 
-    let mode = match (res.applied, res.confirmed) {
-        (false, _) => "DRY-RUN",
-        (true, true) => "APPLIED + CONFIRMED",
-        (true, false) => "REQUESTED, NOT CONFIRMED",
-    };
-    let dev_hex = res
-        .pci_device_id
-        .map(|id| format!(" (0x{id:04X})"))
-        .unwrap_or_default();
-    println!("[{mode}] {}{} Power Limit", res.gpu_name, dev_hex);
-    println!("  Previous: {}%", res.previous_limit_pct);
-    println!("  Requested: {}%", res.requested_limit_pct);
-    println!(
-        "  Allowed Range: {} (default={})",
-        res.allowed_range,
-        res.default_limit_pct
-            .map(|d| format!("{d}%"))
-            .unwrap_or_else(|| "n/a".to_string())
-    );
-    if let Some(verified) = res.verified_limit_pct {
-        println!("  Verified Read-Back: {verified}%");
-    } else if !res.applied {
-        println!("  No GPU setting was modified. Pass --apply to commit via ADLX.");
-    } else {
-        println!("  The driver accepted the request but the value could not be read back; the new limit is UNCONFIRMED.");
-    }
-    if res.applied {
-        println!(
-            "  Previous value was {}%. No automatic rollback exists; to revert, apply that value explicitly.",
-            res.previous_limit_pct
+    // A requested change that is not confirmed is a failure, whatever the driver returned.
+    if apply && !res.succeeded() {
+        anyhow::bail!(
+            "power limit change {} ({}); verify the GPU state before continuing",
+            res.status,
+            res.rollback
         );
     }
-
     Ok(())
 }
 
@@ -643,34 +652,50 @@ pub fn cmd_tune_reset(device_id: Option<&str>, apply: bool, json: bool) -> Resul
 
     if json {
         println!("{}", serde_json::to_string_pretty(&res)?);
-        return Ok(());
+    } else {
+        let mode = if apply {
+            res.status.to_string()
+        } else {
+            "DRY-RUN".to_string()
+        };
+        let dev_hex = res
+            .pci_device_id
+            .map(|id| format!(" (0x{id:04X})"))
+            .unwrap_or_default();
+        println!("[{mode}] {}{} ResetToFactory", res.gpu_name, dev_hex);
+        println!(
+            "  Was At Factory: {}",
+            res.was_at_factory
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        println!(
+            "  Now At Factory: {}",
+            res.now_at_factory
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        if !apply {
+            println!(
+                "  No GPU setting was modified. Pass --apply to reset all ADLX tuning profiles."
+            );
+        } else {
+            println!("  Operation: {}", res.status);
+            println!(
+                "  Rollback:  {} (a factory reset discards the previous tuning profile; it cannot be restored automatically)",
+                res.rollback
+            );
+        }
+        if let Some(err) = &res.error {
+            println!("  Detail: {err}");
+        }
     }
 
-    let mode = match (res.applied, res.confirmed) {
-        (false, _) => "DRY-RUN",
-        (true, true) => "RESET CONFIRMED",
-        (true, false) => "RESET REQUESTED, NOT CONFIRMED",
-    };
-    let dev_hex = res
-        .pci_device_id
-        .map(|id| format!(" (0x{id:04X})"))
-        .unwrap_or_default();
-    println!("[{mode}] {}{} ResetToFactory", res.gpu_name, dev_hex);
-    println!(
-        "  Was At Factory: {}",
-        res.was_at_factory
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    );
-    println!(
-        "  Now At Factory: {}",
-        res.now_at_factory
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    );
-    if !res.applied {
-        println!("  No GPU setting was modified. Pass --apply to reset all ADLX tuning profiles.");
+    if apply && !res.succeeded() {
+        anyhow::bail!(
+            "factory reset {}; verify the GPU state before continuing",
+            res.status
+        );
     }
-
     Ok(())
 }
