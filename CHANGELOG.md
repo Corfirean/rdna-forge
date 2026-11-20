@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 7 (Per-Process VRAM Monitor, Windows GPU Audit, Safe Rollback, LLM Recommender, VCN Decode & Release Packaging)
+- **Per-process WDDM VRAM monitor (`forge-profiler`, `forge-cli`, `forge-desktop`)**:
+  - Added pure-Rust dynamic `pdh.dll` `\GPU Process Memory(*)` (`Dedicated Usage` / `Shared Usage`) wrapper + Win32 `CreateToolhelp32Snapshot` process name resolution in `crates/forge-profiler/src/vram_processes.rs`.
+  - Exposed `forge vram-top [--limit N] [--json]`, integrated **Top VRAM Consumers** (`Recoverable Layers`) into `forge llm plan` and Desktop **Monitor** / **LLM Optimizer**.
+- **Windows GPU Health Audit & Safe Rollback (`forge-core`, `forge-device`, `forge-benchmark`)**:
+  - Added `WindowsSystemAudit` (`ReBAR`, `HAGS`/`HwSchMode`, WDDM `TdrDelay`, `LongPathsEnabled`, actionable advisories) surfaced in `forge doctor` and Desktop **Overview**.
+  - Added dry-run-default `forge llm rollback [--apply] [--json]` (`rollback_lm_studio_config`, `rollback_windows_env_tweaks`) and Desktop rollback buttons restoring LM Studio `.json.bak` backups and removing only RDNA Forge-managed `HKCU\Environment` keys.
+- **VRAM-Aware Popular Local LLM Recommender (`crates/forge-benchmark/src/llm_recommender.rs`)**:
+  - Added curated 15-model catalog (4B–70B dense + `Qwen3-30B-A3B` MoE across `8–64+ GiB` GPUs/APUs) exposed via `forge llm recommend [--device N] [--json]` and Desktop **"What Fits on My GPU?"** panel without requiring local `.gguf` files first.
+- **Anonymized GitHub Hardware Report Generator & Release Workflow**:
+  - Added `crates/forge-benchmark/src/report.rs` (`sanitize_report_text`, `generate_github_hardware_report`), `forge report [--verify] [--output PATH]`, and Desktop **`Copy GitHub Report`**.
+  - Updated `.github/workflows/ci.yml` with `node --check` JS syntax verification for Desktop UI scripts and added `.github/workflows/release.yml` for portable Windows `x64` `.zip` releases (`forge.exe` + `forge-desktop.exe`).
+- **AMF VCN Hardware Decode Benchmark & Capability-Gated AV1 Encode (`forge-runtime`, `forge-benchmark`, `forge-cli`, `forge-desktop`)**:
+  - Extended pure-Rust COM DX11 AMF bindings in `crates/forge-runtime/src/amf.rs` with `AmfDecodeCodec` (`H264Avc`, `Hevc`, `Hevc10Bit`), `run_amf_decode_benchmark` (synthesizing an in-memory GOP stream and verifying `AMF_SURFACE_IID` DX11 `NV12`/`P010` decoded surfaces), and `AmfEncodeCodec::{Av1, Av110Bit}` (`AMFVideoEncoderHW_AV1`, cleanly skipped under `--codec all` or returning `UnsupportedCapability` on RDNA2 VCN 3.0; RDNA3/RDNA4 AV1 encode remains **Not tested** on physical hardware).
+  - Live-verified VCN 3.0 decode on RX 6900 XT (AMF `1.4.37.0`, Adrenalin `26.11.2`): `1920x1080` achieves **`753.89 FPS`** (`H.264 NV12`), **`839.64 FPS`** (`HEVC NV12`), and **`849.64 FPS`** (`HEVC 10-bit P010`, `1761.82 MPix/s`, `34.0 W`); `3840x2160` (`HEVC NV12`) achieves **`307.05 FPS`** (`2546.79 MPix/s`, `38.0 W`).
+
 ### Added — Milestone 6 (Multi-GPU AMD Radeon Support: RDNA1–RDNA4, APUs & Radeon PRO)
 - Expanded `crates/forge-core` hardware database and profile registry:
   - Fixed `0x150E` (`gfx1150` Strix Point 890M/880M) vs `0x1586` (`gfx1151` Strix Halo 8060S/8050S) PCI mapping and added Krackan Point (`0x1114`), `RX 6950 XT`, `RX 6650 XT`, `Radeon AI PRO R9700` (`0x7551`), `PRO W6800/W6600M/W6400/W7900/W7700/W7500`, and `RX 7600M` PCI device IDs.

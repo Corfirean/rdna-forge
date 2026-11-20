@@ -37,6 +37,11 @@ cargo fmt --all -- --check
 # Clippy with warnings denied
 cargo clippy --workspace --all-targets -- -D warnings
 
+# Desktop frontend syntax verification (zero node_modules required)
+node --check apps/forge-desktop/ui/app.js
+node --check apps/forge-desktop/ui/views.js
+node --check apps/forge-desktop/ui/charts.js
+
 # Release binary builds (CLI + optional Tauri v2 desktop app; requires Edge WebView2 on Windows)
 cargo build --release -p forge-cli -p forge-desktop
 
@@ -49,12 +54,18 @@ cargo build --release -p forge-cli -p forge-desktop
 ## Testing
 
 ### Hardware-Independent Tests (CI Safe)
-Runs unit tests (`forge-core`, `forge-device`, `forge-runtime`, `forge-benchmark`, `forge-cli`), WGSL->SPIR-V compilation tests, and CLI/profile integration tests without requiring a physical GPU:
+Runs unit tests (`forge-core`, `forge-device`, `forge-profiler`, `forge-runtime`, `forge-benchmark`, `forge-cli`, `forge-desktop`), WGSL->SPIR-V compilation tests, CLI/profile integration tests, and Desktop UI JS syntax checks (`node --check`) without requiring a physical GPU:
 
 ```powershell
 cargo test --workspace
+node --check apps/forge-desktop/ui/app.js
+node --check apps/forge-desktop/ui/views.js
+node --check apps/forge-desktop/ui/charts.js
 python -m py_compile modules/ai/triton/bench_suite.py
 ```
+
+### Portable Windows Release Workflow
+`.github/workflows/release.yml` packages tagged `v*` releases (and manual `workflow_dispatch` runs) into a portable Windows `x64` `.zip` bundle (`rdna-forge-<tag>-windows-x64.zip`) containing `forge.exe`, `forge-desktop.exe`, `README.md`, `COMPATIBILITY.md`, `BENCHMARKS.md`, `CHANGELOG.md`, and `LICENSE`.
 
 ### Live GPU Correctness Tests
 Runs device discovery, live ADLX telemetry snapshots, read-only ADLX tuning inspection and dry-run range validation (never mutating GPU settings), live AMF (`amfrt64.dll`) VCN codec probing, HIP 4 MiB H2D/D2H verification, Vulkan baseline / tiled `vec4` / INT8 DP4A (`OpSDot`) / Wave32 `W8A32` & `Q4_0` GEMV / fused subgroup `RMSNorm+RoPE` edge-case and batched (`dispatches_per_submit`) equivalence tests, and a repeated-dispatch stability check on physical AMD hardware (use `--test-threads=1` so ADLX, AMF, and HIP tests run sequentially):
@@ -68,15 +79,24 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 ## Running Diagnostics, Monitoring, Tuning & Benchmarks
 
 ```powershell
-# Read-only hardware, runtime & live ADLX telemetry + AMF video audit
+# Read-only hardware, runtime, Windows GPU health audit & live ADLX telemetry + AMF video audit
 .\target\release\forge.exe doctor
 .\target\release\forge.exe doctor --json
 
-# AMD AMF hardware video encoder/decoder capability probe & VCN hardware encode benchmark
+# Generate anonymized GitHub compatibility issue report (username sanitized to <USER>)
+.\target\release\forge.exe report
+
+# Live per-process WDDM dedicated/shared VRAM monitor
+.\target\release\forge.exe vram-top --limit 8
+.\target\release\forge.exe vram-top --json
+
+# AMD AMF hardware video encoder/decoder capability probe, VCN encode & VCN decode benchmarks
 .\target\release\forge.exe video caps
 .\target\release\forge.exe video caps --json
 .\target\release\forge.exe video bench --codec all --width 1920 --height 1080 --fps 60 --bitrate-mbps 12 --preset speed --warmup 15 --frames 120 --output ..\video_bench_1080p.json
 .\target\release\forge.exe video bench --codec all --width 3840 --height 2160 --fps 60 --bitrate-mbps 35 --preset speed --warmup 15 --frames 120 --output ..\video_bench_4k.json
+.\target\release\forge.exe video decode-bench --codec all --width 1920 --height 1080 --fps 60 --bitrate-mbps 12 --warmup 15 --frames 120 --output ..\video_decode_1080p.json
+.\target\release\forge.exe video decode-bench --codec hevc --width 3840 --height 2160 --fps 60 --bitrate-mbps 12 --warmup 15 --frames 120 --output ..\video_decode_4k.json
 
 # Real-time ADLX monitor (table, JSONL, or CSV stream with Ctrl+C graceful exit)
 .\target\release\forge.exe monitor --interval-ms 500 --count 10
@@ -91,14 +111,16 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 .\target\release\forge.exe profile list
 .\target\release\forge.exe profile match --device 0
 
-# GGUF LLM Inspector, Anti-WDDM-Spill Memory Planner, Multi-GPU Autotuner & Safe LM Studio/Ollama Auto-Patcher
+# GGUF LLM Inspector, VRAM-Aware Recommender, Anti-WDDM-Spill Memory Planner, Multi-GPU Autotuner & Safe Auto-Patcher / Rollback
 .\target\release\forge.exe llm discover
 .\target\release\forge.exe llm inspect
+.\target\release\forge.exe llm recommend --device 0
 .\target\release\forge.exe llm plan --device 0 --context 4096
 .\target\release\forge.exe llm autotune --device 0 --vulkan-bin ..\llama-vk\llama-bench.exe --hip-bin ..\llama-hip\llama-bench.exe --context-depth 2048 --reps 2 --output ..\llm_autotune.json
-# Safe dry-run preview of LM Studio per-model JSON & Windows/Ollama environment tweaks (pass --apply to commit with .bak backups):
+# Safe dry-run preview of LM Studio per-model JSON, Windows/Ollama environment tweaks & rollback (pass --apply to commit):
 .\target\release\forge.exe llm apply-lmstudio --device 0 --profile vulkan_wddm_priority --context 4096
 .\target\release\forge.exe llm apply-env --device 0 --context 4096 --kv-quant q8-0
+.\target\release\forge.exe llm rollback
 
 # Range-validated power limit & factory reset (SAFE DRY-RUN by default; pass --apply to commit)
 .\target\release\forge.exe tune power-limit 5
