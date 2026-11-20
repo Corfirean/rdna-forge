@@ -593,7 +593,7 @@ fn read_fan_info(
         (Some(pct), Some(ctrl)) => {
             let min_hw = speed_range_pct.map(|r| r.min).unwrap_or(20);
             Some(format!(
-                "External fan manager ({ctrl}) is actively overriding ADLX by setting all {} curve points to a flat {pct}% instant PWM target (on RDNA2, ADLX has no single-value PWM setter and clamps values below {min_hw}% to the {min_hw}% hardware floor when Zero-RPM is off).",
+                "External fan manager ({ctrl}) is actively overriding ADLX by setting all {} curve points to a flat {pct}% instant PWM target (when ADLX exposes no single-value PWM setter, it clamps values below {min_hw}% to the {min_hw}% hardware floor when Zero-RPM is off).",
                 fan_curve.len()
             ))
         }

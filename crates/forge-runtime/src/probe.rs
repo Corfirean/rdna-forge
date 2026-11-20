@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use forge_core::{BackendKind, BackendStatus, SupportStatus};
+use forge_core::{BackendKind, BackendStatus, GpuArchitecture, SupportStatus};
 use forge_device::DiscoverySnapshot;
 use serde::Deserialize;
 
@@ -151,7 +151,8 @@ pub fn probe_all_backends(
     }
 
     // 3. Triton (Windows)
-    let triton_status = probe_triton_python(python_override);
+    let primary_arch = snapshot.gpus.first().map(|g| g.architecture);
+    let triton_status = probe_triton_python(python_override, primary_arch);
     if triton_status.status == SupportStatus::Unsupported {
         missing.push(format!("Triton: {}", triton_status.summary));
     }
@@ -303,7 +304,10 @@ fn probe_amf_backend() -> BackendStatus {
     }
 }
 
-fn probe_triton_python(python_override: Option<&Path>) -> BackendStatus {
+fn probe_triton_python(
+    python_override: Option<&Path>,
+    primary_arch: Option<GpuArchitecture>,
+) -> BackendStatus {
     let python_cmd = python_override
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "python".to_string());
@@ -413,6 +417,17 @@ print(json.dumps(out))
                 .triton_windows_version
                 .clone()
                 .unwrap_or_else(|| triton_ver.clone());
+            let arch_note = match primary_arch {
+                Some(arch @ (GpuArchitecture::Rdna1 | GpuArchitecture::Rdna2)) => {
+                    format!("; community {arch} support")
+                }
+                Some(
+                    arch @ (GpuArchitecture::Rdna3
+                    | GpuArchitecture::Rdna35
+                    | GpuArchitecture::Rdna4),
+                ) => format!("; native {arch} support"),
+                _ => String::new(),
+            };
             BackendStatus {
                 kind: BackendKind::Triton,
                 status: if parsed.triton_amd_backend {
@@ -422,7 +437,7 @@ print(json.dumps(out))
                 },
                 version: Some(pkg_ver.clone()),
                 summary: format!(
-                    "Detected (triton-windows {pkg_ver}, PyTorch HIP {hip_ver}; community RDNA2 support)"
+                    "Detected (triton-windows {pkg_ver}, PyTorch HIP {hip_ver}{arch_note})"
                 ),
                 details,
             }
