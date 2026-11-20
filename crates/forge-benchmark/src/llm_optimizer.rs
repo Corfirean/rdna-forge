@@ -1762,6 +1762,10 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         });
     }
 
+    // Resolve and validate the benchmark executables before running anything.
+    let vulkan_bin = resolve_optional_bench_bin("--vulkan-bin", config.vulkan_bin.as_deref())?;
+    let hip_bin = resolve_optional_bench_bin("--hip-bin", config.hip_bin.as_deref())?;
+
     let meta = inspect_gguf_model(&config.model_path)?;
     let plan = plan_llm_configuration_for_device(
         &meta,
@@ -1816,7 +1820,7 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
     }
 
     let mut specs = Vec::new();
-    if config.vulkan_bin.is_some() {
+    if vulkan_bin.is_some() {
         specs.push(ProbeSpec {
             id: "vulkan_naive_fa1",
             title: "Baseline Vulkan (-fa 1, f16 KV, default WDDM priority)",
@@ -1858,7 +1862,7 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         });
     }
 
-    if config.hip_bin.is_some() && plan.gpu_architecture != "RDNA1" {
+    if hip_bin.is_some() && plan.gpu_architecture != "RDNA1" {
         let mut hip_envs = vec![("HIP_VISIBLE_DEVICES", hip_dev_str)];
         if supports_hipblaslt {
             hip_envs.push(("ROCBLAS_USE_HIPBLASLT", "1".to_string()));
@@ -1888,9 +1892,9 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
 
     for spec in specs {
         let bin_path = if spec.backend == "vulkan" {
-            config.vulkan_bin.as_ref().unwrap()
+            vulkan_bin.as_ref().unwrap()
         } else {
-            config.hip_bin.as_ref().unwrap()
+            hip_bin.as_ref().unwrap()
         };
 
         let mut cmd = Command::new(bin_path);
@@ -2107,6 +2111,14 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         balanced_score_formula: BALANCED_SCORE_FORMULA.to_string(),
         peak_rss_bytes: peak_process_rss_bytes(),
     })
+}
+
+fn resolve_optional_bench_bin(flag: &str, path: Option<&Path>) -> ForgeResult<Option<PathBuf>> {
+    path.map(|p| {
+        crate::llama::resolve_llama_bench_binary(p)
+            .map_err(|reason| ForgeError::InvalidParameter(format!("{flag}: {reason}")))
+    })
+    .transpose()
 }
 
 /// Profile used as the speedup reference when the Vulkan backend is benchmarked.
@@ -2341,6 +2353,97 @@ fn detect_lmstudio_backend_version(lms_root: &Path, backend_id: &str) -> Option<
     best
 }
 
+/// Absolute path of a Windows system executable (System32), so a planted `reg.exe` next to the
+/// application or earlier on `PATH` is never launched. Falls back to the bare name off Windows.
+fn system_exe(name: &str) -> PathBuf {
+    forge_core::loader::system_directory()
+        .map(|d| d.join(name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Returns `components` of `model_path` relative to `models_root` only if every component is a
+/// plain name. `strip_prefix` alone accepts `..`, which would let the derived config path escape
+/// the config directory.
+fn safe_relative_model_path(model_path: &Path, models_root: &Path) -> Option<PathBuf> {
+    let rel = model_path.strip_prefix(models_root).ok()?;
+    rel.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+        .then(|| rel.to_path_buf())
+}
+
+/// Reads an existing JSON configuration and requires it to be a JSON object.
+///
+/// `Ok(None)` = file absent (a fresh one may be created). A file that exists but is unreadable,
+/// not valid JSON, or not an object is an error: the caller must not overwrite what it cannot
+/// understand.
+fn read_existing_json_object(path: &Path) -> ForgeResult<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path).map_err(ForgeError::Io)?;
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.is_object() => Ok(Some(text)),
+        Ok(_) => Err(ForgeError::InvalidParameter(format!(
+            "existing config '{}' is not a JSON object; refusing to modify it",
+            path.display()
+        ))),
+        Err(e) => Err(ForgeError::InvalidParameter(format!(
+            "existing config '{}' is not valid JSON ({e}); refusing to overwrite it. Fix or remove the file first",
+            path.display()
+        ))),
+    }
+}
+
+/// Creates `<file>.json.bak` from the current file unless a backup already exists.
+///
+/// An existing backup is the pre-RDNA-Forge original and is deliberately preserved: overwriting
+/// it on a second apply would replace the original with an already-patched copy and make
+/// rollback restore the wrong content.
+fn ensure_backup(path: &Path) -> ForgeResult<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bak = path.with_extension("json.bak");
+    if !bak.exists() {
+        std::fs::copy(path, &bak).map_err(ForgeError::Io)?;
+    }
+    Ok(Some(bak.display().to_string()))
+}
+
+/// Writes `contents` to a sibling temp file, flushes it, then renames it over `path`, and finally
+/// re-reads the result to confirm it is valid JSON equal to what was intended.
+fn write_json_atomic_verified(path: &Path, contents: &str) -> ForgeResult<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.forge-tmp");
+    let result = (|| -> std::io::Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ForgeError::Io(e));
+    }
+    let written = std::fs::read_to_string(path).map_err(ForgeError::Io)?;
+    let expected: serde_json::Value = serde_json::from_str(contents)
+        .map_err(|e| ForgeError::ParseError(format!("generated config is invalid JSON: {e}")))?;
+    let actual: serde_json::Value = serde_json::from_str(&written).map_err(|e| {
+        ForgeError::ExecutionFailed(format!(
+            "verification failed: '{}' is not valid JSON after writing ({e})",
+            path.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(ForgeError::ExecutionFailed(format!(
+            "verification failed: '{}' does not match the intended content after writing",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Previews (`dry_run = true`) or writes (`dry_run = false`, with `.bak` backups) optimized
 /// LM Studio per-model load settings and backend selection for the given GGUF model and target GPU.
 pub fn apply_lm_studio_config(
@@ -2392,17 +2495,19 @@ pub fn apply_lm_studio_config(
     }
 
     let models_root = lms_root.join("models");
-    let rel_model_path = model_path
-        .strip_prefix(&models_root)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| PathBuf::from(&meta.file_name));
+    // Models outside LM Studio's models folder (or with `..` components) are keyed by file name
+    // only, so the derived config path can never leave the config directory.
+    let rel_model_path = safe_relative_model_path(model_path, &models_root)
+        .unwrap_or_else(|| PathBuf::from(&meta.file_name));
 
     let model_config_path = internal_dir
         .join("user-concrete-model-default-config")
         .join(format!("{}.json", rel_model_path.display()));
     let backend_prefs_path = internal_dir.join("backend-preferences-v2.json");
 
-    let existing_model_json = std::fs::read_to_string(&model_config_path).ok();
+    let existing_model_json = read_existing_json_object(&model_config_path)?;
+    // Validate the backend preferences up front too, so a bad file aborts before anything is written.
+    let existing_backend_json = read_existing_json_object(&backend_prefs_path)?;
     let (patched_model_json_preview, offload_ratio) = build_lm_studio_model_config_json(
         existing_model_json.as_deref(),
         profile,
@@ -2417,8 +2522,7 @@ pub fn apply_lm_studio_config(
         "llama.cpp-win-x86_64-vulkan-avx2".to_string()
     };
 
-    let mut backend_root = std::fs::read_to_string(&backend_prefs_path)
-        .ok()
+    let mut backend_root = existing_backend_json
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| {
@@ -2471,20 +2575,11 @@ pub fn apply_lm_studio_config(
         if let Some(parent) = model_config_path.parent() {
             std::fs::create_dir_all(parent).map_err(ForgeError::Io)?;
         }
-        if model_config_path.exists() {
-            let bak = model_config_path.with_extension("json.bak");
-            std::fs::copy(&model_config_path, &bak).map_err(ForgeError::Io)?;
-            model_config_backup_path = Some(bak.display().to_string());
-        }
-        std::fs::write(&model_config_path, &patched_model_json_preview).map_err(ForgeError::Io)?;
-
-        if backend_prefs_path.exists() {
-            let bak = backend_prefs_path.with_extension("json.bak");
-            std::fs::copy(&backend_prefs_path, &bak).map_err(ForgeError::Io)?;
-            backend_prefs_backup_path = Some(bak.display().to_string());
-        }
-        std::fs::write(&backend_prefs_path, &patched_backend_json_preview)
-            .map_err(ForgeError::Io)?;
+        // Both backups are taken before either file is modified.
+        model_config_backup_path = ensure_backup(&model_config_path)?;
+        backend_prefs_backup_path = ensure_backup(&backend_prefs_path)?;
+        write_json_atomic_verified(&model_config_path, &patched_model_json_preview)?;
+        write_json_atomic_verified(&backend_prefs_path, &patched_backend_json_preview)?;
     }
 
     Ok(LmStudioPatchResult {
@@ -2509,7 +2604,7 @@ pub fn apply_lm_studio_config(
 }
 
 fn query_hkcu_env_var(key: &str) -> Option<String> {
-    let out = Command::new("reg.exe")
+    let out = Command::new(system_exe("reg.exe"))
         .args(["query", r"HKCU\Environment", "/v", key])
         .output()
         .ok()?;
@@ -2611,7 +2706,7 @@ pub fn apply_windows_and_ollama_env_tweaks(
     for (k, v, purpose) in desired {
         let prev = query_hkcu_env_var(k);
         if !dry_run {
-            let status = Command::new("reg.exe")
+            let status = Command::new(system_exe("reg.exe"))
                 .args([
                     "add",
                     r"HKCU\Environment",
@@ -2807,7 +2902,7 @@ pub fn rollback_windows_env_tweaks(dry_run: bool) -> ForgeResult<EnvRollbackResu
     for &key in RDNA_FORGE_MANAGED_ENV_KEYS {
         let current_value = query_hkcu_env_var(key);
         let removed = if !dry_run && current_value.is_some() {
-            let status = Command::new("reg.exe")
+            let status = Command::new(system_exe("reg.exe"))
                 .args(["delete", r"HKCU\Environment", "/v", key, "/f"])
                 .status()
                 .map_err(ForgeError::Io)?;
@@ -2831,4 +2926,112 @@ pub fn rollback_windows_env_tweaks(dry_run: bool) -> ForgeResult<EnvRollbackResu
         applied: !dry_run,
         keys,
     })
+}
+
+#[cfg(test)]
+mod config_safety_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rdna_forge_cfg_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn malformed_or_non_object_existing_config_is_refused_not_replaced() {
+        let dir = scratch("malformed");
+        let p = dir.join("cfg.json");
+        assert_eq!(read_existing_json_object(&p).unwrap(), None);
+
+        std::fs::write(&p, r#"{"user":"setting"}"#).unwrap();
+        assert!(read_existing_json_object(&p).unwrap().is_some());
+
+        std::fs::write(&p, "{ this is not json").unwrap();
+        let err = read_existing_json_object(&p).unwrap_err().to_string();
+        assert!(err.contains("not valid JSON") && err.contains("refusing"));
+        // The user's file is untouched by the check.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{ this is not json");
+
+        std::fs::write(&p, "[1,2,3]").unwrap();
+        assert!(read_existing_json_object(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("not a JSON object"));
+    }
+
+    #[test]
+    fn backup_keeps_the_original_across_repeated_applies() {
+        let dir = scratch("backup");
+        let p = dir.join("model.gguf.json");
+        std::fs::write(&p, r#"{"original":true}"#).unwrap();
+
+        let first = ensure_backup(&p).unwrap().expect("backup path");
+        write_json_atomic_verified(&p, r#"{"patched":1}"#).unwrap();
+        // A second apply must NOT replace the pristine backup with the already-patched file.
+        let second = ensure_backup(&p).unwrap().expect("backup path");
+        write_json_atomic_verified(&p, r#"{"patched":2}"#).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            r#"{"original":true}"#
+        );
+        // No backup is invented for a file that did not exist.
+        assert_eq!(ensure_backup(&dir.join("absent.json")).unwrap(), None);
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_verifies_it_and_leaves_no_temp_file() {
+        let dir = scratch("atomic");
+        let p = dir.join("c.json");
+        write_json_atomic_verified(&p, r#"{"a":1}"#).unwrap();
+        write_json_atomic_verified(&p, r#"{"a":2}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), r#"{"a":2}"#);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".forge-tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // Invalid intended content is rejected rather than written as "verified".
+        assert!(write_json_atomic_verified(&p, "{not json").is_err());
+    }
+
+    #[test]
+    fn model_paths_with_parent_components_cannot_escape_the_config_directory() {
+        let root = PathBuf::from(r"C:\Users\x\.lmstudio\models");
+        assert_eq!(
+            safe_relative_model_path(&root.join("vendor").join("m.gguf"), &root),
+            Some(PathBuf::from("vendor").join("m.gguf"))
+        );
+        assert_eq!(
+            safe_relative_model_path(&root.join("..").join("..").join("evil.gguf"), &root),
+            None
+        );
+        assert_eq!(
+            safe_relative_model_path(&root.join("a").join("..").join("m.gguf"), &root),
+            None
+        );
+        // Outside the models root entirely.
+        assert_eq!(
+            safe_relative_model_path(Path::new(r"D:\other\m.gguf"), &root),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_tool_is_launched_from_system32() {
+        let exe = system_exe("reg.exe");
+        assert!(exe.is_absolute());
+        assert!(exe.exists(), "{exe:?}");
+    }
 }

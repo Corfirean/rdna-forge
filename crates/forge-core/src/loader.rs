@@ -127,7 +127,7 @@ pub enum PathCheck {
 
 /// Strips the `\\?\` verbatim prefix produced by `canonicalize` on Windows (but keeps UNC paths
 /// verbatim so they stay distinguishable and are then rejected by the root check).
-fn simplify_verbatim(path: PathBuf) -> PathBuf {
+pub fn simplify_verbatim(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\") {
         if !rest.starts_with("UNC\\") {

@@ -259,6 +259,39 @@ pub fn run_llama_comparison(config: &LlamaBenchConfig) -> ForgeResult<LlamaCompa
     })
 }
 
+/// Resolves and validates a user- or UI-supplied `llama-bench` executable before it is launched.
+///
+/// The path is canonicalized (so relative paths and `..` are resolved once, up front), must be an
+/// existing regular file, and must be named `llama-bench*` (`.exe` on Windows). This stops a
+/// caller from pointing the benchmark runner at an arbitrary program.
+pub fn resolve_llama_bench_binary(path: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map(forge_core::loader::simplify_verbatim)
+        .map_err(|e| format!("cannot resolve '{}': {e}", path.display()))?;
+    if !canonical.is_file() {
+        return Err(format!("'{}' is not a regular file", canonical.display()));
+    }
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !name.starts_with("llama-bench") {
+        return Err(format!(
+            "'{}' is not a llama-bench executable (file name must start with 'llama-bench')",
+            canonical.display()
+        ));
+    }
+    #[cfg(windows)]
+    if canonical
+        .extension()
+        .map(|e| !e.eq_ignore_ascii_case("exe"))
+        .unwrap_or(true)
+    {
+        return Err(format!("'{}' must be a .exe file", canonical.display()));
+    }
+    Ok(canonical)
+}
+
 fn execute_single_backend(
     label: &str,
     bin_path: &Path,
@@ -278,7 +311,21 @@ fn execute_single_backend(
         };
     }
 
-    let mut cmd = Command::new(bin_path);
+    let bin_path = match resolve_llama_bench_binary(bin_path) {
+        Ok(p) => p,
+        Err(reason) => {
+            return BackendRunOutcome {
+                backend: label.to_string(),
+                binary_path: bin_path.display().to_string(),
+                succeeded: false,
+                entries: Vec::new(),
+                error: Some(reason),
+                telemetry: None,
+            };
+        }
+    };
+
+    let mut cmd = Command::new(&bin_path);
     if let Some(parent) = bin_path.parent() {
         cmd.current_dir(parent);
     }
@@ -365,5 +412,62 @@ fn execute_single_backend(
             error: Some(format!("failed to spawn {}: {err}", bin_path.display())),
             telemetry,
         },
+    }
+}
+
+#[cfg(test)]
+mod binary_validation_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rdna_forge_bench_bin_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_llama_bench_executables_are_accepted() {
+        let dir = scratch("names");
+        let ok = dir.join(if cfg!(windows) {
+            "llama-bench.exe"
+        } else {
+            "llama-bench"
+        });
+        std::fs::write(&ok, b"x").unwrap();
+        assert!(resolve_llama_bench_binary(&ok).is_ok());
+
+        // Arbitrary program names, missing files and directories are refused.
+        let evil = dir.join(if cfg!(windows) { "cmd.exe" } else { "sh" });
+        std::fs::write(&evil, b"x").unwrap();
+        assert!(resolve_llama_bench_binary(&evil)
+            .unwrap_err()
+            .contains("not a llama-bench"));
+        assert!(resolve_llama_bench_binary(&dir.join("llama-bench-missing.exe")).is_err());
+        assert!(resolve_llama_bench_binary(&dir).is_err());
+
+        // `..` is resolved before the name check, so it cannot disguise another file.
+        let sneaky = dir
+            .join("..")
+            .join(dir.file_name().unwrap())
+            .join(evil.file_name().unwrap());
+        assert!(resolve_llama_bench_binary(&sneaky).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn llama_bench_must_be_an_exe_on_windows() {
+        let dir = scratch("ext");
+        let bat = dir.join("llama-bench.bat");
+        std::fs::write(&bat, b"x").unwrap();
+        assert!(resolve_llama_bench_binary(&bat)
+            .unwrap_err()
+            .contains(".exe"));
     }
 }
