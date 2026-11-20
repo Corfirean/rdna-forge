@@ -4,8 +4,8 @@ mod commands;
 
 use commands::{
     apply_env_and_ollama_patch, apply_lm_studio_patch, get_diagnostics, get_llm_assets,
-    get_llm_plan, get_telemetry_snapshot, get_top_vram_processes, get_tuning_report,
-    get_video_caps, reset_tuning, rollback_env_patch, rollback_lm_studio_patch,
+    get_llm_plan, get_llm_recommendations, get_telemetry_snapshot, get_top_vram_processes,
+    get_tuning_report, get_video_caps, reset_tuning, rollback_env_patch, rollback_lm_studio_patch,
     run_live_verification, run_llm_autotune, run_video_benchmark, run_vulkan_benchmark,
     set_power_limit, AppState,
 };
@@ -33,6 +33,7 @@ fn main() {
             run_vulkan_benchmark,
             get_llm_assets,
             get_llm_plan,
+            get_llm_recommendations,
             run_llm_autotune,
             apply_lm_studio_patch,
             apply_env_and_ollama_patch,

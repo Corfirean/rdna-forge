@@ -5,11 +5,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes,
-    plan_llm_configuration_for_device, resolve_default_triton_script, rollback_lm_studio_config,
-    rollback_windows_env_tweaks, run_llama_comparison, run_triton_suite, run_video_benchmark_suite,
-    run_vulkan_suite, EnvRollbackResult, KvCacheQuant, LlamaBenchConfig, LlmAutotuneConfig,
-    LmStudioRollbackResult, TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig,
-    VulkanKernelSelection,
+    plan_llm_configuration_for_device, recommend_models_for_device, resolve_default_triton_script,
+    rollback_lm_studio_config, rollback_windows_env_tweaks, run_llama_comparison, run_triton_suite,
+    run_video_benchmark_suite, run_vulkan_suite, EnvRollbackResult, KvCacheQuant, LlamaBenchConfig,
+    LlmAutotuneConfig, LmStudioRollbackResult, ModelFitVerdict, TritonBenchConfig,
+    VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
 };
 use forge_core::{
     builtin_profiles, match_profile_for_device, CapabilityResult, DiagnosticReport, GpuDeviceInfo,
@@ -366,6 +366,23 @@ enum LlmSubcommand {
     ApplyEnv(LlmApplyEnvArgs),
     /// Preview (dry-run default) or restore LM Studio .bak backups and reset RDNA Forge HKCU env vars.
     Rollback(LlmRollbackArgs),
+    /// Recommend popular local LLM models & quantizations that fit on the selected GPU's VRAM.
+    Recommend(LlmRecommendArgs),
+}
+
+#[derive(Debug, Args)]
+struct LlmRecommendArgs {
+    /// Target GPU device index (default: primary discrete GPU).
+    #[arg(long)]
+    device: Option<usize>,
+    /// Target context window in tokens.
+    #[arg(long, default_value_t = 4096)]
+    context: u32,
+    /// Safety VRAM margin in MiB reserved against Windows WDDM background spikes.
+    #[arg(long, default_value_t = 512)]
+    safety_margin_mib: u64,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -548,6 +565,7 @@ fn main() -> Result<()> {
             LlmSubcommand::ApplyLmstudio(args) => cmd_llm_apply_lmstudio(&args),
             LlmSubcommand::ApplyEnv(args) => cmd_llm_apply_env(&args),
             LlmSubcommand::Rollback(args) => cmd_llm_rollback(&args),
+            LlmSubcommand::Recommend(args) => cmd_llm_recommend(&args),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -1754,6 +1772,76 @@ fn cmd_llm_rollback(args: &LlmRollbackArgs) -> Result<()> {
     if dry_run {
         println!();
         println!("  No file or registry variable was modified (dry-run preview). Pass --apply to restore/delete.");
+    }
+    Ok(())
+}
+
+fn cmd_llm_recommend(args: &LlmRecommendArgs) -> Result<()> {
+    let report = recommend_models_for_device(args.device, args.context, args.safety_margin_mib)
+        .context("failed to evaluate GPU model recommendations")?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let profile_note = report
+        .matched_profile_id
+        .as_deref()
+        .map(|id| format!(" | Profile={id}"))
+        .unwrap_or_default();
+    let vram_kind = if report.is_apu_unified_memory {
+        "Unified APU Memory"
+    } else {
+        "Physical WDDM VRAM"
+    };
+    println!("RDNA FORGE GPU MODEL RECOMMENDER (WHAT FITS ON MY GPU?)");
+    println!(
+        "  GPU [{}]: {} ({}, {}){profile_note}",
+        report.gpu_index, report.gpu_name, report.gpu_architecture, report.gfx_target
+    );
+    println!(
+        "  {vram_kind}: Total={} MiB | Free={} MiB | Priority=1 Budget={} MiB (@ {} context)",
+        report.total_vram_mib,
+        report.free_vram_mib,
+        report.priority_budget_mib,
+        report.target_context_tokens
+    );
+    println!();
+    println!(
+        "  {:<30} {:<15} {:<8} {:>9} {:>9} {:<22} {:<8} Notes",
+        "Model", "Size", "Quant", "Req(MiB)", "MaxCtx", "Fit Verdict", "Backend"
+    );
+    for r in &report.recommendations {
+        let verdict_str = match r.verdict {
+            ModelFitVerdict::IdealFreeVram => "IDEAL (Free VRAM)",
+            ModelFitVerdict::FitsWddmPriority => "WDDM Priority=1",
+            ModelFitVerdict::FitsMoeOffload => "MoE (-ncmoe)",
+            ModelFitVerdict::TooLarge => "TOO LARGE",
+        };
+        let ctx_str = if r.recommended_max_context > 0 {
+            format!("{}K", r.recommended_max_context / 1024)
+        } else {
+            "--".to_string()
+        };
+        let short_backend = if r.suggested_backend.contains("hipBLASLt") {
+            "ROCm/Vk"
+        } else if r.suggested_backend.contains("ROCm") {
+            "Vk/ROCm"
+        } else {
+            "Vulkan"
+        };
+        println!(
+            "  {:<30} {:<15} {:<8} {:>9} {:>9} {:<22} {:<8} {}",
+            r.name,
+            r.params_label,
+            r.quant,
+            r.total_required_mib,
+            ctx_str,
+            verdict_str,
+            short_backend,
+            r.notes
+        );
     }
     Ok(())
 }

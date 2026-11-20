@@ -1793,8 +1793,73 @@ export function renderLlmOptimizer(root, state, actions) {
     root.appendChild(el("div", { className: "banner banner-err" }, state.llmError));
   }
 
+  const renderRecommenderPanel = () => {
+    const recRep = state.llmRecommendations;
+    if (!recRep || !Array.isArray(recRep.recommendations)) return;
+    const verdictBadge = (v) => {
+      if (v === "ideal_free_vram") return el("span", { className: "badge badge-ok" }, "IDEAL (FREE VRAM)");
+      if (v === "fits_wddm_priority") return el("span", { className: "badge badge-ok" }, "FITS (WDDM PRIO=1)");
+      if (v === "fits_moe_offload") return el("span", { className: "badge badge-warn" }, "MoE (-ncmoe)");
+      return el("span", { className: "badge badge-err" }, "TOO LARGE");
+    };
+    const rRows = recRep.recommendations.map((r) =>
+      el(
+        "tr",
+        {},
+        el(
+          "td",
+          { className: "mono" },
+          r.name,
+          el("div", { className: "sub-detail" }, r.notes)
+        ),
+        el("td", { className: "mono" }, r.params_label),
+        el("td", { className: "mono" }, r.quant),
+        el("td", { className: "num mono" }, `${r.total_required_mib} MiB`),
+        el(
+          "td",
+          { className: "num mono" },
+          r.recommended_max_context > 0 ? `${Math.round(r.recommended_max_context / 1024)}K` : "--"
+        ),
+        el("td", {}, verdictBadge(r.verdict)),
+        el("td", { className: "mono muted-text" }, r.suggested_backend)
+      )
+    );
+    root.appendChild(
+      makePanel(
+        "What Fits on My GPU? (Popular Local LLM Recommender)",
+        `${recRep.gpu_name} | Free=${recRep.free_vram_mib} MiB | Prio=1 Budget=${recRep.priority_budget_mib} MiB @ ${recRep.target_context_tokens} ctx`,
+        el(
+          "div",
+          { className: "data-table-wrap" },
+          el(
+            "table",
+            { className: "data-table" },
+            el(
+              "thead",
+              {},
+              el(
+                "tr",
+                {},
+                el("th", {}, "Model Family & Notes"),
+                el("th", {}, "Size"),
+                el("th", {}, "Quant"),
+                el("th", { className: "num" }, "Est. VRAM"),
+                el("th", { className: "num" }, "Safe Max Ctx"),
+                el("th", {}, "Fit Verdict"),
+                el("th", {}, "Recommended Backend")
+              )
+            ),
+            el("tbody", {}, rRows)
+          )
+        ),
+        true
+      )
+    );
+  };
+
   const plan = state.llmPlan;
   if (!plan) {
+    renderRecommenderPanel();
     root.appendChild(
       el(
         "div",
@@ -2378,6 +2443,8 @@ export function renderLlmOptimizer(root, state, actions) {
       )
     );
   }
+
+  renderRecommenderPanel();
 
   // Empirical llama-bench Autotuner Card
   const autotuneControls = el(

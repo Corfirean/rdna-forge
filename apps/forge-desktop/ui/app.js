@@ -101,6 +101,7 @@ const state = {
   },
   loadingLlmPlan: false,
   llmPlan: null,
+  llmRecommendations: null,
   llmError: null,
   runningLlmAutotune: false,
   llmAutotuneReport: null,
@@ -698,6 +699,23 @@ async function refreshLlmPlan() {
   state.llmError = null;
   if (state.activeTab === "llm") renderActiveView();
 
+  const reqDevice = Number(state.selectedGpuIndex) || 0;
+  const reqCtx = Number(state.llmForm.context_tokens) || 4096;
+  const reqMargin = Number(state.llmForm.safety_margin_mib) || 512;
+
+  try {
+    state.llmRecommendations = await invokeCommand("get_llm_recommendations", {
+      request: {
+        device_index: reqDevice,
+        context_tokens: reqCtx,
+        safety_margin_mib: reqMargin,
+      },
+    });
+  } catch (recErr) {
+    // Non-fatal: still attempt GGUF plan below
+    state.llmRecommendations = null;
+  }
+
   try {
     if (!state.llmAssets) {
       state.llmAssets = await invokeCommand("get_llm_assets");
@@ -714,9 +732,9 @@ async function refreshLlmPlan() {
     state.llmPlan = await invokeCommand("get_llm_plan", {
       request: {
         model_path: state.llmForm.model_path || null,
-        device_index: Number(state.selectedGpuIndex) || 0,
-        context_tokens: Number(state.llmForm.context_tokens) || 4096,
-        safety_margin_mib: Number(state.llmForm.safety_margin_mib) || 512,
+        device_index: reqDevice,
+        context_tokens: reqCtx,
+        safety_margin_mib: reqMargin,
       },
     });
     setStatusNote(`Analyzed GGUF model '${state.llmPlan.model.file_name}'.`);
@@ -929,6 +947,7 @@ function init() {
       state.tuningUi.actionResult = null;
       state.tuningUi.actionError = null;
       state.llmPlan = null;
+      state.llmRecommendations = null;
       state.llmPatchResult = null;
       state.llmPatchError = null;
       renderActiveView();

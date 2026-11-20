@@ -5,10 +5,11 @@ use std::sync::Arc;
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration_for_device,
-    rollback_lm_studio_config, rollback_windows_env_tweaks, run_video_benchmark_suite,
-    run_vulkan_suite, EnvAndOllamaPatchResult, EnvRollbackResult, KvCacheQuant, LlmAutotuneConfig,
-    LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult, LmStudioRollbackResult,
-    LocalLlmAssets, VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
+    recommend_models_for_device, rollback_lm_studio_config, rollback_windows_env_tweaks,
+    run_video_benchmark_suite, run_vulkan_suite, EnvAndOllamaPatchResult, EnvRollbackResult,
+    GpuModelRecommendationReport, KvCacheQuant, LlmAutotuneConfig, LlmAutotuneReport,
+    LlmOptimizationPlan, LmStudioPatchResult, LmStudioRollbackResult, LocalLlmAssets,
+    VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
     VulkanKernelSelection,
 };
 use forge_core::{
@@ -335,6 +336,17 @@ pub struct DesktopEnvRollbackRequest {
     pub dry_run: bool,
 }
 
+/// Request payload for VRAM-aware popular LLM model recommendations in the LLM Optimizer view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopLlmRecommendRequest {
+    #[serde(default)]
+    pub device_index: Option<usize>,
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
+    #[serde(default = "default_safety_margin_mib")]
+    pub safety_margin_mib: u64,
+}
+
 fn default_context_tokens() -> u32 {
     4096
 }
@@ -604,6 +616,22 @@ pub async fn get_llm_plan(request: DesktopLlmPlanRequest) -> Result<LlmOptimizat
     })
     .await
     .map_err(|e| format!("LLM plan task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn get_llm_recommendations(
+    request: DesktopLlmRecommendRequest,
+) -> Result<GpuModelRecommendationReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        recommend_models_for_device(
+            request.device_index,
+            request.context_tokens.clamp(1024, 131_072),
+            request.safety_margin_mib.clamp(0, 4096),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("LLM recommendation task failed: {e}"))?
 }
 
 #[tauri::command]

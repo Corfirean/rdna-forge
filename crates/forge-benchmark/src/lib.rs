@@ -1,5 +1,6 @@
 pub mod llama;
 pub mod llm_optimizer;
+pub mod llm_recommender;
 pub mod memory;
 pub mod stats;
 pub mod triton;
@@ -21,6 +22,10 @@ pub use llm_optimizer::{
     LlmOptimizationPlan, LlmTargetGpuContext, LlmTweakProfile, LmStudioPatchResult,
     LmStudioRollbackResult, LocalLlmAssets, ProcessVramImpact, RollbackFileAction,
     RDNA_FORGE_MANAGED_ENV_KEYS,
+};
+pub use llm_recommender::{
+    recommend_models_for_device, recommend_models_for_gpu_budget, GpuModelRecommendationReport,
+    ModelFitVerdict, ModelRecommendation,
 };
 pub use memory::peak_process_rss_bytes;
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
