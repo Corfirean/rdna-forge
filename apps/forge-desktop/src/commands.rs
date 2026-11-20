@@ -4,13 +4,16 @@ use std::sync::Arc;
 
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
-    discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration,
+    discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration_for_device,
     run_video_benchmark_suite, run_vulkan_suite, EnvAndOllamaPatchResult, KvCacheQuant,
     LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult, LocalLlmAssets,
     VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
     VulkanKernelSelection,
 };
-use forge_core::{CapabilityResult, DiagnosticReport, SupportStatus};
+use forge_core::{
+    match_profile_for_device, ArchitectureCapabilities, CapabilityResult, DiagnosticReport,
+    SupportStatus,
+};
 use forge_device::discover_all;
 use forge_profiler::{
     check_competing_workload_warning, check_vram_pressure_warning, read_all_gpu_tuning,
@@ -68,11 +71,22 @@ impl Drop for BusyGuard {
     }
 }
 
+/// Matched built-in profile and architecture capability metadata for a discovered GPU.
+#[derive(Debug, Clone, Serialize)]
+pub struct DesktopGpuProfileMatch {
+    pub gpu_index: usize,
+    pub matched_profile_id: Option<String>,
+    pub matched_profile_name: Option<String>,
+    pub vcn_generation: String,
+    pub arch_capabilities: ArchitectureCapabilities,
+}
+
 /// Complete diagnostics overview payload returned to the Overview view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DesktopDiagnosticsResponse {
     pub report: DiagnosticReport,
     pub telemetry: Option<Vec<GpuTelemetrySample>>,
+    pub gpu_metadata: Vec<DesktopGpuProfileMatch>,
 }
 
 /// Live ADLX telemetry polling payload with optional pause state during GPU tasks.
@@ -255,14 +269,18 @@ impl DesktopVideoBenchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopLlmPlanRequest {
     pub model_path: Option<String>,
+    #[serde(default)]
+    pub device_index: Option<usize>,
     pub context_tokens: u32,
     pub safety_margin_mib: u64,
 }
 
-/// Request payload for empirical `llama-bench` RDNA2 autotuning in the LLM Optimizer view.
+/// Request payload for empirical `llama-bench` AMD Radeon autotuning in the LLM Optimizer view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopLlmAutotuneRequest {
     pub model_path: Option<String>,
+    #[serde(default)]
+    pub device_index: Option<usize>,
     pub vulkan_bin: Option<String>,
     pub hip_bin: Option<String>,
     pub rocm_lib_dir: Option<String>,
@@ -276,6 +294,8 @@ pub struct DesktopLlmAutotuneRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopLmStudioPatchRequest {
     pub model_path: Option<String>,
+    #[serde(default)]
+    pub device_index: Option<usize>,
     pub profile_id: Option<String>,
     #[serde(default = "default_context_tokens")]
     pub context_tokens: u32,
@@ -289,6 +309,8 @@ pub struct DesktopLmStudioPatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopEnvPatchRequest {
     pub model_path: Option<String>,
+    #[serde(default)]
+    pub device_index: Option<usize>,
     #[serde(default = "default_context_tokens")]
     pub context_tokens: u32,
     pub kv_quant: Option<String>,
@@ -344,6 +366,21 @@ pub async fn get_diagnostics(
         }];
         capabilities.extend(default_untested_capabilities());
 
+        let gpu_metadata: Vec<DesktopGpuProfileMatch> = snapshot
+            .gpus
+            .iter()
+            .map(|gpu| {
+                let matched = match_profile_for_device(gpu);
+                DesktopGpuProfileMatch {
+                    gpu_index: gpu.index,
+                    matched_profile_id: matched.as_ref().map(|m| m.id.clone()),
+                    matched_profile_name: matched.as_ref().map(|m| m.profile.device.name.clone()),
+                    vcn_generation: gpu.architecture.vcn_generation().to_string(),
+                    arch_capabilities: gpu.architecture.arch_capabilities(),
+                }
+            })
+            .collect();
+
         let report = DiagnosticReport {
             system: snapshot.system,
             gpus: snapshot.gpus,
@@ -351,7 +388,11 @@ pub async fn get_diagnostics(
             capabilities,
             missing_dependencies,
         };
-        Ok(DesktopDiagnosticsResponse { report, telemetry })
+        Ok(DesktopDiagnosticsResponse {
+            report,
+            telemetry,
+            gpu_metadata,
+        })
     })
     .await
     .map_err(|e| format!("Diagnostics background task failed: {e}"))?
@@ -525,8 +566,9 @@ pub async fn get_llm_plan(request: DesktopLlmPlanRequest) -> Result<LlmOptimizat
     tauri::async_runtime::spawn_blocking(move || {
         let path = resolve_desktop_model_path(request.model_path.as_deref())?;
         let meta = inspect_gguf_model(&path).map_err(|e| e.to_string())?;
-        plan_llm_configuration(
+        plan_llm_configuration_for_device(
             &meta,
+            request.device_index,
             request.context_tokens.clamp(512, 262_144),
             request.safety_margin_mib.clamp(0, 4096),
         )
@@ -560,6 +602,7 @@ pub async fn run_llm_autotune(
 
         let cfg = LlmAutotuneConfig {
             model_path,
+            device_index: request.device_index,
             vulkan_bin,
             hip_bin,
             rocm_lib_dir,
@@ -582,6 +625,7 @@ pub async fn apply_lm_studio_patch(
         let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
         apply_lm_studio_config(
             &model_path,
+            request.device_index,
             request.profile_id.as_deref(),
             request.context_tokens.clamp(512, 262_144),
             request.safety_margin_mib.clamp(0, 4096),
@@ -606,6 +650,7 @@ pub async fn apply_env_and_ollama_patch(
         };
         apply_windows_and_ollama_env_tweaks(
             &model_path,
+            request.device_index,
             request.context_tokens.clamp(512, 262_144),
             kv_quant,
             None,
@@ -724,10 +769,12 @@ mod tests {
         let lms_patch: DesktopLmStudioPatchRequest =
             serde_json::from_str(r#"{"profile_id":"vulkan_wddm_priority"}"#).unwrap();
         assert!(lms_patch.dry_run);
+        assert_eq!(lms_patch.device_index, None);
         assert_eq!(lms_patch.context_tokens, 4096);
 
         let env_patch: DesktopEnvPatchRequest = serde_json::from_str(r#"{}"#).unwrap();
         assert!(env_patch.dry_run);
+        assert_eq!(env_patch.device_index, None);
         assert_eq!(env_patch.context_tokens, 4096);
     }
 

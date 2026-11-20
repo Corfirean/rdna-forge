@@ -4,13 +4,15 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
-    discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes, plan_llm_configuration,
-    resolve_default_triton_script, run_llama_comparison, run_triton_suite,
-    run_video_benchmark_suite, run_vulkan_suite, KvCacheQuant, LlamaBenchConfig, LlmAutotuneConfig,
-    TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
+    discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes,
+    plan_llm_configuration_for_device, resolve_default_triton_script, run_llama_comparison,
+    run_triton_suite, run_video_benchmark_suite, run_vulkan_suite, KvCacheQuant, LlamaBenchConfig,
+    LlmAutotuneConfig, TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig,
+    VulkanKernelSelection,
 };
 use forge_core::{
-    CapabilityResult, DiagnosticReport, GpuDeviceInfo, HardwareProfile, SupportStatus,
+    builtin_profiles, match_profile_for_device, CapabilityResult, DiagnosticReport, GpuDeviceInfo,
+    HardwareProfile, SupportStatus,
 };
 use forge_device::discover_all;
 use forge_profiler::{
@@ -61,7 +63,7 @@ enum Commands {
         #[command(subcommand)]
         action: VideoSubcommand,
     },
-    /// Inspect GGUF models, calculate anti-WDDM-spill VRAM budgets, and autotune llama.cpp for RDNA2.
+    /// Inspect GGUF models, calculate anti-WDDM-spill VRAM budgets, and autotune llama.cpp for AMD Radeon.
     Llm {
         #[command(subcommand)]
         action: LlmSubcommand,
@@ -311,6 +313,19 @@ enum ProfileSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// List all built-in AMD Radeon hardware profiles bundled with RDNA Forge.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Auto-match a discovered GPU adapter to its closest built-in AMD Radeon profile.
+    Match {
+        /// Discovered GPU device index to match (0 = preferred GPU).
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -328,9 +343,9 @@ enum LlmSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Calculate anti-WDDM-spill VRAM budgets, KV cache quantization savings, and RDNA2 tweaks.
+    /// Calculate anti-WDDM-spill VRAM budgets, KV cache quantization savings, and AMD Radeon tweaks.
     Plan(LlmPlanArgs),
-    /// Run empirical llama-bench autotuning across Vulkan/ROCm RDNA2 tweak profiles.
+    /// Run empirical llama-bench autotuning across Vulkan/ROCm AMD Radeon tweak profiles.
     Autotune(LlmAutotuneArgs),
     /// Preview (dry-run default) or patch LM Studio per-model config and backend preferences (with .bak backup).
     ApplyLmstudio(LlmApplyLmstudioArgs),
@@ -343,7 +358,10 @@ struct LlmApplyLmstudioArgs {
     /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
     #[arg(long)]
     model: Option<PathBuf>,
-    /// Profile ID to apply (e.g. vulkan_wddm_priority, rocm_q4_kv_long_ctx, vulkan_q4_kv_decode, vulkan_strict_zero_spill).
+    /// Target GPU device index (default: primary discrete GPU).
+    #[arg(long)]
+    device: Option<usize>,
+    /// Profile ID to apply (e.g. vulkan_wddm_priority, rocm_wmma_hipblaslt, rocm_q4_kv_long_ctx, vulkan_q4_kv_decode, moe_expert_offload, vulkan_strict_zero_spill).
     #[arg(long)]
     profile: Option<String>,
     /// Target context window in tokens.
@@ -381,6 +399,9 @@ struct LlmApplyEnvArgs {
     /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
     #[arg(long)]
     model: Option<PathBuf>,
+    /// Target GPU device index (default: primary discrete GPU).
+    #[arg(long)]
+    device: Option<usize>,
     /// Target context window in tokens for the generated Ollama Modelfile.
     #[arg(long, default_value_t = 4096)]
     context: u32,
@@ -402,6 +423,9 @@ struct LlmPlanArgs {
     /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
     #[arg(long)]
     model: Option<PathBuf>,
+    /// Target GPU device index (default: primary discrete GPU).
+    #[arg(long)]
+    device: Option<usize>,
     /// Target context window in tokens.
     #[arg(long, default_value_t = 4096)]
     context: u32,
@@ -419,6 +443,9 @@ struct LlmAutotuneArgs {
     /// Path to the .gguf model file (or omit to use the first discovered local GGUF model).
     #[arg(long)]
     model: Option<PathBuf>,
+    /// Target GPU device index (default: primary discrete GPU).
+    #[arg(long)]
+    device: Option<usize>,
     /// Optional path to Vulkan llama-bench.exe.
     #[arg(long)]
     vulkan_bin: Option<PathBuf>,
@@ -490,6 +517,8 @@ fn main() -> Result<()> {
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
+            ProfileSubcommand::List { json } => cmd_profile_list(json),
+            ProfileSubcommand::Match { device, json } => cmd_profile_match(device, json),
         },
     }
 }
@@ -652,7 +681,11 @@ fn print_doctor_report(report: &DiagnosticReport, telemetry: Option<&[GpuTelemet
 
 fn print_gpu_block(gpu: &GpuDeviceInfo, compact: bool) {
     println!("  {}", gpu.name);
-    println!("  Architecture: {}", gpu.architecture);
+    println!(
+        "  Architecture: {} ({})",
+        gpu.architecture,
+        gpu.architecture.vcn_generation()
+    );
     println!(
         "  Target: {}",
         gpu.gfx_target
@@ -660,6 +693,12 @@ fn print_gpu_block(gpu: &GpuDeviceInfo, compact: bool) {
             .map(|t| t.base.as_str())
             .unwrap_or("unknown")
     );
+    if let Some(matched) = match_profile_for_device(gpu) {
+        println!(
+            "  Matched Profile: {} (id={})",
+            matched.profile.device.name, matched.id
+        );
+    }
     println!(
         "  VRAM: {:.2} GiB ({} bytes)",
         gib(gpu.vram_bytes),
@@ -1225,8 +1264,9 @@ fn cmd_llm_plan(args: &LlmPlanArgs) -> Result<()> {
     let path = resolve_target_gguf_path(args.model.as_deref())?;
     let meta = inspect_gguf_model(&path)
         .with_context(|| format!("failed to inspect GGUF model '{}'", path.display()))?;
-    let plan = plan_llm_configuration(&meta, args.context, args.safety_margin_mib)
-        .context("failed to build LLM optimization plan")?;
+    let plan =
+        plan_llm_configuration_for_device(&meta, args.device, args.context, args.safety_margin_mib)
+            .context("failed to build LLM optimization plan")?;
     let json_text = serde_json::to_string_pretty(&plan)?;
     write_optional_output(args.output.as_deref(), &json_text)?;
 
@@ -1244,12 +1284,27 @@ fn cmd_llm_plan(args: &LlmPlanArgs) -> Result<()> {
         plan.model.block_count,
         plan.model.architecture
     );
+    let profile_note = plan
+        .matched_profile_id
+        .as_deref()
+        .map(|id| format!(" | Profile={id}"))
+        .unwrap_or_default();
+    let vram_kind = if plan.is_apu_unified_memory {
+        "Unified APU Memory"
+    } else {
+        "Live WDDM VRAM"
+    };
     println!(
-        "  Target GPU: {} ({}) | Physical CPU Cores: {}",
-        plan.gpu_name, plan.gfx_target, plan.physical_cpu_cores
+        "  Target GPU [{}]: {} ({}, {}){} | Physical CPU Cores: {}",
+        plan.gpu_index,
+        plan.gpu_name,
+        plan.gpu_architecture,
+        plan.gfx_target,
+        profile_note,
+        plan.physical_cpu_cores
     );
     println!(
-        "  Live WDDM VRAM: Total={} MiB | Used={} MiB | Free={} MiB | Safety Margin={} MiB",
+        "  {vram_kind}: Total={} MiB | Used={} MiB | Free={} MiB | Safety Margin={} MiB",
         plan.total_vram_mib, plan.used_vram_mib, plan.free_vram_mib, plan.safety_margin_mib
     );
     if plan.recoverable_layers_if_apps_closed > 0 {
@@ -1308,10 +1363,23 @@ fn cmd_llm_plan(args: &LlmPlanArgs) -> Result<()> {
     }
 
     println!();
-    println!("RECOMMENDED RDNA2 EXECUTION PROFILES");
+    println!(
+        "RECOMMENDED {} ({}) EXECUTION PROFILES",
+        if plan.gpu_architecture.is_empty() {
+            "AMD RADEON"
+        } else {
+            plan.gpu_architecture.as_str()
+        },
+        plan.gfx_target
+    );
     for (idx, p) in plan.recommended_profiles.iter().enumerate() {
+        let ncmoe_note = if p.n_cpu_moe > 0 {
+            format!(", ncmoe={}", p.n_cpu_moe)
+        } else {
+            String::new()
+        };
         println!(
-            "  [{}] {} (backend={}, dev={}, ngl={}, fa={}, kv={}/{})",
+            "  [{}] {} (backend={}, dev={}, ngl={}{ncmoe_note}, fa={}, kv={}/{})",
             idx + 1,
             p.title,
             p.backend,
@@ -1352,6 +1420,7 @@ fn cmd_llm_autotune(args: &LlmAutotuneArgs) -> Result<()> {
 
     let cfg = LlmAutotuneConfig {
         model_path,
+        device_index: args.device,
         vulkan_bin,
         hip_bin,
         rocm_lib_dir,
@@ -1437,6 +1506,7 @@ fn cmd_llm_apply_lmstudio(args: &LlmApplyLmstudioArgs) -> Result<()> {
     let model_path = resolve_target_gguf_path(args.model.as_deref())?;
     let res = apply_lm_studio_config(
         &model_path,
+        args.device,
         args.profile.as_deref(),
         args.context,
         args.safety_margin_mib,
@@ -1484,6 +1554,7 @@ fn cmd_llm_apply_env(args: &LlmApplyEnvArgs) -> Result<()> {
     let model_path = resolve_target_gguf_path(args.model.as_deref())?;
     let res = apply_windows_and_ollama_env_tweaks(
         &model_path,
+        args.device,
         args.context,
         args.kv_quant.into(),
         args.modelfile_out.as_deref(),
@@ -1500,10 +1571,11 @@ fn cmd_llm_apply_env(args: &LlmApplyEnvArgs) -> Result<()> {
     println!("[{mode}] WINDOWS USER ENVIRONMENT (HKCU\\Environment) & OLLAMA TWEAKS");
     for c in &res.env_changes {
         println!(
-            "  {:<34} : {:<10} -> {}",
+            "  {:<34} : {:<10} -> {} ({})",
             c.key,
             c.previous_value.as_deref().unwrap_or("(unset)"),
-            c.new_value
+            c.new_value,
+            c.purpose
         );
     }
     println!();
@@ -1554,6 +1626,108 @@ fn cmd_profile_show(path: &Path, json: bool) -> Result<()> {
             profile.capabilities.wmma,
             profile.capabilities.mfma
         );
+    }
+    Ok(())
+}
+
+fn cmd_profile_list(json: bool) -> Result<()> {
+    let profiles = builtin_profiles();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&profiles)?);
+        return Ok(());
+    }
+
+    println!(
+        "RDNA FORGE BUILT-IN HARDWARE PROFILES ({} total)",
+        profiles.len()
+    );
+    println!(
+        "  {:<13} {:<27} {:<8} {:<8} {:>5} {:>8} {:<6} {:<5}",
+        "ID", "Name", "Arch", "Target", "CUs", "VRAM", "WMMA", "FP8"
+    );
+    for entry in &profiles {
+        let p = &entry.profile;
+        println!(
+            "  {:<13} {:<27} {:<8} {:<8} {:>5} {:>6.1}G {:<6} {:<5}",
+            entry.id,
+            p.device.name,
+            p.device.architecture,
+            p.device.gfx_target,
+            p.compute.compute_units,
+            gib(p.memory.vram_bytes),
+            if p.capabilities.wmma { "yes" } else { "no" },
+            if p.capabilities.fp8 { "yes" } else { "no" },
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ProfileMatchCliReport<'a> {
+    device_index: usize,
+    device_name: &'a str,
+    architecture: String,
+    gfx_target: Option<String>,
+    pci_vendor_id: String,
+    pci_device_id: String,
+    matched_profile: Option<forge_core::BuiltinProfileInfo>,
+}
+
+fn cmd_profile_match(device_index: usize, json: bool) -> Result<()> {
+    let snapshot = discover_all();
+    let gpu = snapshot.gpus.get(device_index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "GPU device index {} not found ({} device(s) discovered)",
+            device_index,
+            snapshot.gpus.len()
+        )
+    })?;
+    let matched = match_profile_for_device(gpu);
+
+    if json {
+        let report = ProfileMatchCliReport {
+            device_index: gpu.index,
+            device_name: &gpu.name,
+            architecture: gpu.architecture.to_string(),
+            gfx_target: gpu.gfx_target.as_ref().map(|t| t.base.clone()),
+            pci_vendor_id: format!("0x{:04X}", gpu.vendor_id),
+            pci_device_id: format!("0x{:04X}", gpu.device_id),
+            matched_profile: matched,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Device [{}]: {} ({}, {}, PCI 0x{:04X}:0x{:04X})",
+        gpu.index,
+        gpu.name,
+        gpu.architecture,
+        gpu.gfx_target
+            .as_ref()
+            .map(|t| t.base.as_str())
+            .unwrap_or("unknown"),
+        gpu.vendor_id,
+        gpu.device_id
+    );
+    match matched {
+        Some(entry) => {
+            println!(
+                "  Matched Profile: {} (id={}, path={})",
+                entry.profile.device.name, entry.id, entry.relative_path
+            );
+            println!(
+                "  Specs: {} CUs ({} WGPs), {:.1} GiB, L2 {} MiB, Infinity Cache {} MiB",
+                entry.profile.compute.compute_units,
+                entry.profile.compute.wgp_count,
+                gib(entry.profile.memory.vram_bytes),
+                entry.profile.memory.l2_cache_bytes / (1024 * 1024),
+                entry.profile.memory.infinity_cache_bytes / (1024 * 1024)
+            );
+        }
+        None => {
+            println!("  No built-in AMD Radeon hardware profile matched this adapter (generic architecture policy applies).");
+        }
     }
     Ok(())
 }
@@ -1698,12 +1872,14 @@ mod tests {
             other => panic!("unexpected command parsed: {other:?}"),
         }
 
-        let llm_plan = Cli::try_parse_from(["forge", "llm", "plan", "--context", "8192"])
-            .expect("llm plan args must parse");
+        let llm_plan =
+            Cli::try_parse_from(["forge", "llm", "plan", "--device", "1", "--context", "8192"])
+                .expect("llm plan args must parse");
         match llm_plan.command {
             Commands::Llm {
                 action: LlmSubcommand::Plan(args),
             } => {
+                assert_eq!(args.device, Some(1));
                 assert_eq!(args.context, 8192);
                 assert_eq!(args.safety_margin_mib, 512);
             }
@@ -1714,6 +1890,8 @@ mod tests {
             "forge",
             "llm",
             "apply-lmstudio",
+            "--device",
+            "0",
             "--profile",
             "vulkan_wddm_priority",
             "--context",
@@ -1724,6 +1902,7 @@ mod tests {
             Commands::Llm {
                 action: LlmSubcommand::ApplyLmstudio(args),
             } => {
+                assert_eq!(args.device, Some(0));
                 assert_eq!(args.profile.as_deref(), Some("vulkan_wddm_priority"));
                 assert_eq!(args.context, 4096);
                 assert!(!args.apply, "apply-lmstudio must default to dry-run");
@@ -1735,6 +1914,8 @@ mod tests {
             "forge",
             "llm",
             "apply-env",
+            "--device",
+            "0",
             "--kv-quant",
             "q4-0",
             "--context",
@@ -1745,11 +1926,33 @@ mod tests {
             Commands::Llm {
                 action: LlmSubcommand::ApplyEnv(args),
             } => {
+                assert_eq!(args.device, Some(0));
                 assert_eq!(args.kv_quant, KvQuantChoice::Q4_0);
                 assert_eq!(args.context, 8192);
                 assert!(!args.apply, "apply-env must default to dry-run");
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
+
+        let prof_list = Cli::try_parse_from(["forge", "profile", "list", "--json"])
+            .expect("profile list --json must parse");
+        assert!(matches!(
+            prof_list.command,
+            Commands::Profile {
+                action: ProfileSubcommand::List { json: true }
+            }
+        ));
+
+        let prof_match = Cli::try_parse_from(["forge", "profile", "match", "--device", "1"])
+            .expect("profile match --device 1 must parse");
+        assert!(matches!(
+            prof_match.command,
+            Commands::Profile {
+                action: ProfileSubcommand::Match {
+                    device: 1,
+                    json: false
+                }
+            }
+        ));
     }
 }

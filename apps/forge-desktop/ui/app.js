@@ -648,7 +648,7 @@ const actions = {
   copyLlmCommand: (cmdText) => {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
       navigator.clipboard.writeText(cmdText).then(
-        () => setStatusNote("Copied RDNA2 llama-server launch command to clipboard."),
+        () => setStatusNote("Copied AMD Radeon llama-server launch command to clipboard."),
         () => setStatusNote("Clipboard copy failed; select and copy command text manually.")
       );
     }
@@ -685,6 +685,7 @@ async function refreshLlmPlan() {
     state.llmPlan = await invokeCommand("get_llm_plan", {
       request: {
         model_path: state.llmForm.model_path || null,
+        device_index: Number(state.selectedGpuIndex) || 0,
         context_tokens: Number(state.llmForm.context_tokens) || 4096,
         safety_margin_mib: Number(state.llmForm.safety_margin_mib) || 512,
       },
@@ -703,13 +704,14 @@ async function runLlmAutotune() {
   state.runningLlmAutotune = true;
   state.busyOp = true;
   state.llmAutotuneError = null;
-  setStatusNote("Running empirical llama-bench RDNA2 autotuner...");
+  setStatusNote("Running empirical llama-bench AMD Radeon autotuner...");
   renderActiveView();
 
   try {
     state.llmAutotuneReport = await invokeCommand("run_llm_autotune", {
       request: {
         model_path: state.llmForm.model_path || null,
+        device_index: Number(state.selectedGpuIndex) || 0,
         vulkan_bin: state.llmForm.vulkan_bin || null,
         hip_bin: state.llmForm.hip_bin || null,
         rocm_lib_dir: state.llmAssets?.rocm_lib_dir || null,
@@ -746,6 +748,7 @@ async function applyLmStudioPatch(profileId, dryRun) {
     const res = await invokeCommand("apply_lm_studio_patch", {
       request: {
         model_path: state.llmForm.model_path || null,
+        device_index: Number(state.selectedGpuIndex) || 0,
         profile_id: profileId || null,
         context_tokens: Number(state.llmForm.context_tokens) || 4096,
         safety_margin_mib: Number(state.llmForm.safety_margin_mib) || 512,
@@ -781,6 +784,7 @@ async function applyEnvPatch(dryRun) {
     const res = await invokeCommand("apply_env_and_ollama_patch", {
       request: {
         model_path: state.llmForm.model_path || null,
+        device_index: Number(state.selectedGpuIndex) || 0,
         context_tokens: Number(state.llmForm.context_tokens) || 4096,
         kv_quant: "q8_0",
         dry_run: Boolean(dryRun),
@@ -830,7 +834,13 @@ function init() {
       state.tuningUi.pendingConfirm = null;
       state.tuningUi.actionResult = null;
       state.tuningUi.actionError = null;
+      state.llmPlan = null;
+      state.llmPatchResult = null;
+      state.llmPatchError = null;
       renderActiveView();
+      if (state.activeTab === "llm") {
+        refreshLlmPlan();
+      }
     });
   }
 

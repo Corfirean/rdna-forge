@@ -188,11 +188,28 @@ export function renderOverview(root, state, actions) {
   const { report } = diag;
   const gpu = selectedGpuFromDiagnostics(state);
   const gfxLabel = gpu?.gfx_target ? `${gpu.gfx_target.raw} (${gpu.architecture.toUpperCase()})` : gpu?.architecture || "n/a";
+  const gpuMeta = gpu
+    ? (diag.gpu_metadata || []).find((m) => m.gpu_index === gpu.index) || null
+    : null;
+  const archCaps = gpuMeta?.arch_capabilities || null;
 
   const gpuSpecRows = gpu
     ? [
         ["Adapter", gpu.name, false],
         ["Architecture / Target", gfxLabel],
+        [
+          "Matched Profile",
+          gpuMeta?.matched_profile_name
+            ? `${gpuMeta.matched_profile_name} (${gpuMeta.matched_profile_id})`
+            : "Generic AMD / Unmatched",
+          false,
+        ],
+        [
+          "ISA & Media",
+          archCaps
+            ? `FP16=${archCaps.has_native_fp16}  BF16=${archCaps.has_native_bf16}  FP8=${archCaps.has_native_fp8}  DP4A=${archCaps.has_dp4a_i8}  WMMA=${archCaps.has_wmma} | ${gpuMeta.vcn_generation}`
+            : gpuMeta?.vcn_generation || "n/a",
+        ],
         ["PCI Vendor : Device", `${fmtHex(gpu.vendor_id)}:${fmtHex(gpu.device_id)}`],
         ["PCI Bus ID", gpu.pci_bus_id || "n/a"],
         ["Type", gpu.discrete ? "Discrete GPU" : "Integrated GPU", false],
@@ -1671,7 +1688,7 @@ export function renderLlmOptimizer(root, state, actions) {
         { className: "empty-state" },
         state.loadingLlmPlan
           ? "Inspecting GGUF model header and live ADLX WDDM VRAM..."
-          : "Select a local GGUF model and click 'Analyze & Plan VRAM' to calculate non-spilling GPU layer budgets and RDNA2 tweaks."
+          : "Select a local GGUF model and click 'Analyze & Plan VRAM' to calculate non-spilling GPU layer budgets and AMD Radeon tweaks."
       )
     );
     return;
@@ -1718,9 +1735,15 @@ export function renderLlmOptimizer(root, state, actions) {
       el(
         "div",
         { className: "kpi-tile" },
-        el("div", { className: "kpi-label" }, "Free Physical VRAM"),
+        el("div", { className: "kpi-label" }, plan.is_apu_unified_memory ? "Free Unified VRAM" : "Free Physical VRAM"),
         el("div", { className: "kpi-value" }, `${plan.free_vram_mib} MiB`),
-        el("div", { className: "kpi-sub" }, `Used: ${plan.used_vram_mib} / ${plan.total_vram_mib} MiB`)
+        el(
+          "div",
+          { className: "kpi-sub" },
+          plan.is_apu_unified_memory
+            ? `Unified APU Pool (Used: ${plan.used_vram_mib} / ${plan.total_vram_mib} MiB)`
+            : `Used: ${plan.used_vram_mib} / ${plan.total_vram_mib} MiB`
+        )
       ),
       el(
         "div",
@@ -1799,7 +1822,7 @@ export function renderLlmOptimizer(root, state, actions) {
     )
   );
 
-  // Recommended RDNA2 Profiles & One-Click Copy / LM Studio Patcher Commands
+  // Recommended AMD Radeon Profiles & One-Click Copy / LM Studio Patcher Commands
   const profileCards = (plan.recommended_profiles || []).map((p) => {
     const envStr = (p.env_vars || []).map(([k, v]) => `${k}=${v}`).join(" | ") || "none";
     return el(
@@ -1869,8 +1892,8 @@ export function renderLlmOptimizer(root, state, actions) {
 
   root.appendChild(
     makePanel(
-      `Verified AMD RDNA2 (${plan.gfx_target}) Tweaks & Launch Profiles`,
-      `${plan.gpu_name}`,
+      `AMD ${plan.gpu_architecture || "Radeon"} (${plan.gfx_target}) Tweaks & Launch Profiles`,
+      `${plan.gpu_name}${plan.matched_profile_id ? ` [${plan.matched_profile_id}]` : ""}`,
       el("div", {}, profileCards)
     )
   );
@@ -1930,15 +1953,15 @@ export function renderLlmOptimizer(root, state, actions) {
             className: `banner ${d.applied ? "banner-ok" : "banner-warn"} mono`,
             style: "margin-bottom:0",
           },
-          `[${d.applied ? "APPLIED" : "DRY-RUN PREVIEW"}] Profile: ${d.profile_id} (${d.profile_title}) | Runtime: ${d.selected_runtime}`
+          `[${d.applied ? "APPLIED" : "DRY-RUN PREVIEW"}] Profile: ${d.profile_id} (${d.profile_title}) | Runtime: ${d.selected_lmstudio_backend}`
         )
       );
       patchPanelBody.appendChild(
         makeKvTable([
           ["Model Config Path", d.model_config_path],
-          ["Model Backup (.bak)", d.model_backup_path || "(none — new file or dry-run)"],
+          ["Model Backup (.bak)", d.model_config_backup_path || "(none — new file or dry-run)"],
           ["Backend Preferences Path", d.backend_prefs_path],
-          ["Backend Backup (.bak)", d.backend_backup_path || "(none)"],
+          ["Backend Backup (.bak)", d.backend_prefs_backup_path || "(none)"],
         ])
       );
       patchPanelBody.appendChild(
@@ -1949,7 +1972,7 @@ export function renderLlmOptimizer(root, state, actions) {
             style:
               "margin:0;padding:8px 10px;background:#111214;border:1px solid #24272d;font-size:11px;max-height:220px;overflow:auto;color:#cfd4dc",
           },
-          d.model_config_json
+          d.patched_model_json_preview
         )
       );
     } else if (pr.kind === "env") {
@@ -1961,17 +1984,17 @@ export function renderLlmOptimizer(root, state, actions) {
             className: `banner ${d.applied ? "banner-ok" : "banner-warn"} mono`,
             style: "margin-bottom:0",
           },
-          `[${d.applied ? "APPLIED TO HKCU\\Environment" : "DRY-RUN PREVIEW"}] ${d.note}`
+          `[${d.applied ? "APPLIED TO HKCU\\Environment" : "DRY-RUN PREVIEW"}] ${d.ollama_create_cmd}`
         )
       );
       const envRows = (d.env_changes || []).map((c) =>
         el(
           "tr",
           {},
-          el("td", { className: "mono" }, c.name),
+          el("td", { className: "mono" }, c.key),
           el("td", { className: "mono muted-text" }, c.previous_value || "(unset)"),
           el("td", { className: "mono" }, c.new_value),
-          el("td", { className: "muted-text" }, c.purpose)
+          el("td", { className: "muted-text" }, c.purpose || "--")
         )
       );
       patchPanelBody.appendChild(
@@ -1987,7 +2010,7 @@ export function renderLlmOptimizer(root, state, actions) {
               el("th", {}, "Variable (HKCU\\Environment)"),
               el("th", {}, "Previous"),
               el("th", {}, "Target"),
-              el("th", {}, "RDNA2 Purpose")
+              el("th", {}, "Purpose")
             )
           ),
           el("tbody", {}, envRows)
@@ -2003,7 +2026,7 @@ export function renderLlmOptimizer(root, state, actions) {
             {
               type: "button",
               className: "btn",
-              onClick: () => actions.copyLlmCommand(d.ollama_modelfile),
+              onClick: () => actions.copyLlmCommand(d.ollama_modelfile_content),
             },
             "Copy Ollama Modelfile"
           )
@@ -2017,7 +2040,7 @@ export function renderLlmOptimizer(root, state, actions) {
             style:
               "margin:0;padding:8px 10px;background:#111214;border:1px solid #24272d;font-size:11px;max-height:180px;overflow:auto;color:#cfd4dc",
           },
-          d.ollama_modelfile
+          d.ollama_modelfile_content
         )
       );
     }
@@ -2036,7 +2059,7 @@ export function renderLlmOptimizer(root, state, actions) {
     root.appendChild(
       makePanel(
         "LM Studio & Local Launcher Optimization Checklist",
-        "Applies directly to your installed LM Studio 2.73.0 Vulkan & ROCm backends",
+        "Applies directly to LM Studio Vulkan & ROCm backends",
         el(
           "div",
           { style: "display:flex;flex-direction:column;gap:6px" },

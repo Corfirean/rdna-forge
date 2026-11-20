@@ -228,6 +228,8 @@ fn forge_cli_help_and_profile_show_succeed() {
         &["llm", "autotune", "--help"][..],
         &["llm", "apply-lmstudio", "--help"][..],
         &["llm", "apply-env", "--help"][..],
+        &["profile", "list", "--help"][..],
+        &["profile", "match", "--help"][..],
     ] {
         let out = Command::new(bin)
             .args(args)
@@ -235,6 +237,15 @@ fn forge_cli_help_and_profile_show_succeed() {
             .expect("subcommand --help must execute");
         assert!(out.status.success(), "help failed for {args:?}");
     }
+
+    let prof_list_out = Command::new(bin)
+        .args(["profile", "list", "--json"])
+        .output()
+        .expect("forge profile list --json must execute");
+    assert!(prof_list_out.status.success());
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&prof_list_out.stdout)
+        .expect("profile list --json must parse as JSON array");
+    assert_eq!(listed.len(), 18);
 
     let profile_path = repo_root().join("profiles/gfx1030/rx6900xt.toml");
     let prof_out = Command::new(bin)
@@ -247,4 +258,36 @@ fn forge_cli_help_and_profile_show_succeed() {
     let prof_stdout = String::from_utf8_lossy(&prof_out.stdout);
     assert!(prof_stdout.contains("gfx1030"));
     assert!(prof_stdout.contains("CUs: 80 (40 WGPs)"));
+}
+
+#[test]
+fn all_profiles_on_disk_load_and_validate_and_match_builtin_registry() {
+    let profiles_root = repo_root().join("profiles");
+    let mut toml_files = Vec::new();
+    let mut stack = vec![profiles_root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("profiles dir readable") {
+            let entry = entry.expect("dir entry readable");
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                toml_files.push(path);
+            }
+        }
+    }
+
+    assert_eq!(
+        toml_files.len(),
+        forge_core::builtin_profiles().len(),
+        "every on-disk TOML profile under profiles/ must be registered in forge-core"
+    );
+
+    for path in toml_files {
+        let loaded = HardwareProfile::from_file(&path)
+            .unwrap_or_else(|e| panic!("failed to validate {}: {e}", path.display()));
+        loaded
+            .validate()
+            .unwrap_or_else(|e| panic!("failed to validate {}: {e}", path.display()));
+    }
 }
