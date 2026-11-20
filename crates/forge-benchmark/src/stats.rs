@@ -29,9 +29,51 @@ pub struct BenchmarkResult {
     pub latency: LatencyStats,
     pub throughput_unit: String,
     pub throughput_median: f64,
+    /// What `throughput_median` actually measures and what it does not (see
+    /// [`BenchmarkResult::annotate_metric_semantics`]). Empty only for results from older reports.
+    #[serde(default)]
+    pub metric_semantics: String,
     pub accuracy: Option<NumericalAccuracy>,
     pub peak_rss_bytes: Option<u64>,
     pub notes: Option<String>,
+}
+
+impl BenchmarkResult {
+    /// Names the throughput metric precisely and records its measurement scope.
+    ///
+    /// Kernel `GB/s` figures are *logical* bandwidth: minimal unique input + output bytes at
+    /// storage precision divided by the median per-dispatch time. They are not measured VRAM
+    /// traffic and can legitimately exceed the card's VRAM bandwidth when the working set stays
+    /// in cache (e.g. RDNA2 Infinity Cache) or weights are reused across batched dispatches.
+    /// `GFLOP/s` / `TOPS` count mathematical operations (2 per multiply-accumulate), not executed
+    /// instructions. Whether the time is kernel-only or includes submission overhead follows from
+    /// `timing_source`.
+    pub fn annotate_metric_semantics(&mut self) {
+        let metric = match self.throughput_unit.as_str() {
+            "GB/s" => {
+                self.throughput_unit = "GB/s (logical)".to_string();
+                "Logical bandwidth = minimal unique input+output bytes / median latency. NOT measured VRAM bandwidth; may exceed it when data is cache-resident or reused across batched dispatches."
+            }
+            "GFLOP/s" => {
+                "Logical compute rate = mathematical floating-point operations / median latency; not executed-instruction throughput."
+            }
+            "TOPS" => {
+                "Logical integer compute rate = mathematical integer operations / median latency; not executed-instruction throughput."
+            }
+            "GB/s (logical)" => return,
+            _ => "Throughput metric defined by the benchmark that produced it.",
+        };
+        let scope = match self.timing_source.as_str() {
+            "vulkan_timestamp_query" => {
+                "Timing: kernel-only GPU timestamps."
+            }
+            "host_fence_wall_clock" => {
+                "Timing: host wall clock around submit+fence (end-to-end, includes submission overhead; not kernel-only)."
+            }
+            _ => "Timing scope: see timing_source.",
+        };
+        self.metric_semantics = format!("{metric} {scope}");
+    }
 }
 
 /// Result of repeated kernel dispatches verifying numeric and runtime stability.
@@ -128,4 +170,49 @@ fn sorted_percentile(sorted: &[f64], pct: f64) -> f64 {
     let hi = rank.ceil() as usize;
     let frac = rank - (lo as f64);
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(unit: &str, timing_source: &str) -> BenchmarkResult {
+        BenchmarkResult {
+            name: "k".into(),
+            backend: "b".into(),
+            shape: "s".into(),
+            dtype: "f32".into(),
+            timing_source: timing_source.into(),
+            latency: compute_latency_stats(1, &[1.0, 2.0, 3.0]).unwrap(),
+            throughput_unit: unit.into(),
+            throughput_median: 1.0,
+            metric_semantics: String::new(),
+            accuracy: None,
+            peak_rss_bytes: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn bandwidth_metric_is_labelled_logical_and_timing_scope_is_stated() {
+        let mut r = result("GB/s", "vulkan_timestamp_query");
+        r.annotate_metric_semantics();
+        assert_eq!(r.throughput_unit, "GB/s (logical)");
+        assert!(r.metric_semantics.contains("NOT measured VRAM bandwidth"));
+        assert!(r.metric_semantics.contains("kernel-only"));
+
+        let mut r = result("GB/s", "host_fence_wall_clock");
+        r.annotate_metric_semantics();
+        assert!(r.metric_semantics.contains("not kernel-only"));
+
+        // Idempotent: annotating twice must not change the unit again.
+        let before = r.clone();
+        r.annotate_metric_semantics();
+        assert_eq!(r, before);
+
+        let mut r = result("GFLOP/s", "vulkan_timestamp_query");
+        r.annotate_metric_semantics();
+        assert_eq!(r.throughput_unit, "GFLOP/s");
+        assert!(r.metric_semantics.contains("mathematical"));
+    }
 }

@@ -17,15 +17,17 @@ pub use llama::{
     LlamaBenchEntry, LlamaComparisonReport,
 };
 pub use llm_optimizer::{
-    apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
-    build_lm_studio_model_config_json, discover_local_llm_assets, estimate_kv_and_state_bytes,
-    gguf_file_type_name, inspect_gguf_model, inspect_gguf_reader, plan_llm_configuration,
+    apply_baseline_speedups, apply_lm_studio_config, apply_windows_and_ollama_env_tweaks,
+    autotune_llm_model, balanced_score, build_lm_studio_model_config_json,
+    discover_local_llm_assets, estimate_kv_and_state_bytes, gguf_file_type_name,
+    inspect_gguf_model, inspect_gguf_reader, plan_llm_configuration,
     plan_llm_configuration_for_device, plan_llm_configuration_for_gpu, rollback_lm_studio_config,
-    rollback_lm_studio_config_in_dir, rollback_windows_env_tweaks, EnvAndOllamaPatchResult,
-    EnvRollbackItem, EnvRollbackResult, EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget,
-    KvCacheQuant, LlmAutotuneCandidateResult, LlmAutotuneConfig, LlmAutotuneReport,
-    LlmOptimizationPlan, LlmTargetGpuContext, LlmTweakProfile, LmStudioPatchResult,
-    LmStudioRollbackResult, LocalLlmAssets, ProcessVramImpact, RollbackFileAction,
+    rollback_lm_studio_config_in_dir, rollback_windows_env_tweaks, select_autotune_winners,
+    EnvAndOllamaPatchResult, EnvRollbackItem, EnvRollbackResult, EnvVarChange, GgufModelMetadata,
+    KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult, LlmAutotuneConfig,
+    LlmAutotuneReport, LlmOptimizationPlan, LlmTargetGpuContext, LlmTweakProfile,
+    LmStudioPatchResult, LmStudioRollbackResult, LocalLlmAssets, ProcessVramImpact,
+    RollbackFileAction, BALANCED_DECODE_WEIGHT, BALANCED_PREFILL_WEIGHT,
     RDNA_FORGE_MANAGED_ENV_KEYS,
 };
 pub use llm_recommender::{
@@ -512,6 +514,97 @@ mod tests {
             .recommended_profiles
             .iter()
             .any(|p| p.backend == "hip"));
+    }
+
+    fn candidate(
+        id: &str,
+        ok: bool,
+        pp: Option<f64>,
+        tg: Option<f64>,
+    ) -> LlmAutotuneCandidateResult {
+        LlmAutotuneCandidateResult {
+            profile_id: id.to_string(),
+            title: id.to_string(),
+            backend: "vulkan".to_string(),
+            n_gpu_layers: 99,
+            flash_attn: true,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            env_summary: "default".to_string(),
+            succeeded: ok,
+            pp_tok_s: pp,
+            tg_tok_s: tg,
+            tg_speedup_vs_baseline: None,
+            pp_speedup_vs_baseline: None,
+            llama_server_cmd: String::new(),
+            error: (!ok).then(|| "failed".to_string()),
+        }
+    }
+
+    #[test]
+    fn autotune_winners_ignore_failed_nan_zero_and_incomplete_candidates() {
+        let c = vec![
+            candidate("base", true, Some(100.0), Some(10.0)),
+            candidate("nan", true, Some(f64::NAN), Some(f64::NAN)),
+            candidate("zero", true, Some(0.0), Some(0.0)),
+            // Fastest numbers but failed: must never win.
+            candidate("failed", false, Some(9_999.0), Some(999.0)),
+            // Best decode but no prefill: eligible for decode, not for balanced.
+            candidate("decode_only", true, None, Some(15.0)),
+            candidate("tuned", true, Some(300.0), Some(12.0)),
+        ];
+        let (decode, prefill, balanced) = select_autotune_winners(&c);
+        assert_eq!(decode.as_deref(), Some("decode_only"));
+        assert_eq!(prefill.as_deref(), Some("tuned"));
+        assert_eq!(balanced.as_deref(), Some("tuned"));
+
+        // Nothing valid => no winner, not an arbitrary one.
+        let none = vec![
+            candidate("a", false, None, None),
+            candidate("b", true, Some(f64::NAN), None),
+        ];
+        assert_eq!(select_autotune_winners(&none), (None, None, None));
+
+        // Ties resolve to the earliest candidate.
+        let tie = vec![
+            candidate("first", true, Some(5.0), Some(5.0)),
+            candidate("second", true, Some(5.0), Some(5.0)),
+        ];
+        assert_eq!(select_autotune_winners(&tie).2.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn balanced_score_is_a_scale_free_weighted_geometric_mean() {
+        // Doubling either rate multiplies the score by 2^weight, independent of magnitude.
+        let s = balanced_score(10.0, 100.0);
+        assert!((balanced_score(20.0, 100.0) / s - 2f64.powf(0.7)).abs() < 1e-12);
+        assert!((balanced_score(10.0, 200.0) / s - 2f64.powf(0.3)).abs() < 1e-12);
+        assert!((BALANCED_DECODE_WEIGHT + BALANCED_PREFILL_WEIGHT - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn speedups_are_relative_to_the_designated_baseline_only() {
+        let mut c = vec![
+            candidate("vulkan_naive_fa1", true, Some(100.0), Some(10.0)),
+            candidate("tuned", true, Some(200.0), Some(15.0)),
+            candidate("no_prefill", true, None, Some(20.0)),
+            candidate("failed", false, Some(1.0), Some(1.0)),
+        ];
+        apply_baseline_speedups(&mut c, "vulkan_naive_fa1");
+        assert_eq!(c[0].tg_speedup_vs_baseline, Some(1.0));
+        assert_eq!(c[1].pp_speedup_vs_baseline, Some(2.0));
+        assert_eq!(c[1].tg_speedup_vs_baseline, Some(1.5));
+        assert_eq!(c[2].pp_speedup_vs_baseline, None);
+        assert_eq!(c[2].tg_speedup_vs_baseline, Some(2.0));
+        assert_eq!(c[3].tg_speedup_vs_baseline, None);
+
+        // A failed baseline must not be replaced by another candidate.
+        let mut c = vec![
+            candidate("vulkan_naive_fa1", false, None, None),
+            candidate("tuned", true, Some(200.0), Some(15.0)),
+        ];
+        apply_baseline_speedups(&mut c, "vulkan_naive_fa1");
+        assert!(c.iter().all(|x| x.tg_speedup_vs_baseline.is_none()));
     }
 
     #[test]

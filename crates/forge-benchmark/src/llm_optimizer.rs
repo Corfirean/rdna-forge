@@ -320,6 +320,13 @@ pub struct LlmAutotuneReport {
     pub best_decode_profile_id: Option<String>,
     pub best_prefill_profile_id: Option<String>,
     pub best_balanced_profile_id: Option<String>,
+    /// Profile every speedup is relative to. `None` when no designated baseline ran successfully
+    /// (speedups are then absent rather than measured against an arbitrary candidate).
+    #[serde(default)]
+    pub baseline_profile_id: Option<String>,
+    /// Human-readable definition of the balanced score used for `best_balanced_profile_id`.
+    #[serde(default)]
+    pub balanced_score_formula: String,
     pub peak_rss_bytes: Option<u64>,
 }
 
@@ -1878,8 +1885,6 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
     }
 
     let mut candidates = Vec::with_capacity(specs.len());
-    let mut baseline_pp: Option<f64> = None;
-    let mut baseline_tg: Option<f64> = None;
 
     for spec in specs {
         let bin_path = if spec.backend == "vulkan" {
@@ -1974,30 +1979,23 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 match parse_llama_bench_json(&stdout, spec.backend) {
                     Ok(entries) => {
-                        let pp = entries
-                            .iter()
-                            .find(|e| e.n_prompt > 0 && e.n_gen == 0)
-                            .map(|e| e.median_tok_s);
-                        let tg = entries
-                            .iter()
-                            .find(|e| e.n_gen > 0 && e.n_prompt == 0)
-                            .map(|e| e.median_tok_s);
-
-                        if baseline_pp.is_none() {
-                            baseline_pp = pp;
-                        }
-                        if baseline_tg.is_none() {
-                            baseline_tg = tg;
-                        }
-
-                        let pp_speedup = match (pp, baseline_pp) {
-                            (Some(cur), Some(base)) if base > 0.0 => Some(cur / base),
-                            _ => None,
-                        };
-                        let tg_speedup = match (tg, baseline_tg) {
-                            (Some(cur), Some(base)) if base > 0.0 => Some(cur / base),
-                            _ => None,
-                        };
+                        let pp = valid_rate(
+                            entries
+                                .iter()
+                                .find(|e| e.n_prompt > 0 && e.n_gen == 0)
+                                .map(|e| e.median_tok_s),
+                        );
+                        let tg = valid_rate(
+                            entries
+                                .iter()
+                                .find(|e| e.n_gen > 0 && e.n_prompt == 0)
+                                .map(|e| e.median_tok_s),
+                        );
+                        // A run that produced no usable rate at all is a failure, not a success.
+                        let error = (pp.is_none() && tg.is_none()).then(|| {
+                            "llama-bench produced no finite, positive prompt-processing or token-generation rate"
+                                .to_string()
+                        });
 
                         candidates.push(LlmAutotuneCandidateResult {
                             profile_id: spec.id.to_string(),
@@ -2008,13 +2006,13 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
                             cache_type_k: spec.ctk.to_string(),
                             cache_type_v: spec.ctv.to_string(),
                             env_summary,
-                            succeeded: true,
+                            succeeded: error.is_none(),
                             pp_tok_s: pp,
                             tg_tok_s: tg,
-                            tg_speedup_vs_baseline: tg_speedup,
-                            pp_speedup_vs_baseline: pp_speedup,
+                            tg_speedup_vs_baseline: None,
+                            pp_speedup_vs_baseline: None,
                             llama_server_cmd,
-                            error: None,
+                            error,
                         });
                     }
                     Err(e) => {
@@ -2080,36 +2078,21 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         }
     }
 
-    let best_decode_profile_id = candidates
-        .iter()
-        .filter(|c| c.succeeded && c.tg_tok_s.is_some())
-        .max_by(|a, b| {
-            a.tg_tok_s
-                .unwrap_or(0.0)
-                .total_cmp(&b.tg_tok_s.unwrap_or(0.0))
+    // The designated baseline is the stock Vulkan profile. If it did not run or failed there is no
+    // baseline: speedups stay empty instead of being measured against whichever candidate
+    // happened to succeed first.
+    let baseline_profile_id = BASELINE_PROFILE_ID
+        .filter(|id| {
+            candidates
+                .iter()
+                .any(|c| c.profile_id == *id && c.succeeded)
         })
-        .map(|c| c.profile_id.clone());
-
-    let best_prefill_profile_id = candidates
-        .iter()
-        .filter(|c| c.succeeded && c.pp_tok_s.is_some())
-        .max_by(|a, b| {
-            a.pp_tok_s
-                .unwrap_or(0.0)
-                .total_cmp(&b.pp_tok_s.unwrap_or(0.0))
-        })
-        .map(|c| c.profile_id.clone());
-
-    // Geometric mean of prefill and decode (weighted 70% decode, 30% prefill)
-    let best_balanced_profile_id = candidates
-        .iter()
-        .filter(|c| c.succeeded && c.tg_tok_s.is_some() && c.pp_tok_s.is_some())
-        .max_by(|a, b| {
-            let score_a = a.tg_tok_s.unwrap_or(0.0).powf(0.7) * a.pp_tok_s.unwrap_or(0.0).powf(0.3);
-            let score_b = b.tg_tok_s.unwrap_or(0.0).powf(0.7) * b.pp_tok_s.unwrap_or(0.0).powf(0.3);
-            score_a.total_cmp(&score_b)
-        })
-        .map(|c| c.profile_id.clone());
+        .map(str::to_string);
+    if let Some(id) = &baseline_profile_id {
+        apply_baseline_speedups(&mut candidates, id);
+    }
+    let (best_decode_profile_id, best_prefill_profile_id, best_balanced_profile_id) =
+        select_autotune_winners(&candidates);
 
     Ok(LlmAutotuneReport {
         plan,
@@ -2120,8 +2103,88 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         best_decode_profile_id,
         best_prefill_profile_id,
         best_balanced_profile_id,
+        baseline_profile_id,
+        balanced_score_formula: BALANCED_SCORE_FORMULA.to_string(),
         peak_rss_bytes: peak_process_rss_bytes(),
     })
+}
+
+/// Profile used as the speedup reference when the Vulkan backend is benchmarked.
+const BASELINE_PROFILE_ID: Option<&str> = Some("vulkan_naive_fa1");
+
+/// Weight of decode (token generation) in the balanced score.
+///
+/// Rationale: interactive chat spends most wall-clock time in decode, and prefill rates are
+/// typically an order of magnitude higher, so an unweighted product would be dominated by
+/// prefill. A weighted geometric mean `tg^w * pp^(1-w)` is scale-free (a 2x gain in either rate
+/// moves the score by the same factor regardless of units). The 70/30 split is a documented
+/// default, not a derived optimum: callers with prompt-heavy workloads should read the separate
+/// `best_prefill_profile_id` instead.
+pub const BALANCED_DECODE_WEIGHT: f64 = 0.7;
+pub const BALANCED_PREFILL_WEIGHT: f64 = 1.0 - BALANCED_DECODE_WEIGHT;
+const BALANCED_SCORE_FORMULA: &str =
+    "score = tg_tok_s^0.7 * pp_tok_s^0.3 (weighted geometric mean, 70% decode / 30% prefill); only candidates with both rates, finite and > 0, are eligible";
+
+/// Keeps only finite, strictly positive rates; NaN, infinity, zero and negatives are measurement failures.
+fn valid_rate(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite() && *x > 0.0)
+}
+
+/// Weighted geometric mean of decode and prefill rates (see [`BALANCED_DECODE_WEIGHT`]).
+pub fn balanced_score(tg_tok_s: f64, pp_tok_s: f64) -> f64 {
+    tg_tok_s.powf(BALANCED_DECODE_WEIGHT) * pp_tok_s.powf(BALANCED_PREFILL_WEIGHT)
+}
+
+/// Fills `*_speedup_vs_baseline` relative to the successful candidate `baseline_id`.
+/// Speedups are only computed from rates that exist (and are valid) in both candidates.
+pub fn apply_baseline_speedups(candidates: &mut [LlmAutotuneCandidateResult], baseline_id: &str) {
+    let Some(base) = candidates
+        .iter()
+        .find(|c| c.profile_id == baseline_id && c.succeeded)
+    else {
+        return;
+    };
+    let (base_pp, base_tg) = (valid_rate(base.pp_tok_s), valid_rate(base.tg_tok_s));
+    for c in candidates.iter_mut().filter(|c| c.succeeded) {
+        c.pp_speedup_vs_baseline = valid_rate(c.pp_tok_s)
+            .zip(base_pp)
+            .map(|(cur, base)| cur / base);
+        c.tg_speedup_vs_baseline = valid_rate(c.tg_tok_s)
+            .zip(base_tg)
+            .map(|(cur, base)| cur / base);
+    }
+}
+
+/// Picks `(best_decode, best_prefill, best_balanced)` profile ids.
+///
+/// Failed candidates and non-finite / non-positive rates are never eligible. Ties resolve to the
+/// earliest candidate in probe order, so the result is deterministic.
+pub fn select_autotune_winners(
+    candidates: &[LlmAutotuneCandidateResult],
+) -> (Option<String>, Option<String>, Option<String>) {
+    fn best_by(
+        candidates: &[LlmAutotuneCandidateResult],
+        score: impl Fn(&LlmAutotuneCandidateResult) -> Option<f64>,
+    ) -> Option<String> {
+        let mut best: Option<(&LlmAutotuneCandidateResult, f64)> = None;
+        for c in candidates.iter().filter(|c| c.succeeded) {
+            if let Some(s) = score(c).filter(|s| s.is_finite()) {
+                if best.is_none_or(|(_, b)| s > b) {
+                    best = Some((c, s));
+                }
+            }
+        }
+        best.map(|(c, _)| c.profile_id.clone())
+    }
+    (
+        best_by(candidates, |c| valid_rate(c.tg_tok_s)),
+        best_by(candidates, |c| valid_rate(c.pp_tok_s)),
+        best_by(candidates, |c| {
+            valid_rate(c.tg_tok_s)
+                .zip(valid_rate(c.pp_tok_s))
+                .map(|(tg, pp)| balanced_score(tg, pp))
+        }),
+    )
 }
 
 /// Builds a merged LM Studio per-model JSON configuration (`user-concrete-model-default-config`),

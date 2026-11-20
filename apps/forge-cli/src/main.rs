@@ -1767,6 +1767,14 @@ fn cmd_llm_autotune(args: &LlmAutotuneArgs) -> Result<()> {
         "  Winner (Best Overall Balanced):    {}",
         report.best_balanced_profile_id.as_deref().unwrap_or("n/a")
     );
+    println!(
+        "  Speedup baseline: {}",
+        report
+            .baseline_profile_id
+            .as_deref()
+            .unwrap_or("none (designated baseline did not run or failed; speedups not computed)")
+    );
+    println!("  Balanced score: {}", report.balanced_score_formula);
     if let Some(best_id) = &report.best_balanced_profile_id {
         if let Some(best) = report.candidates.iter().find(|c| &c.profile_id == best_id) {
             println!("  Recommended Command:");

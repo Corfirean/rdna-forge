@@ -254,6 +254,9 @@ pub fn run_vulkan_suite(config: &VulkanBenchConfig) -> ForgeResult<VulkanBenchRe
     };
 
     let telemetry = guard.and_then(|g| g.stop_and_summarize());
+    for b in &mut benchmarks {
+        b.annotate_metric_semantics();
+    }
 
     Ok(VulkanBenchReport {
         system,
@@ -374,6 +377,7 @@ fn bench_gemm_f32_case(
         latency,
         throughput_unit: "GFLOP/s".to_string(),
         throughput_median: gflops,
+        metric_semantics: String::new(),
         accuracy,
         peak_rss_bytes: peak_process_rss_bytes(),
         notes,
@@ -443,6 +447,7 @@ fn bench_gemm_i8_case(
         latency,
         throughput_unit: "TOPS".to_string(),
         throughput_median: tops,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(ref_note),
@@ -497,6 +502,7 @@ fn bench_rmsnorm_case(
         latency,
         throughput_unit: "GB/s".to_string(),
         throughput_median: gb_s,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!("batch={batch}; full exact FP64 CPU reference")),
@@ -557,6 +563,7 @@ fn bench_rope_case(
         latency,
         throughput_unit: "GB/s".to_string(),
         throughput_median: gb_s,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!("batch={batch}; full exact FP64 CPU reference")),
@@ -619,6 +626,7 @@ fn bench_gemv_w8_case(
         latency,
         throughput_unit: "GB/s".to_string(),
         throughput_median: gb_s,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
@@ -680,6 +688,7 @@ fn bench_gemv_q4_case(
         latency,
         throughput_unit: "GB/s".to_string(),
         throughput_median: gb_s,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
@@ -752,6 +761,7 @@ fn bench_fused_rmsnorm_rope_case(
         latency,
         throughput_unit: "GB/s".to_string(),
         throughput_median: gb_s,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
@@ -812,6 +822,7 @@ fn bench_gemv_q4_k_case(
         latency,
         throughput_unit: "GB/s".to_string(),
         throughput_median: gb_s,
+        metric_semantics: String::new(),
         accuracy: Some(acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
@@ -925,6 +936,7 @@ fn bench_flash_attention_case(
         latency,
         throughput_unit: "GFLOP/s".to_string(),
         throughput_median: gflops,
+        metric_semantics: String::new(),
         accuracy: Some(head_acc),
         peak_rss_bytes: peak_process_rss_bytes(),
         notes: Some(format!(
