@@ -114,13 +114,18 @@ pub fn resolve_python_executable_in(
 
     // Bare name: PATH only. On Windows a name without an extension gets `.exe` appended.
     let name = spec.as_os_str();
-    let mut candidates = vec![name.to_os_string()];
     #[cfg(windows)]
-    if spec.extension().is_none() {
-        let mut with_exe = name.to_os_string();
-        with_exe.push(".exe");
-        candidates.insert(0, with_exe);
-    }
+    let candidates = {
+        let mut c = vec![name.to_os_string()];
+        if spec.extension().is_none() {
+            let mut with_exe = name.to_os_string();
+            with_exe.push(".exe");
+            c.insert(0, with_exe);
+        }
+        c
+    };
+    #[cfg(not(windows))]
+    let candidates = vec![name.to_os_string()];
     for dir in search_dirs.iter().filter(|d| d.is_absolute()) {
         for cand in &candidates {
             let full = dir.join(cand);
