@@ -11,6 +11,21 @@ Status legend:
 - **Unsupported**: Confirmed broken, excluded, or dropped by upstream.
 - **Not tested**: Not executed on physical hardware in this repository yet.
 
+### Evidence levels and the capability ladder
+
+A built-in hardware profile (`profiles/gfx*/`) or a PCI-ID mapping is a *software description* of a GPU. It is **not** evidence that the GPU works. Claims in this repository use one of these evidence levels:
+
+| Evidence level | Meaning | Applies today to |
+| :--- | :--- | :--- |
+| **Hardware-tested** | Executed by a maintainer on the physical GPU, with results recorded in this repository | RX 6900 XT (`gfx1030`) only; Raphael iGPU (`gfx1036`) partially |
+| **Community-tested** | Reported by an external user through a hardware report (`forge report`) and reviewed | None yet |
+| **Build-tested** | Compiles and passes hardware-independent tests in CI | All crates and all 18 profile files (parse/validation only) |
+| **Experimental** | Implemented but not validated on target hardware | RDNA3/RDNA3.5/RDNA4 planners and AV1 encode gating; ROCm/Triton paths on `gfx1030` are partial |
+| **Unsupported** | Confirmed broken or dropped upstream | See table below |
+| **Unknown** | No information | Any GPU not listed |
+
+For a given GPU and feature, the stages are cumulative and a later stage is only claimed when the earlier ones and its own check have actually run: *detected* -> *runtime available* -> *capability discovered* -> *compiles* -> *executes* -> *correctness verified* -> *performance measured* -> *hardware qualified*. `forge doctor` reports the first three; `forge doctor --verify`, `cargo test -- --ignored` (hardware qualification workflow) and `forge bench` cover the later ones. RDNA1, RDNA3, RDNA3.5 and RDNA4 entries stop at *detected / capability discovered by profile* until someone runs those stages on real hardware. No cross-generation performance improvement is claimed.
+
 ---
 
 ## 1. Upstream Ecosystem Feasibility Audit

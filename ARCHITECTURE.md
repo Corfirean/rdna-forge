@@ -42,6 +42,7 @@ Crate dependency flow (`forge-cli`, `forge-desktop` -> `forge-benchmark` -> {`fo
 - **`profile`**: Parses, validates, and embeds all 18 TOML hardware profiles (`BuiltinProfileInfo`, `builtin_profiles`, `builtin_profile_by_id`) plus token/CU/VRAM-disambiguated auto-matching (`match_profile_for_device`).
 - **`policy`**: Enforces `validate_kernel_execution` (checks vendor, `maxBufferSize`, VRAM budget, FP16/BF16/FP8/INT8/WMMA/MFMA flags) and `select_preferred_device` (deterministic ordering: discrete AMD > integrated AMD > other, breaking ties by VRAM).
 - **`error`**: Typed `ForgeError` enum using `thiserror` across all library crates.
+- **`loader`**: The single place that loads native libraries (`load_system_library`, `load_vendor_library`): System32-only resolution for system/driver DLLs, trusted-root validation for vendor SDK DLLs, module-path read-back, and typed `NotFound` / `Untrusted` / `LoadFailed` errors. `forge-device`, `forge-profiler` and `forge-runtime` call it instead of `libloading::Library::new` directly.
 
 ### `forge-device`
 Correlates four independent Windows sources without relying on broken `Win32_VideoController.AdapterRAM` (`u32` 4 GiB cap):
@@ -66,7 +67,8 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 - **`hip_verify`**: RAII-guarded `hipMalloc` / `hipMemcpy` / `hipEvent*` 4 MiB bit-exact H2D+D2H verification against `amdhip64_*.dll`.
 
 ### `forge-benchmark`
-- **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs.
+- **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs, and attaches `metric_semantics` (logical vs measured, kernel-only vs end-to-end) to every result.
+- **`gguf_layout`**: Parses the GGUF tensor-info section with checked arithmetic and classifies tensors (per-layer, routed experts, embedding, output, shared) so the LLM planner models llama.cpp `-ngl` / `--n-cpu-moe` placement from real per-layer sizes. The old `file size / block count` split is kept only as a labelled `file_size_approximation` fallback. Estimates are not allocator predictions: backend sub-allocation, compute buffers and driver overhead are budgeted separately and the result is always presented as an estimate.
 - **`memory`**: Captures process peak working set via Win32 `GetProcessMemoryInfo`.
 - **`vulkan_suite`**, **`video`**, **`llama`**, **`llm_optimizer`**, **`llm_recommender`**, **`report`**, **`triton`**: Orchestrates reproducible compute, VCN hardware encode/decode benchmarks (`run_video_benchmark_suite` with `skip_unsupported` & `skipped_codecs`, `run_video_decode_benchmark_suite`), GGUF v2/v3 header inspection (including MoE `<arch>.expert_count` & `-ncmoe` calculation), multi-GPU anti-WDDM-spill & APU unified-memory VRAM planning (`LlmTargetGpuContext`, `plan_llm_configuration_for_device`, `recover_layers_hint` from top WDDM consumers), VRAM-aware 15-model LLM recommendations (`recommend_models_for_device`), anonymized GitHub hardware compatibility report generation (`sanitize_report_text`, `generate_github_hardware_report`), architecture-tailored `llama.cpp` tweaks (including `ROCBLAS_USE_HIPBLASLT=1` on RDNA3/3.5/4 and Vulkan-only guidance on RDNA1), dry-run-safe LM Studio/Windows/Ollama patching plus `.json.bak` & `HKCU\Environment` rollback (`rollback_lm_studio_config`, `rollback_windows_env_tweaks`), LLM benchmarks (`--batch-dispatches` defaulting to `16`), and ADLX telemetry (`TelemetryGuard` for native Vulkan and AMF VCN; non-overlapping pre/post snapshots for ROCm/HIP workloads).
 
@@ -92,7 +94,7 @@ Optional Windows-native Tauri v2 + Edge WebView2 application (`apps/forge-deskto
 ## 3. Dynamic Loading & Licensing Boundary
 
 RDNA Forge keeps all core Rust crates MIT-licensed and avoids vendoring external SDK binaries or proprietary headers:
-- `vulkan-1.dll`, `amdhip64_*.dll`, and `amdadlx64.dll` are loaded dynamically at runtime if present on the user system.
+- `vulkan-1.dll`, `amdhip64_*.dll`, `amdadlx64.dll`, `amfrt64.dll` and `pdh.dll` are loaded dynamically at runtime if present, through `forge_core::loader` (System32 / trusted install roots only; see [SECURITY.md](SECURITY.md)).
 - Missing DLLs or unsupported runtimes yield explicit `SupportStatus::Unsupported` diagnostics or typed `ForgeError::RuntimeUnavailable` errors rather than crashes.
 - GPL-3.0 third-party projects (such as Magpie) are excluded from the codebase.
 

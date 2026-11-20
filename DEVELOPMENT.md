@@ -64,6 +64,13 @@ node --check apps/forge-desktop/ui/charts.js
 python -m py_compile modules/ai/triton/bench_suite.py
 ```
 
+### CI, Supply-Chain Checks and Hardware Qualification
+- `.github/workflows/ci.yml` runs on GitHub-hosted runners with no GPU: `lint` (rustfmt + clippy `-D warnings`), `test` (`cargo test --workspace --locked`), `scripts` (UI/Python syntax) and `security` (`cargo-deny`). The GPU correctness tests are `#[ignore]`d there; the job summary states that they were **not run**. A green CI run therefore says nothing about GPU behavior.
+- All third-party actions are pinned to commit SHAs (the comment next to each is the release it came from). To update one, resolve the new tag to its commit SHA, review the diff between releases, and change both together. Do not replace a SHA with a tag.
+- Dependency policy lives in `deny.toml` (`cargo install cargo-deny --locked`, then `cargo deny check`): RustSec advisories fail the check, only permissive licenses (plus MPL-2.0) are allowed, and only crates.io is an accepted source. `Cargo.lock` is committed and CI builds with `--locked`; dependency changes must update it in the same commit and be justified in the commit message.
+- Hardware qualification is a separate, manual workflow (`.github/workflows/hardware-qualification.yml`) for a self-hosted Windows runner labelled `self-hosted, windows, amd-gpu`. Locally the equivalent is `cargo test -p forge-cli --test gpu_correctness -- --ignored --test-threads=1`. Record the GPU, driver and result when reporting qualification; a skipped test is not a pass.
+- The declared MSRV is Rust `1.87` (`workspace.package.rust-version`); CI builds with current stable and does not yet verify the MSRV.
+
 ### Portable Windows Release Workflow
 `.github/workflows/release.yml` packages tagged `v*` releases (and manual `workflow_dispatch` runs) into a portable Windows `x64` `.zip` bundle (`RDNA-Forge-<tag>-win-x64.zip` with `SHA256SUMS.txt`) containing `forge.exe`, `forge-desktop.exe`, `profiles/`, `README.md`, `COMPATIBILITY.md`, `BENCHMARKS.md`, `CHANGELOG.md`, and `LICENSE`.
 

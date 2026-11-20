@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Milestone 8 (Engineering Hardening & Release Qualification)
+- **GGUF memory planner** (`forge-benchmark`): memory is now planned from parsed GGUF tensor metadata (per-layer, expert, embedding, output, shared tensors; mixed quantization; tied embeddings; `--n-cpu-moe` from real expert bytes) instead of `file size / block count`. The old approximation remains only as an explicitly labelled fallback. Header parsing uses checked arithmetic and rejects duplicate/invalid/truncated tensor records; missing metadata keys are recorded as assumed defaults; placeholder VRAM values are flagged. `bytes_per_layer` is now the mean tensor-based layer size, `KvCacheMemoryBudget` gains `model_file_mib` and `weights_estimate_basis`, and `model_weights_mib` is the estimated GPU-resident weight size at full offload (it excludes the CPU-resident token embedding).
+- **Native library loading** (`forge-core::loader`): replaced bare-name `LoadLibrary` calls (including `ash`'s `Entry::load`) with a System32 / trusted-root policy and module-path verification. The bare-name HIP fallback was removed. `forge doctor` reports verified paths. An unavailable `RtlGetVersion` now yields an `unknown` OS version instead of `10.0.0`.
+- **ADLX tuning results**: `PowerLimitChangeResult` / `TuningResetResult` gain `confirmed`; a contradicting read-back is an error, an unreadable one is shown as `NOT CONFIRMED`. ADLX vtable slots for `IADLXGPUTuningServices` and `IADLXManualPowerTuning1` were checked against the upstream headers (no change needed).
+- **Benchmarks**: kernel `GB/s` is now `GB/s (logical)` with a `metric_semantics` description. LLM autotune speedups use an explicit baseline (`vulkan_naive_fa1`) instead of the first successful candidate, reject non-finite/zero rates (NaN previously outranked real values), treat a run with no usable rate as failed, and report the baseline and balanced-score formula.
+- **LM Studio / Ollama patcher**: refuses malformed existing configs instead of overwriting them, no longer overwrites `.json.bak` on repeated applies (which destroyed the original), writes atomically with read-back verification, rejects `..` in model paths, and launches `reg.exe` from System32. `llama-bench` executables are validated before launch.
+- **CI / supply chain**: all actions pinned to commit SHAs, read-only token by default with a separate write-scoped publish job, `--locked` builds, `cargo-deny` policy (`deny.toml`), split lint/test/scripts/security jobs, and a manual hardware-qualification workflow. GPU tests are reported as not run on hosted runners.
+
 ## [0.1.0] - 2026-11-20
 
 ### Added — Milestone 7 (Per-Process VRAM Monitor, Windows GPU Audit, Safe Rollback, LLM Recommender, VCN Decode & Release Packaging)

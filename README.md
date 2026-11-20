@@ -12,6 +12,12 @@ RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contr
 - **Live GPU capability verification (`forge doctor --verify`)**: Executes bit-exact HIP 4 MiB H2D/D2H transfers and pure-Rust WGSL->SPIR-V (`naga`) Vulkan compute kernels (baseline FP32 GEMM, register-blocked `128x64 vec4` FP32 GEMM, `OpSDot` INT8 DP4A GEMM, Wave32 `W8A32` / `Q4_0` / `Q4_K` GEMV, RMSNorm, RoPE, fused subgroup `RMSNorm+RoPE`, tiled causal FlashAttention) validated against exact FP64/`i64` CPU references.
 - **Reproducible benchmark harnesses (`forge bench`)**: Statistical median/IQR/MAD/p95 timing + numerical accuracy + peak RSS + ADLX telemetry across Vulkan compute (`--kernel all|gemm|gemm-opt|gemm-i8|gemv-w8|gemv-q4|gemv-q4-k|rmsnorm|rope|fused-rms-rope|flash-attn`), PyTorch ROCm + `triton-windows` (`--smoke`, opt-in `--telemetry`), and `llama.cpp` (`--flash-attn`, `--hip-disable-graphs`).
 
+### Maturity at a Glance
+- **Hardware-tested**: RX 6900 XT (`gfx1030`) on Windows 11 / Adrenalin `26.11.2`: discovery, Vulkan compute kernels, HIP memory round-trip, ADLX telemetry and read-only tuning, AMF encode/decode (18 hardware tests pass via `cargo test -p forge-cli --test gpu_correctness -- --ignored --test-threads=1`).
+- **Experimental / unverified on hardware**: RDNA1, RDNA3, RDNA3.5 and RDNA4 profiles and planners; AV1 hardware encode; ROCm and `triton-windows` paths on `gfx1030` (partial); ADLX `tune ... --apply` (mutating path not exercised in qualification; dry-run and read-back verification only).
+- **Estimates, not measurements**: LLM memory plans are computed from GGUF tensor metadata and are estimates of llama.cpp placement, not allocator predictions. Kernel `GB/s` figures are *logical* bandwidth, not VRAM bandwidth (see [BENCHMARKS.md](BENCHMARKS.md)).
+- **Safe by default**: anything that changes GPU or application configuration (`tune`, `llm apply-*`, `llm rollback`) is a dry run unless `--apply` is passed.
+
 ### Currently Verified Hardware
 - **Primary verified target**: AMD Radeon RX 6900 XT (`gfx1030`, RDNA2, 16 GiB VRAM) on Windows 11 Build `26300` with Adrenalin `26.11.2`.
 - **Detected secondary adapter**: AMD Ryzen 7 7700X integrated Radeon Graphics (`gfx1036`, RDNA2).
@@ -25,7 +31,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 7 complete (**Per-process WDDM VRAM monitor** via `pdh.dll` & LLM layer recovery, **Windows GPU hidden-trap audit** for `ReBAR`/`HAGS`/`TdrDelay`/`LongPathsEnabled` + **dry-run-default LM Studio/env rollback**, **VRAM-aware 15-model LLM Recommender** `"What Fits on My GPU?"`, **anonymized GitHub hardware report generator** `forge report`, **CI UI syntax gate + portable Windows x64 `.zip` release workflow**, and **AMF VCN hardware decode benchmark** `forge video decode-bench` + capability-gated **AV1 hardware encode**), building on Milestones 6 (multi-GPU RDNA1–RDNA4 & APUs), 5 (`Qwen3.8-27B` `+108%` prefill / `+63%` decode), 4C (`AMF` VCN encode), 4B (`Q4_K` GEMV & FlashAttention), 4A (**Forge Desktop**), 3A–3C, 2, and 1.
+**Current Project Status:** Milestone 8 (engineering hardening and release qualification: secure native-library loading, tensor-based GGUF memory planning, benchmark metric semantics, verified ADLX tuning results, non-destructive config patching, pinned CI) builds on Milestone 7 complete (**Per-process WDDM VRAM monitor** via `pdh.dll` & LLM layer recovery, **Windows GPU hidden-trap audit** for `ReBAR`/`HAGS`/`TdrDelay`/`LongPathsEnabled` + **dry-run-default LM Studio/env rollback**, **VRAM-aware 15-model LLM Recommender** `"What Fits on My GPU?"`, **anonymized GitHub hardware report generator** `forge report`, **CI UI syntax gate + portable Windows x64 `.zip` release workflow**, and **AMF VCN hardware decode benchmark** `forge video decode-bench` + capability-gated **AV1 hardware encode**), building on Milestones 6 (multi-GPU RDNA1–RDNA4 & APUs), 5 (`Qwen3.8-27B` `+108%` prefill / `+63%` decode), 4C (`AMF` VCN encode), 4B (`Q4_K` GEMV & FlashAttention), 4A (**Forge Desktop**), 3A–3C, 2, and 1.
 
 ---
 
