@@ -479,6 +479,11 @@ pub struct ResetOutcome {
 /// A reset discards the user's tuning profile and the previous profile is not captured, so there
 /// is nothing to restore: `rollback` is always [`RollbackStatus::Unsupported`] when a reset was
 /// requested. Dry runs and "already at factory" never write.
+///
+/// The state is read back after the call whether it returned success or an error, because an
+/// error does not prove that nothing changed. An error with a factory read-back is reported as
+/// `Confirmed` (with the error text), an error with a non-factory or unreadable state as
+/// `NotConfirmed`; `NotApplied` is reserved for dry runs and "already at factory".
 pub fn reset_to_factory(
     ctl: &mut dyn FactoryResetControl,
     dry_run: bool,
@@ -495,27 +500,48 @@ pub fn reset_to_factory(
         return Ok(out);
     }
     out.rollback = RollbackStatus::Unsupported;
-    if let Err(rc) = ctl.reset() {
-        out.error = Some(format!(
-            "ResetToFactory was rejected: {}",
-            adlx_result_name(rc)
-        ));
-        return Ok(out);
-    }
+
+    // An error return does not prove the driver left the state untouched (a partial or late
+    // reset is possible), so the state is read back after the call whether it succeeded or not and
+    // the result reflects what ADLX reports.
+    let call = ctl.reset();
     out.now_at_factory = ctl.is_at_factory();
-    match out.now_at_factory {
-        Some(true) => out.status = OperationStatus::Confirmed,
-        Some(false) => {
+    let rejected = call
+        .err()
+        .map(|rc| format!("ResetToFactory returned {}", adlx_result_name(rc)));
+    match (out.now_at_factory, rejected) {
+        (Some(true), None) => out.status = OperationStatus::Confirmed,
+        (Some(true), Some(why)) => {
+            // The call reported an error but ADLX now reports factory tuning: report the state.
+            out.status = OperationStatus::Confirmed;
+            out.error = Some(format!(
+                "{why}, but ADLX reports the GPU is now at factory settings"
+            ));
+        }
+        (Some(false), None) => {
             out.status = OperationStatus::NotConfirmed;
             out.error = Some(
                 "ResetToFactory was accepted but ADLX still reports non-factory tuning".to_string(),
             );
         }
-        None => {
+        (Some(false), Some(why)) => {
+            out.status = OperationStatus::NotConfirmed;
+            out.error = Some(format!(
+                "{why} and ADLX still reports non-factory tuning; the reset is not confirmed"
+            ));
+        }
+        (None, None) => {
             out.status = OperationStatus::Applied;
             out.error = Some(
                 "the reset was accepted but the factory state could not be read back".to_string(),
             );
+        }
+        (None, Some(why)) => {
+            // Neither "applied" nor "not applied" can be claimed: the state is unknown.
+            out.status = OperationStatus::NotConfirmed;
+            out.error = Some(format!(
+                "{why} and the factory state could not be read back; whether the reset took effect is unknown"
+            ));
         }
     }
     Ok(out)
@@ -799,77 +825,149 @@ mod tests {
         assert!(o.error.unwrap().contains("could not be read back"));
     }
 
+    /// Scripted fake factory-reset backend.
     struct FakeReset {
         at_factory: Option<bool>,
         resets: usize,
-        behavior: ResetBehavior,
+        /// What `reset()` returns.
+        call: Result<(), i32>,
+        /// Whether a `reset()` call (even an erroring one) actually moves the GPU to factory.
+        applies: bool,
+        /// When false, `is_at_factory()` is unreadable once `reset()` has been called.
+        readable_after: bool,
     }
-    enum ResetBehavior {
-        Honor,
-        Reject(i32),
-        Ignore,
-        Unreadable,
+
+    impl FakeReset {
+        fn new(call: Result<(), i32>, applies: bool, readable_after: bool) -> Self {
+            Self {
+                at_factory: Some(false),
+                resets: 0,
+                call,
+                applies,
+                readable_after,
+            }
+        }
     }
+
     impl FactoryResetControl for FakeReset {
         fn is_at_factory(&mut self) -> Option<bool> {
-            if matches!(self.behavior, ResetBehavior::Unreadable) && self.resets > 0 {
+            if self.resets > 0 && !self.readable_after {
                 return None;
             }
             self.at_factory
         }
         fn reset(&mut self) -> Result<(), i32> {
             self.resets += 1;
-            match self.behavior {
-                ResetBehavior::Honor | ResetBehavior::Unreadable => {
-                    self.at_factory = Some(true);
-                    Ok(())
-                }
-                ResetBehavior::Reject(rc) => Err(rc),
-                ResetBehavior::Ignore => Ok(()),
+            if self.applies {
+                self.at_factory = Some(true);
             }
+            self.call
         }
     }
 
     #[test]
-    fn reset_states_are_distinct_and_rollback_is_unsupported() {
-        let mk = |b| FakeReset {
-            at_factory: Some(false),
-            resets: 0,
-            behavior: b,
-        };
-        // Dry run and already-at-factory never reset.
-        let mut f = mk(ResetBehavior::Honor);
+    fn reset_dry_run_and_already_at_factory_never_reset() {
+        let mut f = FakeReset::new(Ok(()), true, true);
         let o = reset_to_factory(&mut f, true).unwrap();
         assert_eq!((f.resets, o.status), (0, OperationStatus::NotApplied));
-        let mut g = FakeReset {
-            at_factory: Some(true),
-            resets: 0,
-            behavior: ResetBehavior::Honor,
-        };
-        assert_eq!(
-            reset_to_factory(&mut g, false).unwrap().status,
-            OperationStatus::NotApplied
-        );
-        assert_eq!(g.resets, 0);
+        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
 
-        let mut f = mk(ResetBehavior::Honor);
+        let mut g = FakeReset::new(Ok(()), true, true);
+        g.at_factory = Some(true);
+        let o = reset_to_factory(&mut g, false).unwrap();
+        assert_eq!((g.resets, o.status), (0, OperationStatus::NotApplied));
+        assert!(o.error.is_none());
+    }
+
+    #[test]
+    fn reset_success_with_factory_readback_is_confirmed() {
+        let mut f = FakeReset::new(Ok(()), true, true);
         let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(f.resets, 1);
         assert_eq!(o.status, OperationStatus::Confirmed);
+        assert_eq!(o.now_at_factory, Some(true));
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
+        assert!(o.error.is_none());
+    }
 
-        let mut f = mk(ResetBehavior::Ignore);
+    #[test]
+    fn reset_success_but_state_contradicts_is_not_confirmed() {
+        // The driver says OK but the GPU still reports non-factory tuning.
+        let mut f = FakeReset::new(Ok(()), false, true);
         let o = reset_to_factory(&mut f, false).unwrap();
         assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.now_at_factory, Some(false));
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
+        assert!(o.error.unwrap().contains("still reports non-factory"));
+    }
 
-        let mut f = mk(ResetBehavior::Reject(18));
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_eq!(o.status, OperationStatus::NotApplied);
-        assert!(o.error.unwrap().contains("ADLX_RESET_NEEDED (18)"));
-
-        let mut f = mk(ResetBehavior::Unreadable);
+    #[test]
+    fn reset_success_with_unreadable_state_is_applied_unverified() {
+        let mut f = FakeReset::new(Ok(()), true, false);
         let o = reset_to_factory(&mut f, false).unwrap();
         assert_eq!(o.status, OperationStatus::Applied);
+        assert_eq!(o.now_at_factory, None);
+        assert_eq!(o.rollback, RollbackStatus::Unsupported);
+    }
+
+    #[test]
+    fn reset_error_but_state_became_factory_reports_the_actual_state() {
+        // ResetToFactory returned ADLX_FAIL, yet IsAtFactory now says true.
+        let mut f = FakeReset::new(Err(3), true, true);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(f.resets, 1);
+        assert_eq!(o.status, OperationStatus::Confirmed);
+        assert_eq!(o.now_at_factory, Some(true));
+        assert_eq!(o.rollback, RollbackStatus::Unsupported);
+        let e = o.error.unwrap();
+        assert!(e.contains("ADLX_FAIL (3)") && e.contains("now at factory settings"));
+    }
+
+    #[test]
+    fn reset_error_with_unchanged_state_is_not_confirmed_not_not_applied() {
+        // The error does not prove nothing changed: the result must say "not confirmed".
+        let mut f = FakeReset::new(Err(18), false, true);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(f.resets, 1);
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.now_at_factory, Some(false));
+        assert_eq!(o.rollback, RollbackStatus::Unsupported);
+        let e = o.error.unwrap();
+        assert!(e.contains("ADLX_RESET_NEEDED (18)") && e.contains("not confirmed"));
+    }
+
+    #[test]
+    fn reset_error_with_unreadable_state_does_not_claim_it_was_not_applied() {
+        let mut f = FakeReset::new(Err(3), true, false);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_ne!(o.status, OperationStatus::NotApplied);
+        assert_eq!(o.status, OperationStatus::NotConfirmed);
+        assert_eq!(o.now_at_factory, None);
+        assert_eq!(o.rollback, RollbackStatus::Unsupported);
+        assert!(o.error.unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn reset_results_succeed_only_when_confirmed() {
+        let result = |status, error: Option<&str>| TuningResetResult {
+            gpu_name: "g".into(),
+            pci_device_id: None,
+            was_at_factory: Some(false),
+            applied: status != OperationStatus::NotApplied,
+            now_at_factory: None,
+            confirmed: status == OperationStatus::Confirmed,
+            status,
+            rollback: RollbackStatus::Unsupported,
+            error: error.map(str::to_string),
+        };
+        assert!(result(OperationStatus::Confirmed, None).succeeded());
+        assert!(result(
+            OperationStatus::Confirmed,
+            Some("call errored but state is factory")
+        )
+        .succeeded());
+        assert!(!result(OperationStatus::NotConfirmed, Some("x")).succeeded());
+        assert!(!result(OperationStatus::Applied, None).succeeded());
     }
 
     #[test]
