@@ -15,7 +15,7 @@ use forge_benchmark::{
 };
 use forge_core::{
     match_profile_for_device, ArchitectureCapabilities, CapabilityResult, DiagnosticReport,
-    SupportStatus,
+    GpuDeviceInfo, SupportStatus,
 };
 use forge_device::discover_all;
 use forge_profiler::{
@@ -33,8 +33,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::apply_gate::{
-    gate_key, parse_kv_quant_strict, validate_device_index, validate_model_path,
-    validate_pci_device_id, validate_power_limit, validate_profile_id, ApplyGate,
+    gate_key, parse_kv_quant_strict, select_llm_target, select_tuning_target,
+    validate_device_index, validate_model_path, validate_pci_device_id, validate_power_limit,
+    validate_profile_id, ApplyGate, DeviceIdentity,
 };
 
 /// Shared desktop application state synchronizing exclusive GPU/ADLX workloads.
@@ -622,7 +623,9 @@ pub async fn set_power_limit(
 ) -> Result<PowerLimitChangeResult, String> {
     let key = prepare_power_limit(&request)?;
     let guard = state.acquire_gpu("power limit change")?;
-    enforce_gate(&state.gate, &key, request.dry_run)?;
+    let pci = request.pci_device_id;
+    let identity = resolve_identity(move |gpus| select_tuning_target(gpus, pci)).await?;
+    enforce_gate(&state.gate, &key, &identity, request.dry_run)?;
     let dry_run = request.dry_run;
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
@@ -632,7 +635,7 @@ pub async fn set_power_limit(
     .await
     .map_err(|e| format!("Power limit task failed: {e}"))??;
     if dry_run && result.succeeded() {
-        state.gate.record_preview(&key);
+        state.gate.record_preview(&key, &identity);
     }
     Ok(result)
 }
@@ -644,7 +647,9 @@ pub async fn reset_tuning(
 ) -> Result<TuningResetResult, String> {
     let key = prepare_reset_tuning(&request)?;
     let guard = state.acquire_gpu("factory tuning reset")?;
-    enforce_gate(&state.gate, &key, request.dry_run)?;
+    let pci = request.pci_device_id;
+    let identity = resolve_identity(move |gpus| select_tuning_target(gpus, pci)).await?;
+    enforce_gate(&state.gate, &key, &identity, request.dry_run)?;
     let dry_run = request.dry_run;
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
@@ -654,7 +659,7 @@ pub async fn reset_tuning(
     .await
     .map_err(|e| format!("Tuning reset task failed: {e}"))??;
     if dry_run && result.succeeded() {
-        state.gate.record_preview(&key);
+        state.gate.record_preview(&key, &identity);
     }
     Ok(result)
 }
@@ -810,7 +815,9 @@ pub async fn apply_lm_studio_patch(
     request: DesktopLmStudioPatchRequest,
 ) -> Result<LmStudioPatchResult, String> {
     let prepared = prepare_lm_studio_patch(&request)?;
-    enforce_gate(&state.gate, &prepared.key, request.dry_run)?;
+    let device_index = request.device_index;
+    let identity = resolve_identity(move |gpus| select_llm_target(gpus, device_index)).await?;
+    enforce_gate(&state.gate, &prepared.key, &identity, request.dry_run)?;
     let dry_run = request.dry_run;
     let result = tauri::async_runtime::spawn_blocking(move || {
         apply_lm_studio_config(
@@ -826,7 +833,7 @@ pub async fn apply_lm_studio_patch(
     .await
     .map_err(|e| format!("LM Studio config patch task failed: {e}"))??;
     if dry_run {
-        state.gate.record_preview(&prepared.key);
+        state.gate.record_preview(&prepared.key, &identity);
     }
     Ok(result)
 }
@@ -837,7 +844,9 @@ pub async fn apply_env_and_ollama_patch(
     request: DesktopEnvPatchRequest,
 ) -> Result<EnvAndOllamaPatchResult, String> {
     let prepared = prepare_env_patch(&request)?;
-    enforce_gate(&state.gate, &prepared.key, request.dry_run)?;
+    let device_index = request.device_index;
+    let identity = resolve_identity(move |gpus| select_llm_target(gpus, device_index)).await?;
+    enforce_gate(&state.gate, &prepared.key, &identity, request.dry_run)?;
     let dry_run = request.dry_run;
     let result = tauri::async_runtime::spawn_blocking(move || {
         apply_windows_and_ollama_env_tweaks(
@@ -853,7 +862,7 @@ pub async fn apply_env_and_ollama_patch(
     .await
     .map_err(|e| format!("Windows/Ollama env patch task failed: {e}"))??;
     if dry_run {
-        state.gate.record_preview(&prepared.key);
+        state.gate.record_preview(&prepared.key, &identity);
     }
     Ok(result)
 }
@@ -864,7 +873,9 @@ pub async fn rollback_lm_studio_patch(
     request: DesktopLmStudioRollbackRequest,
 ) -> Result<LmStudioRollbackResult, String> {
     let (model_path, key) = prepare_lm_studio_rollback(&request)?;
-    enforce_gate(&state.gate, &key, request.dry_run)?;
+    // Restores `.json.bak` files; independent of which GPU exists, so no device identity.
+    let identity = DeviceIdentity::none();
+    enforce_gate(&state.gate, &key, &identity, request.dry_run)?;
     let dry_run = request.dry_run;
     let result = tauri::async_runtime::spawn_blocking(move || {
         rollback_lm_studio_config(model_path.as_deref(), request.dry_run).map_err(|e| e.to_string())
@@ -872,7 +883,7 @@ pub async fn rollback_lm_studio_patch(
     .await
     .map_err(|e| format!("LM Studio rollback task failed: {e}"))??;
     if dry_run {
-        state.gate.record_preview(&key);
+        state.gate.record_preview(&key, &identity);
     }
     Ok(result)
 }
@@ -883,7 +894,9 @@ pub async fn rollback_env_patch(
     request: DesktopEnvRollbackRequest,
 ) -> Result<EnvRollbackResult, String> {
     let key = prepare_env_rollback();
-    enforce_gate(&state.gate, &key, request.dry_run)?;
+    // Removes RDNA Forge-managed HKCU\\Environment values; independent of any GPU.
+    let identity = DeviceIdentity::none();
+    enforce_gate(&state.gate, &key, &identity, request.dry_run)?;
     let dry_run = request.dry_run;
     let result = tauri::async_runtime::spawn_blocking(move || {
         rollback_windows_env_tweaks(request.dry_run).map_err(|e| e.to_string())
@@ -891,20 +904,37 @@ pub async fn rollback_env_patch(
     .await
     .map_err(|e| format!("Windows/Ollama env rollback task failed: {e}"))??;
     if dry_run {
-        state.gate.record_preview(&key);
+        state.gate.record_preview(&key, &identity);
     }
     Ok(result)
 }
 
 /// Authorizes a request at the backend: dry runs are always allowed (they change nothing);
-/// an apply requires a matching, unexpired, unused preview. The frontend's `dry_run` flag alone
+/// an apply requires a matching, unexpired, unused preview made for the same GPU. The frontend's `dry_run` flag alone
 /// never grants permission.
-fn enforce_gate(gate: &ApplyGate, key: &str, dry_run: bool) -> Result<(), String> {
+fn enforce_gate(
+    gate: &ApplyGate,
+    key: &str,
+    identity: &DeviceIdentity,
+    dry_run: bool,
+) -> Result<(), String> {
     if dry_run {
         Ok(())
     } else {
-        gate.authorize_apply(key)
+        gate.authorize_apply(key, identity)
     }
+}
+
+/// Discovers the installed adapters and resolves the identity of the GPU an operation targets.
+/// Runs on a blocking thread (discovery probes Vulkan, HIP and the registry). Called at preview
+/// time and again at apply time, so a changed or removed device is detected.
+async fn resolve_identity<F>(select: F) -> Result<DeviceIdentity, String>
+where
+    F: FnOnce(&[GpuDeviceInfo]) -> Result<DeviceIdentity, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || select(&discover_all().gpus))
+        .await
+        .map_err(|e| format!("GPU identity resolution failed: {e}"))?
 }
 
 /// Validates a power-limit request and returns the gate key for its exact parameters.
@@ -1286,9 +1316,9 @@ mod enforcement_tests {
             dry_run: true,
         };
         let key = prepare_power_limit(&req).unwrap();
-        assert!(enforce_gate(&gate, &key, req.dry_run).is_ok());
+        assert!(enforce_gate(&gate, &key, &DeviceIdentity::none(), req.dry_run).is_ok());
         // A dry run authorizes nothing by itself: recording happens only after it succeeded.
-        assert!(gate.authorize_apply(&key).is_err());
+        assert!(gate.authorize_apply(&key, &DeviceIdentity::none()).is_err());
     }
 
     #[test]
@@ -1301,17 +1331,17 @@ mod enforcement_tests {
         };
         let key5 = prepare_power_limit(&apply(5)).unwrap();
         // Frontend says dry_run=false but nothing was previewed: refused.
-        assert!(enforce_gate(&gate, &key5, false)
+        assert!(enforce_gate(&gate, &key5, &DeviceIdentity::none(), false)
             .unwrap_err()
             .contains("no matching dry-run"));
 
-        gate.record_preview(&key5);
+        gate.record_preview(&key5, &DeviceIdentity::none());
         // A preview for 5% does not authorize 10%.
         let key10 = prepare_power_limit(&apply(10)).unwrap();
-        assert!(enforce_gate(&gate, &key10, false).is_err());
+        assert!(enforce_gate(&gate, &key10, &DeviceIdentity::none(), false).is_err());
         // The matching apply is allowed once.
-        assert!(enforce_gate(&gate, &key5, false).is_ok());
-        assert!(enforce_gate(&gate, &key5, false).is_err());
+        assert!(enforce_gate(&gate, &key5, &DeviceIdentity::none(), false).is_ok());
+        assert!(enforce_gate(&gate, &key5, &DeviceIdentity::none(), false).is_err());
     }
 
     #[test]
@@ -1367,13 +1397,13 @@ mod enforcement_tests {
 
         // A preview binds to model, device, profile, context and margin.
         let gate = ApplyGate::new();
-        gate.record_preview(&ok.key);
+        gate.record_preview(&ok.key, &DeviceIdentity::none());
         let mut other = base.clone();
         other.context_tokens = 8192;
         let other = prepare_lm_studio_patch(&other).unwrap();
         assert_ne!(ok.key, other.key);
-        assert!(enforce_gate(&gate, &other.key, false).is_err());
-        assert!(enforce_gate(&gate, &ok.key, false).is_ok());
+        assert!(enforce_gate(&gate, &other.key, &DeviceIdentity::none(), false).is_err());
+        assert!(enforce_gate(&gate, &ok.key, &DeviceIdentity::none(), false).is_ok());
     }
 
     #[test]
@@ -1407,20 +1437,136 @@ mod enforcement_tests {
             dry_run: false,
         })
         .unwrap();
-        assert!(enforce_gate(&gate, &all.1, false).is_err());
-        gate.record_preview(&all.1);
-        assert!(enforce_gate(&gate, &all.1, false).is_ok());
+        assert!(enforce_gate(&gate, &all.1, &DeviceIdentity::none(), false).is_err());
+        gate.record_preview(&all.1, &DeviceIdentity::none());
+        assert!(enforce_gate(&gate, &all.1, &DeviceIdentity::none(), false).is_ok());
 
         let env_key = prepare_env_rollback();
-        assert!(enforce_gate(&gate, &env_key, false).is_err());
+        assert!(enforce_gate(&gate, &env_key, &DeviceIdentity::none(), false).is_err());
         // An LM Studio rollback preview never authorizes the registry rollback.
-        gate.record_preview(&all.1);
-        assert!(enforce_gate(&gate, &env_key, false).is_err());
+        gate.record_preview(&all.1, &DeviceIdentity::none());
+        assert!(enforce_gate(&gate, &env_key, &DeviceIdentity::none(), false).is_err());
 
         assert!(prepare_lm_studio_rollback(&DesktopLmStudioRollbackRequest {
             model_path: Some("not-a-model.txt".into()),
             dry_run: false,
         })
         .is_err());
+    }
+
+    fn adapter(
+        index: usize,
+        name: &str,
+        device: u32,
+        bus: &str,
+        discrete: bool,
+    ) -> forge_core::GpuDeviceInfo {
+        crate::apply_gate::test_support::gpu(index, name, 0x1002, device, Some(bus), discrete)
+    }
+
+    #[test]
+    fn power_limit_and_reset_previews_are_bound_to_the_resolved_gpu() {
+        let gpus = vec![
+            adapter(0, "AMD Radeon RX 6900 XT", 0x73AF, "0000:03:00.0", true),
+            adapter(1, "AMD Radeon RX 6800 XT", 0x73BF, "0000:06:00.0", true),
+        ];
+        let gate = ApplyGate::new();
+        let power = |pci| DesktopPowerLimitRequest {
+            pci_device_id: pci,
+            limit_pct: 5,
+            dry_run: false,
+        };
+        // Preview targets the 6900 XT.
+        let key_a = prepare_power_limit(&power(Some(0x73AF))).unwrap();
+        let dev_a = select_tuning_target(&gpus, Some(0x73AF)).unwrap();
+        gate.record_preview(&key_a, &dev_a);
+
+        // Same parameters, but the apply resolves a different PCI device: refused, and the
+        // refusal comes from the identity binding, not from a key mismatch.
+        let dev_b = select_tuning_target(&gpus, Some(0x73BF)).unwrap();
+        let err = enforce_gate(&gate, &key_a, &dev_b, false).unwrap_err();
+        assert!(err.contains("target GPU changed"), "{err}");
+
+        // The reset command uses the same selector, so the same protection applies.
+        let reset = DesktopResetTuningRequest {
+            pci_device_id: Some(0x73AF),
+            dry_run: false,
+        };
+        let reset_key = prepare_reset_tuning(&reset).unwrap();
+        gate.record_preview(&reset_key, &dev_a);
+        assert!(enforce_gate(&gate, &reset_key, &dev_b, false).is_err());
+        gate.record_preview(&reset_key, &dev_a);
+        assert!(enforce_gate(&gate, &reset_key, &dev_a, false).is_ok());
+    }
+
+    #[test]
+    fn llm_config_previews_are_bound_to_the_resolved_gpu() {
+        let model = temp_gguf();
+        let igpu = adapter(0, "AMD Radeon(TM) Graphics", 0x164E, "0000:0e:00.0", false);
+        let dgpu = adapter(1, "AMD Radeon RX 6900 XT", 0x73AF, "0000:03:00.0", true);
+        let lm = DesktopLmStudioPatchRequest {
+            model_path: Some(model.display().to_string()),
+            device_index: Some(1),
+            profile_id: None,
+            context_tokens: 4096,
+            safety_margin_mib: 512,
+            dry_run: false,
+        };
+        let prepared = prepare_lm_studio_patch(&lm).unwrap();
+        let env = DesktopEnvPatchRequest {
+            model_path: Some(model.display().to_string()),
+            device_index: Some(1),
+            context_tokens: 4096,
+            kv_quant: None,
+            dry_run: false,
+        };
+        let env_prepared = prepare_env_patch(&env).unwrap();
+
+        let before = vec![igpu.clone(), dgpu.clone()];
+        let gate = ApplyGate::new();
+        let at_preview = select_llm_target(&before, Some(1)).unwrap();
+        gate.record_preview(&prepared.key, &at_preview);
+        gate.record_preview(&env_prepared.key, &at_preview);
+
+        // Unchanged system: both applies are authorized once.
+        assert!(enforce_gate(&gate, &prepared.key, &at_preview, false).is_ok());
+        assert!(enforce_gate(&gate, &prepared.key, &at_preview, false).is_err());
+
+        // Index 1 now resolves to the integrated GPU: the environment patch is refused.
+        let after = vec![dgpu, igpu];
+        let at_apply = select_llm_target(&after, Some(1)).unwrap();
+        assert!(enforce_gate(&gate, &env_prepared.key, &at_apply, false)
+            .unwrap_err()
+            .contains("target GPU changed"));
+
+        // A removed device is an error before the gate is even consulted.
+        assert!(select_llm_target(&after[..1], Some(1)).is_err());
+    }
+
+    #[test]
+    fn rollbacks_use_an_explicit_no_device_identity() {
+        // Rollbacks restore files / registry values and do not depend on a GPU, so their previews
+        // carry the "none" identity and are never satisfied by (or satisfy) a GPU-bound preview.
+        let gate = ApplyGate::new();
+        let (_, key) = prepare_lm_studio_rollback(&DesktopLmStudioRollbackRequest {
+            model_path: None,
+            dry_run: false,
+        })
+        .unwrap();
+        let gpu_identity = select_llm_target(
+            &[adapter(
+                0,
+                "AMD Radeon RX 6900 XT",
+                0x73AF,
+                "0000:03:00.0",
+                true,
+            )],
+            Some(0),
+        )
+        .unwrap();
+        gate.record_preview(&key, &gpu_identity);
+        assert!(enforce_gate(&gate, &key, &DeviceIdentity::none(), false).is_err());
+        gate.record_preview(&key, &DeviceIdentity::none());
+        assert!(enforce_gate(&gate, &key, &DeviceIdentity::none(), false).is_ok());
     }
 }
