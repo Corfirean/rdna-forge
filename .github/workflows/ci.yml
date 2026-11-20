@@ -34,6 +34,17 @@ jobs:
       - name: Run hardware-independent unit and integration tests
         run: cargo test --workspace
 
+      - name: Setup Node.js for UI syntax check
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate Desktop UI JavaScript syntax
+        run: |
+          node --check apps/forge-desktop/ui/app.js
+          node --check apps/forge-desktop/ui/views.js
+          node --check apps/forge-desktop/ui/charts.js
+
       - name: Check Python benchmark suite syntax
         uses: actions/setup-python@v5
         with:

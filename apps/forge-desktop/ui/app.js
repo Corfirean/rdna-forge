@@ -542,6 +542,32 @@ async function runBenchmark() {
 const actions = {
   refreshDiagnostics,
   runLiveVerify,
+  copyGithubReport: async () => {
+    setStatusNote("Generating sanitized GitHub hardware report...");
+    try {
+      const rep = await invokeCommand("generate_hardware_report", { verify: false });
+      const content = `<!-- Suggested Title: ${rep.issue_title} -->\n\n${rep.markdown}`;
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(content);
+        setStatusNote(`Copied anonymized GitHub hardware report (${rep.issue_title}).`);
+      } else {
+        downloadTextFile("rdna-forge-hardware-report.md", content, "text/markdown");
+      }
+    } catch (err) {
+      try {
+        // Fallback if clipboard permissions fail on WebView2 focus loss
+        const rep = await invokeCommand("generate_hardware_report", { verify: false });
+        downloadTextFile(
+          "rdna-forge-hardware-report.md",
+          `<!-- Suggested Title: ${rep.issue_title} -->\n\n${rep.markdown}`,
+          "text/markdown"
+        );
+      } catch (e2) {
+        state.overviewError = String(e2 || err);
+        renderActiveView();
+      }
+    }
+  },
   exportDiagnosticsJson: () => {
     if (!state.diagnostics) return;
     downloadTextFile(

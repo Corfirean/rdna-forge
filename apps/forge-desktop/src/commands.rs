@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
-    discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration_for_device,
-    recommend_models_for_device, rollback_lm_studio_config, rollback_windows_env_tweaks,
-    run_video_benchmark_suite, run_vulkan_suite, EnvAndOllamaPatchResult, EnvRollbackResult,
-    GpuModelRecommendationReport, KvCacheQuant, LlmAutotuneConfig, LlmAutotuneReport,
-    LlmOptimizationPlan, LmStudioPatchResult, LmStudioRollbackResult, LocalLlmAssets,
-    VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
-    VulkanKernelSelection,
+    discover_local_llm_assets, generate_github_hardware_report, inspect_gguf_model,
+    plan_llm_configuration_for_device, recommend_models_for_device, rollback_lm_studio_config,
+    rollback_windows_env_tweaks, run_video_benchmark_suite, run_vulkan_suite,
+    EnvAndOllamaPatchResult, EnvRollbackResult, GpuModelRecommendationReport, HardwareReportOutput,
+    KvCacheQuant, LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult,
+    LmStudioRollbackResult, LocalLlmAssets, VideoBenchReport, VideoBenchSuiteConfig,
+    VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
 };
 use forge_core::{
     match_profile_for_device, ArchitectureCapabilities, CapabilityResult, DiagnosticReport,
@@ -450,6 +450,25 @@ pub async fn run_live_verification(
     })
     .await
     .map_err(|e| format!("Live verification background task failed: {e}"))
+}
+
+#[tauri::command]
+pub async fn generate_hardware_report(
+    state: State<'_, AppState>,
+    verify: Option<bool>,
+) -> Result<HardwareReportOutput, String> {
+    let run_verify = verify.unwrap_or(false);
+    let guard = if run_verify {
+        Some(state.acquire_gpu("hardware report verification")?)
+    } else {
+        None
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        generate_github_hardware_report(run_verify).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Hardware report task failed: {e}"))?
 }
 
 #[tauri::command]

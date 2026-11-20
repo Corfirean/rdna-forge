@@ -4,12 +4,13 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
-    discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes,
-    plan_llm_configuration_for_device, recommend_models_for_device, resolve_default_triton_script,
-    rollback_lm_studio_config, rollback_windows_env_tweaks, run_llama_comparison, run_triton_suite,
-    run_video_benchmark_suite, run_vulkan_suite, EnvRollbackResult, KvCacheQuant, LlamaBenchConfig,
-    LlmAutotuneConfig, LmStudioRollbackResult, ModelFitVerdict, TritonBenchConfig,
-    VideoBenchSuiteConfig, VulkanBenchConfig, VulkanKernelSelection,
+    discover_local_llm_assets, generate_github_hardware_report, inspect_gguf_model,
+    peak_process_rss_bytes, plan_llm_configuration_for_device, recommend_models_for_device,
+    resolve_default_triton_script, rollback_lm_studio_config, rollback_windows_env_tweaks,
+    run_llama_comparison, run_triton_suite, run_video_benchmark_suite, run_vulkan_suite,
+    EnvRollbackResult, KvCacheQuant, LlamaBenchConfig, LlmAutotuneConfig, LmStudioRollbackResult,
+    ModelFitVerdict, TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig,
+    VulkanKernelSelection,
 };
 use forge_core::{
     builtin_profiles, match_profile_for_device, CapabilityResult, DiagnosticReport, GpuDeviceInfo,
@@ -76,6 +77,21 @@ enum Commands {
     },
     /// Show Top-N Windows processes consuming dedicated and shared GPU VRAM.
     VramTop(VramTopArgs),
+    /// Generate an anonymized Markdown hardware compatibility report for GitHub issues.
+    Report(ReportArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReportArgs {
+    /// Run live GPU verification checks (Vulkan compute + HIP roundtrip) and embed results.
+    #[arg(long)]
+    verify: bool,
+    /// Optional path to write the generated Markdown report.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Emit JSON payload (`issue_title`, `markdown`, `sanitized`) instead of raw Markdown.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -573,6 +589,7 @@ fn main() -> Result<()> {
             ProfileSubcommand::Match { device, json } => cmd_profile_match(device, json),
         },
         Commands::VramTop(args) => cmd_vram_top(&args),
+        Commands::Report(args) => cmd_report(&args),
     }
 }
 
@@ -1882,6 +1899,23 @@ fn cmd_vram_top(args: &VramTopArgs) -> Result<()> {
         rows.len(),
         total_ded_mib
     );
+    Ok(())
+}
+
+fn cmd_report(args: &ReportArgs) -> Result<()> {
+    let report = generate_github_hardware_report(args.verify)
+        .context("failed to generate GitHub hardware report")?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&report)?;
+        write_optional_output(args.output.as_deref(), &json)?;
+        println!("{json}");
+    } else {
+        write_optional_output(args.output.as_deref(), &report.markdown)?;
+        println!("Issue Title: {}", report.issue_title);
+        println!();
+        println!("{}", report.markdown);
+    }
     Ok(())
 }
 

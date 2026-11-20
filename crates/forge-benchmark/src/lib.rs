@@ -2,6 +2,7 @@ pub mod llama;
 pub mod llm_optimizer;
 pub mod llm_recommender;
 pub mod memory;
+pub mod report;
 pub mod stats;
 pub mod triton;
 pub mod video;
@@ -28,6 +29,10 @@ pub use llm_recommender::{
     ModelFitVerdict, ModelRecommendation,
 };
 pub use memory::peak_process_rss_bytes;
+pub use report::{
+    generate_github_hardware_report, sanitize_report_text, sanitize_report_text_with_env,
+    HardwareReportOutput,
+};
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
 pub use triton::{
     parse_triton_suite_json, resolve_default_triton_script, run_triton_suite, TritonBenchConfig,

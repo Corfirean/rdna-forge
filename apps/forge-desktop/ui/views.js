@@ -168,6 +168,16 @@ export function renderOverview(root, state, actions) {
           type: "button",
           className: "btn",
           disabled: !diag,
+          onClick: actions.copyGithubReport,
+        },
+        "Copy GitHub Report"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: !diag,
           onClick: actions.exportDiagnosticsJson,
         },
         "Export JSON"
