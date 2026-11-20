@@ -2,7 +2,8 @@
 name = "forge-desktop"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Tauri 2.12 (tauri, tauri-build, muda) requires rustc 1.90.
+rust-version = "1.90"
 license.workspace = true
 
 [[bin]]

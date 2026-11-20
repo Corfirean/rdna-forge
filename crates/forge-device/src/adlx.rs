@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::ffi::{c_char, CStr};
 
 use serde::{Deserialize, Serialize};

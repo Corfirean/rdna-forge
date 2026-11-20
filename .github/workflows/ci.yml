@@ -76,6 +76,71 @@ jobs:
           # .github/workflows/hardware-qualification.yml and DEVELOPMENT.md.
           "GPU correctness tests: NOT RUN (require an AMD GPU; hardware qualification workflow)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
+  # The declared minimum Rust versions, built for real. 1.88 is the floor for the libraries and CLI
+  # (libloading 0.9 requires it); the desktop app needs 1.90 because Tauri 2.12 does.
+  msrv:
+    name: MSRV check (Rust ${{ matrix.toolchain }}, ${{ matrix.scope }})
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: "1.88.0"
+            scope: libraries and CLI
+            args: --workspace --exclude forge-desktop
+          - toolchain: "1.90.0"
+            scope: full workspace incl. desktop
+            args: --workspace
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch tip
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msrv-${{ matrix.toolchain }}
+
+      - name: Type-check at the minimum supported Rust version
+        run: cargo check ${{ matrix.args }} --all-targets --locked
+
+  # Compile and lint only. RDNA Forge targets Windows; this job exists to keep the non-Windows
+  # branches of the code (for example forge-core::loader) compiling. It does not run tests and
+  # does not imply Linux support. forge-desktop (Tauri/GTK) is intentionally excluded.
+  linux-compile:
+    name: Linux compile and lint check (libraries and CLI, no tests)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch tip
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Type-check
+        run: cargo check --workspace --exclude forge-desktop --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --exclude forge-desktop --all-targets --locked -- -D warnings
+
   scripts:
     name: Desktop UI and Python syntax checks
     runs-on: ubuntu-latest

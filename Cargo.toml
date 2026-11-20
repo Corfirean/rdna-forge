@@ -13,7 +13,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+# Verified floor for the libraries and CLI (libloading 0.9 requires 1.88). forge-desktop declares
+# its own, higher value because Tauri 2.12 requires 1.90. See DEVELOPMENT.md and the CI "msrv" job.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/Corfirean/rdna-forge"
 
