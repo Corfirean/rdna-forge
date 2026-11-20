@@ -928,8 +928,8 @@ export function renderTuning(root, state, actions) {
     const res = state.tuningUi.actionResult;
     const text =
       res.kind === "power"
-        ? `Power Limit ${res.data.applied ? "APPLIED" : "DRY-RUN VALIDATED"}: current=${res.data.previous_limit_pct}%, requested=${res.data.requested_limit_pct}%, verified=${res.data.verified_limit_pct ?? "n/a"}%, range=${res.data.allowed_range.min}..=${res.data.allowed_range.max}%`
-        : `Factory Reset ${res.data.applied ? "APPLIED" : "DRY-RUN"}: was_at_factory=${res.data.was_at_factory}, now_at_factory=${res.data.now_at_factory}`;
+        ? `Power Limit ${res.data.applied ? (res.data.confirmed ? "APPLIED + CONFIRMED" : "REQUESTED, NOT CONFIRMED") : "DRY-RUN VALIDATED"}: current=${res.data.previous_limit_pct}%, requested=${res.data.requested_limit_pct}%, verified=${res.data.verified_limit_pct ?? "n/a"}%, range=${res.data.allowed_range.min}..=${res.data.allowed_range.max}%`
+        : `Factory Reset ${res.data.applied ? (res.data.confirmed ? "CONFIRMED" : "REQUESTED, NOT CONFIRMED") : "DRY-RUN"}: was_at_factory=${res.data.was_at_factory}, now_at_factory=${res.data.now_at_factory}`;
     powerPanelContent.appendChild(
       el("div", { className: "banner banner-ok mono", style: "margin-top:10px;margin-bottom:0" }, text)
     );

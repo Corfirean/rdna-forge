@@ -7,9 +7,9 @@ use forge_core::{ForgeError, ForgeResult};
 
 use crate::adlx_ffi::{AdlxSession, IAdlxGpu, IAdlxInterface, OwnedGpu, OwnedInterface, ADLX_OK};
 use crate::tuning::{
-    FanCurvePoint, FanTuningInfo, GfxTuningInfo, GpuTuningReport, IntRange, MemoryTimingMode,
-    PowerLimitChangeResult, PowerTuningInfo, PresetTuningInfo, TuningCapabilities,
-    TuningResetResult, VramTuningInfo,
+    check_power_limit_readback, check_reset_readback, FanCurvePoint, FanTuningInfo, GfxTuningInfo,
+    GpuTuningReport, IntRange, MemoryTimingMode, PowerLimitChangeResult, PowerTuningInfo,
+    PresetTuningInfo, TuningCapabilities, TuningResetResult, VramTuningInfo,
 };
 
 #[repr(C)]
@@ -906,6 +906,7 @@ impl AdlxSession {
                 default_limit_pct: info.power_limit_default_pct,
                 applied: false,
                 verified_limit_pct: None,
+                confirmed: false,
             });
         }
 
@@ -918,6 +919,9 @@ impl AdlxSession {
         }
 
         let verified_limit_pct = unsafe { read_i32(&power_obj, pvt.get_power_limit) };
+        // A mismatching read-back is an error: the request must not be reported as successful.
+        let confirmed =
+            check_power_limit_readback(limit_pct, previous_limit_pct, verified_limit_pct)?;
         Ok(PowerLimitChangeResult {
             gpu_name,
             pci_device_id: dev_id,
@@ -927,6 +931,7 @@ impl AdlxSession {
             default_limit_pct: info.power_limit_default_pct,
             applied: true,
             verified_limit_pct,
+            confirmed,
         })
     }
 
@@ -952,6 +957,7 @@ impl AdlxSession {
                 was_at_factory,
                 applied: false,
                 now_at_factory: was_at_factory,
+                confirmed: false,
             });
         }
 
@@ -963,12 +969,14 @@ impl AdlxSession {
         }
 
         let now_at_factory = unsafe { call_gpu_bool(vt, svc_ptr, vt.is_at_factory, gpu.0) };
+        let confirmed = check_reset_readback(now_at_factory)?;
         Ok(TuningResetResult {
             gpu_name,
             pci_device_id: dev_id,
             was_at_factory,
             applied: true,
             now_at_factory,
+            confirmed,
         })
     }
 }

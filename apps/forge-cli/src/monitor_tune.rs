@@ -600,7 +600,11 @@ pub fn cmd_tune_power_limit(
         return Ok(());
     }
 
-    let mode = if res.applied { "APPLIED" } else { "DRY-RUN" };
+    let mode = match (res.applied, res.confirmed) {
+        (false, _) => "DRY-RUN",
+        (true, true) => "APPLIED + CONFIRMED",
+        (true, false) => "REQUESTED, NOT CONFIRMED",
+    };
     let dev_hex = res
         .pci_device_id
         .map(|id| format!(" (0x{id:04X})"))
@@ -617,8 +621,16 @@ pub fn cmd_tune_power_limit(
     );
     if let Some(verified) = res.verified_limit_pct {
         println!("  Verified Read-Back: {verified}%");
-    } else {
+    } else if !res.applied {
         println!("  No GPU setting was modified. Pass --apply to commit via ADLX.");
+    } else {
+        println!("  The driver accepted the request but the value could not be read back; the new limit is UNCONFIRMED.");
+    }
+    if res.applied {
+        println!(
+            "  Previous value was {}%. No automatic rollback exists; to revert, apply that value explicitly.",
+            res.previous_limit_pct
+        );
     }
 
     Ok(())
@@ -634,7 +646,11 @@ pub fn cmd_tune_reset(device_id: Option<&str>, apply: bool, json: bool) -> Resul
         return Ok(());
     }
 
-    let mode = if res.applied { "APPLIED" } else { "DRY-RUN" };
+    let mode = match (res.applied, res.confirmed) {
+        (false, _) => "DRY-RUN",
+        (true, true) => "RESET CONFIRMED",
+        (true, false) => "RESET REQUESTED, NOT CONFIRMED",
+    };
     let dev_hex = res
         .pci_device_id
         .map(|id| format!(" (0x{id:04X})"))

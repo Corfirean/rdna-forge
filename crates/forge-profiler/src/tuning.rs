@@ -223,8 +223,13 @@ pub struct PowerLimitChangeResult {
     pub requested_limit_pct: i32,
     pub allowed_range: IntRange,
     pub default_limit_pct: Option<i32>,
+    /// The driver accepted the change request (`SetPowerLimit` returned OK). Not proof of state.
     pub applied: bool,
+    /// Value read back from the driver after the request, if the read succeeded.
     pub verified_limit_pct: Option<i32>,
+    /// True only when the read-back value equals the requested value.
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 /// Outcome of validating (dry-run) or executing an ADLX factory tuning reset.
@@ -233,6 +238,78 @@ pub struct TuningResetResult {
     pub gpu_name: String,
     pub pci_device_id: Option<u32>,
     pub was_at_factory: Option<bool>,
+    /// The driver accepted the reset request (`ResetToFactory` returned OK). Not proof of state.
     pub applied: bool,
+    /// State read back after the request, if the read succeeded.
     pub now_at_factory: Option<bool>,
+    /// True only when the read-back reports the GPU is at factory settings.
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+/// Interprets the read-back after a power-limit request.
+///
+/// `Ok(true)` = confirmed, `Ok(false)` = read-back unavailable (outcome unknown, must be shown
+/// as unconfirmed), `Err` = the driver reports a different value, i.e. the change did not take
+/// effect as requested.
+pub fn check_power_limit_readback(
+    requested_pct: i32,
+    previous_pct: i32,
+    readback: Option<i32>,
+) -> ForgeResult<bool> {
+    match readback {
+        Some(v) if v == requested_pct => Ok(true),
+        Some(v) => Err(ForgeError::ExecutionFailed(format!(
+            "SetPowerLimit({requested_pct}%) was accepted but the driver now reports {v}% (previous value was {previous_pct}%); the GPU power limit is not as requested"
+        ))),
+        None => Ok(false),
+    }
+}
+
+/// Interprets the read-back after a factory-reset request (see [`check_power_limit_readback`]).
+pub fn check_reset_readback(now_at_factory: Option<bool>) -> ForgeResult<bool> {
+    match now_at_factory {
+        Some(true) => Ok(true),
+        Some(false) => Err(ForgeError::ExecutionFailed(
+            "ResetToFactory was accepted but ADLX still reports non-factory tuning; the reset is not confirmed"
+                .to_string(),
+        )),
+        None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn power_limit_readback_distinguishes_confirmed_mismatch_and_unknown() {
+        assert!(check_power_limit_readback(10, 0, Some(10)).unwrap());
+        assert!(!check_power_limit_readback(10, 0, None).unwrap());
+        let err = check_power_limit_readback(10, 0, Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not as requested") && err.contains("previous value was 0%"));
+    }
+
+    #[test]
+    fn reset_readback_distinguishes_confirmed_mismatch_and_unknown() {
+        assert!(check_reset_readback(Some(true)).unwrap());
+        assert!(!check_reset_readback(None).unwrap());
+        assert!(check_reset_readback(Some(false)).is_err());
+    }
+
+    #[test]
+    fn range_validation_rejects_out_of_range_and_misaligned_values() {
+        let r = IntRange::from_adlx(-10, 10, 2).unwrap();
+        assert!(r.validate(4, "x").is_ok());
+        assert!(r.validate(11, "x").is_err());
+        assert!(r.validate(-11, "x").is_err());
+        assert!(r.validate(3, "x").is_err());
+        assert!(IntRange::from_adlx(5, 1, 1).is_none());
+        assert!(IntRange::from_adlx(0, 10, 0).is_none());
+        // Extreme bounds must not overflow the alignment arithmetic.
+        let wide = IntRange::from_adlx(i32::MIN, i32::MAX, 1).unwrap();
+        assert!(wide.validate(i32::MAX, "x").is_ok());
+    }
 }
