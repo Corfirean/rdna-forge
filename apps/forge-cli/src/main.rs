@@ -1469,12 +1469,27 @@ fn cmd_llm_inspect(model: Option<&Path>, json: bool) -> Result<()> {
         meta.gguf_version, meta.tensor_count, meta.architecture
     );
     println!(
-        "  Layers: {} blocks (+{} MTP) | ~{:.1} MiB/layer | Declared Max Context: {} tokens",
+        "  Layers: {} blocks (+{} MTP) | mean {:.1} MiB/layer [{}] | Declared Max Context: {} tokens",
         meta.block_count,
         meta.nextn_predict_layers,
         meta.bytes_per_layer as f64 / (1024.0 * 1024.0),
+        meta.tensor_layout_basis(),
         meta.declared_context_length
     );
+    if let Some(l) = &meta.tensor_layout {
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        println!(
+            "  Tensors (aligned MiB): layers {:.1} | embedding {:.1} | output {:.1} | shared {:.1} | est. GPU weights at full offload {:.1}",
+            mib(l.repeating_layer_bytes()),
+            mib(l.embedding_bytes),
+            mib(l.output_bytes),
+            mib(l.shared_bytes),
+            mib(l.full_offload_bytes())
+        );
+    }
+    for note in meta.tensor_layout_notes() {
+        println!("  NOTE: {note}");
+    }
     println!(
         "  Dimensions: embd={}, ffn={}, heads={} (kv={}), head_dim=({}/{})",
         meta.embedding_length,

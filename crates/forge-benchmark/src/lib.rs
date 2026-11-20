@@ -1,3 +1,4 @@
+pub mod gguf_layout;
 pub mod llama;
 pub mod llm_optimizer;
 pub mod llm_recommender;
@@ -8,6 +9,9 @@ pub mod triton;
 pub mod video;
 pub mod vulkan_suite;
 
+pub use gguf_layout::{
+    classify_tensor, ggml_type_traits, tensor_size_bytes, GgufTensorLayout, TensorRole,
+};
 pub use llama::{
     parse_llama_bench_json, run_llama_comparison, BackendRunOutcome, LlamaBenchConfig,
     LlamaBenchEntry, LlamaComparisonReport,
@@ -15,7 +19,7 @@ pub use llama::{
 pub use llm_optimizer::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     build_lm_studio_model_config_json, discover_local_llm_assets, estimate_kv_and_state_bytes,
-    gguf_file_type_name, inspect_gguf_model, plan_llm_configuration,
+    gguf_file_type_name, inspect_gguf_model, inspect_gguf_reader, plan_llm_configuration,
     plan_llm_configuration_for_device, plan_llm_configuration_for_gpu, rollback_lm_studio_config,
     rollback_lm_studio_config_in_dir, rollback_windows_env_tweaks, EnvAndOllamaPatchResult,
     EnvRollbackItem, EnvRollbackResult, EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget,
@@ -228,6 +232,9 @@ mod tests {
             expert_feed_forward_length: None,
             is_moe: false,
             bytes_per_layer: 14_403_496_864 / 65,
+            tensor_layout: None,
+            split_count: None,
+            assumed_defaults: Vec::new(),
         };
 
         let f16_bytes = estimate_kv_and_state_bytes(&meta, 4096, KvCacheQuant::F16);
@@ -313,6 +320,9 @@ mod tests {
             expert_feed_forward_length: None,
             is_moe: false,
             bytes_per_layer: 14_403_496_864 / 65,
+            tensor_layout: None,
+            split_count: None,
+            assumed_defaults: Vec::new(),
         };
 
         // 1. RX 6900 XT (RDNA2, 16 GiB + iGPU)

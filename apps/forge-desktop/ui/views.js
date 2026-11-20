@@ -2054,6 +2054,7 @@ export function renderLlmOptimizer(root, state, actions) {
   const m = plan.model;
   const gib = (m.file_size_bytes / (1024 ** 3)).toFixed(2);
   const mibPerLayer = (m.bytes_per_layer / (1024 ** 2)).toFixed(1);
+  const layerBasis = m.tensor_layout ? "mean, from tensor metadata" : "approx. file size / layers";
 
   root.appendChild(
     el(
@@ -2082,7 +2083,7 @@ export function renderLlmOptimizer(root, state, actions) {
           { className: "kpi-sub" },
           m.full_attention_interval
             ? `Hybrid SSM+Attn (1/${m.full_attention_interval} full attn, ~${mibPerLayer} MiB/L)`
-            : `~${mibPerLayer} MiB/layer`
+            : `~${mibPerLayer} MiB/layer (${layerBasis})`
         )
       ),
       el(

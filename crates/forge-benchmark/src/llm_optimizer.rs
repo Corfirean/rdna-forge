@@ -9,6 +9,9 @@ use forge_device::discover_all;
 use forge_profiler::{query_top_vram_processes, snapshot_all_gpus};
 use serde::{Deserialize, Serialize};
 
+use crate::gguf_layout::{
+    inferred_block_count, read_tensor_records, GgufTensorLayout, DEFAULT_GGUF_ALIGNMENT,
+};
 use crate::llama::parse_llama_bench_json;
 use crate::memory::peak_process_rss_bytes;
 
@@ -51,7 +54,64 @@ pub struct GgufModelMetadata {
     pub expert_feed_forward_length: Option<u32>,
     #[serde(default)]
     pub is_moe: bool,
+    /// Mean repeating-layer tensor size. Derived from `tensor_layout` when present; otherwise the
+    /// legacy `file_size_bytes / block_count` approximation (see [`GgufModelMetadata::tensor_layout_basis`]).
     pub bytes_per_layer: u64,
+    /// Exact per-role tensor accounting parsed from the GGUF tensor-info section, if available.
+    #[serde(default)]
+    pub tensor_layout: Option<GgufTensorLayout>,
+    /// `split.count` when the model is a multi-file GGUF (this file holds only one shard).
+    #[serde(default)]
+    pub split_count: Option<u32>,
+    /// Metadata keys that were missing and replaced by a guess; any plan using them is qualified.
+    #[serde(default)]
+    pub assumed_defaults: Vec<String>,
+}
+
+impl GgufModelMetadata {
+    /// `"tensor_metadata"` when memory estimates come from parsed tensor sizes, else
+    /// `"file_size_approximation"` (uniform file-size / block-count split; not an exact figure).
+    pub fn tensor_layout_basis(&self) -> &'static str {
+        if self.tensor_layout.is_some() {
+            "tensor_metadata"
+        } else {
+            "file_size_approximation"
+        }
+    }
+
+    /// Human-readable qualifications that limit how exact the weight estimate is.
+    pub fn tensor_layout_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        match &self.tensor_layout {
+            None => notes.push(
+                "No tensor metadata was available; weight memory is approximated as file size split evenly across layers and may be wrong for embeddings, output tensors, uneven layers or experts."
+                    .to_string(),
+            ),
+            Some(l) => {
+                if l.unknown_type_tensors > 0 {
+                    notes.push(format!(
+                        "{} tensor(s) use an unknown GGML type; their sizes are upper bounds taken from data offsets.",
+                        l.unknown_type_tensors
+                    ));
+                }
+                if l.extra_layer_bytes > 0 {
+                    notes.push(
+                        "Some blk.N tensors have an index beyond the declared block_count; they are assumed GPU-resident only at full offload."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(n) = self.split_count.filter(|&n| n > 1) {
+            notes.push(format!(
+                "Model is split across {n} GGUF files; only this file's tensors are counted, so weight memory is under-reported."
+            ));
+        }
+        for d in &self.assumed_defaults {
+            notes.push(format!("Assumed default: {d}."));
+        }
+        notes
+    }
 }
 
 /// Supported `llama.cpp` KV cache quantization types (`-ctk` / `-ctv`).
@@ -91,7 +151,16 @@ pub struct KvCacheMemoryBudget {
     pub kv_quant: String,
     pub requires_flash_attn: bool,
     pub context_tokens: u32,
+    /// Estimated GPU-resident weight memory at full offload (MiB). Computed from GGUF tensor
+    /// sizes when `weights_estimate_basis == "tensor_metadata"`, otherwise it is the whole file
+    /// size and therefore an upper-bound approximation. Never an exact allocator prediction.
     pub model_weights_mib: u64,
+    /// On-disk model file size (MiB), reported separately from the GPU weight estimate.
+    #[serde(default)]
+    pub model_file_mib: u64,
+    /// `"tensor_metadata"` or `"file_size_approximation"`.
+    #[serde(default)]
+    pub weights_estimate_basis: String,
     pub kv_and_state_mib: u64,
     pub compute_scratch_mib: u64,
     pub total_required_mib: u64,
@@ -574,8 +643,16 @@ pub fn gguf_file_type_name(file_type: Option<u32>, file_name: &str) -> String {
 pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
     let file = File::open(path).map_err(ForgeError::Io)?;
     let file_size_bytes = file.metadata().map_err(ForgeError::Io)?.len();
-    let mut reader = BufReader::new(file);
+    inspect_gguf_reader(BufReader::new(file), file_size_bytes, path)
+}
 
+/// Parses a GGUF stream of `file_size_bytes` bytes. `path` is only used for names in the result
+/// and error messages. Exposed so synthetic fixtures can be inspected without touching disk.
+pub fn inspect_gguf_reader<R: Read + Seek>(
+    mut reader: R,
+    file_size_bytes: u64,
+    path: &Path,
+) -> ForgeResult<GgufModelMetadata> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic).map_err(ForgeError::Io)?;
     if &magic != GGUF_MAGIC {
@@ -610,6 +687,13 @@ pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
         }
     }
 
+    let alignment = kvs
+        .get("general.alignment")
+        .and_then(GgufValue::as_u32)
+        .map_or(DEFAULT_GGUF_ALIGNMENT, u64::from);
+    let (tensor_records, data_offset) =
+        read_tensor_records(&mut reader, tensor_count, file_size_bytes, alignment)?;
+
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -626,12 +710,23 @@ pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
         kvs.get(&key).and_then(GgufValue::as_u32)
     };
 
-    let block_count = get_arch_u32("block_count").unwrap_or(32).max(1);
+    // Missing keys fall back to a guess, but every guess is recorded so callers can qualify
+    // any estimate that depends on it instead of presenting it as exact.
+    let mut assumed_defaults: Vec<String> = Vec::new();
+    let mut get_or_assume = |suffix: &str, default: u32| -> u32 {
+        get_arch_u32(suffix).unwrap_or_else(|| {
+            assumed_defaults.push(format!(
+                "{architecture}.{suffix} missing, assumed {default}"
+            ));
+            default
+        })
+    };
+
     let nextn_predict_layers = get_arch_u32("nextn_predict_layers").unwrap_or(0);
-    let declared_context_length = get_arch_u32("context_length").unwrap_or(4096);
-    let embedding_length = get_arch_u32("embedding_length").unwrap_or(4096);
+    let declared_context_length = get_or_assume("context_length", 4096);
+    let embedding_length = get_or_assume("embedding_length", 4096);
     let feed_forward_length = get_arch_u32("feed_forward_length");
-    let head_count = get_arch_u32("attention.head_count").unwrap_or(32).max(1);
+    let head_count = get_or_assume("attention.head_count", 32).max(1);
     let head_count_kv = get_arch_u32("attention.head_count_kv")
         .unwrap_or(head_count)
         .max(1);
@@ -647,10 +742,42 @@ pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
     let expert_feed_forward_length = get_arch_u32("expert_feed_forward_length");
     let is_moe = expert_count.unwrap_or(0) > 1;
 
+    let block_count = match (
+        get_arch_u32("block_count"),
+        inferred_block_count(&tensor_records),
+    ) {
+        (Some(declared), _) => declared.max(1),
+        (None, Some(inferred)) => {
+            assumed_defaults.push(format!(
+                "{architecture}.block_count missing, inferred {inferred} from blk.N tensors"
+            ));
+            inferred
+        }
+        (None, None) => {
+            assumed_defaults.push(format!("{architecture}.block_count missing, assumed 32"));
+            32
+        }
+    };
+
+    let tensor_layout = if tensor_records.is_empty() {
+        None
+    } else {
+        Some(GgufTensorLayout::from_records(
+            &tensor_records,
+            block_count,
+            alignment,
+            data_offset,
+        )?)
+    };
+    let split_count = kvs.get("split.count").and_then(GgufValue::as_u32);
+
     let file_type_code = kvs.get("general.file_type").and_then(GgufValue::as_u32);
     let quantization_name = gguf_file_type_name(file_type_code, &file_name);
-    let total_layers = u64::from(block_count.max(1));
-    let bytes_per_layer = file_size_bytes / total_layers;
+    let bytes_per_layer = match &tensor_layout {
+        Some(layout) => layout.mean_layer_bytes(),
+        // Legacy approximation, only used when no tensor metadata exists (see `tensor_layout_basis`).
+        None => file_size_bytes / u64::from(block_count.max(1)),
+    };
 
     Ok(GgufModelMetadata {
         file_path: path.display().to_string(),
@@ -692,6 +819,9 @@ pub fn inspect_gguf_model(path: &Path) -> ForgeResult<GgufModelMetadata> {
         expert_feed_forward_length,
         is_moe,
         bytes_per_layer,
+        tensor_layout,
+        split_count,
+        assumed_defaults,
     })
 }
 
@@ -709,19 +839,26 @@ pub fn estimate_kv_and_state_bytes(
         _ => (meta.block_count, 0),
     };
 
-    let kv_elems_per_token_per_layer =
-        u64::from(meta.head_count_kv) * u64::from(meta.key_length + meta.value_length);
-    let total_kv_elems =
-        kv_elems_per_token_per_layer * u64::from(attn_layers) * u64::from(context_tokens);
+    // Header values are untrusted u32s; saturate instead of wrapping so a corrupt header can only
+    // inflate the estimate (and therefore fail the "fits" check), never shrink it.
+    let kv_elems_per_token_per_layer = u64::from(meta.head_count_kv)
+        .saturating_mul(u64::from(meta.key_length) + u64::from(meta.value_length));
+    let total_kv_elems = kv_elems_per_token_per_layer
+        .saturating_mul(u64::from(attn_layers))
+        .saturating_mul(u64::from(context_tokens));
+    // `as u64` on an f64 saturates, which is the intended behavior here.
     let kv_bytes = (total_kv_elems as f64 * kv_quant.bytes_per_element()).ceil() as u64;
 
     let ssm_bytes_per_layer = match (meta.ssm_inner_size, meta.ssm_state_size) {
-        (Some(inner), Some(state)) => u64::from(inner) * u64::from(state) * 4 + 512 * 1024,
+        (Some(inner), Some(state)) => u64::from(inner)
+            .saturating_mul(u64::from(state))
+            .saturating_mul(4)
+            .saturating_add(512 * 1024),
         _ => 4 * 1024 * 1024,
     };
-    let ssm_bytes = u64::from(ssm_layers) * ssm_bytes_per_layer;
+    let ssm_bytes = u64::from(ssm_layers).saturating_mul(ssm_bytes_per_layer);
 
-    kv_bytes + ssm_bytes
+    kv_bytes.saturating_add(ssm_bytes)
 }
 
 /// Auto-discovers local `.gguf` model files and `llama.cpp` Vulkan/ROCm binaries on Windows.
@@ -907,6 +1044,70 @@ fn resolve_hip_visible_index(
         .unwrap_or(0)
 }
 
+const MIB: u64 = 1024 * 1024;
+
+/// Weight-memory model used by the planner.
+///
+/// With GGUF tensor metadata it uses exact per-layer sizes and llama.cpp layer-offload
+/// semantics. Without it, it falls back to the legacy uniform `file_size / block_count`
+/// split, which is only an approximation (embeddings, output tensors, uneven layers and MoE
+/// experts are not distinguished) and is labelled as such via [`Self::basis`].
+struct WeightModel<'a> {
+    model: &'a GgufModelMetadata,
+}
+
+impl<'a> WeightModel<'a> {
+    fn new(model: &'a GgufModelMetadata) -> Self {
+        Self { model }
+    }
+
+    fn basis(&self) -> &'static str {
+        self.model.tensor_layout_basis()
+    }
+
+    fn file_mib(&self) -> u64 {
+        self.model.file_size_bytes.div_ceil(MIB)
+    }
+
+    /// GPU weight MiB with every layer offloaded and no CPU experts.
+    fn full_offload_mib(&self) -> u64 {
+        match &self.model.tensor_layout {
+            Some(l) => l.full_offload_bytes().div_ceil(MIB),
+            None => self.file_mib(),
+        }
+    }
+
+    /// Mean repeating-layer size in MiB (a mean over uneven layers, used only for coarse conversions).
+    fn mean_layer_mib(&self) -> f64 {
+        match &self.model.tensor_layout {
+            Some(l) => (l.mean_layer_bytes() as f64 / MIB as f64).max(1.0),
+            None => (self.file_mib() as f64 / f64::from(self.model.block_count.max(1))).max(1.0),
+        }
+    }
+
+    /// Largest `-ngl` (<= block count) whose weights fit in `budget_mib`.
+    fn max_ngl(&self, budget_mib: u64) -> u32 {
+        match &self.model.tensor_layout {
+            Some(l) => l.max_ngl_within(budget_mib.saturating_mul(MIB)),
+            None => ((budget_mib as f64 / self.mean_layer_mib()).floor() as u32)
+                .min(self.model.block_count),
+        }
+    }
+
+    /// Smallest `--n-cpu-moe` that brings full-offload weights within `budget_mib`.
+    fn min_cpu_moe(&self, budget_mib: u64) -> u32 {
+        match &self.model.tensor_layout {
+            Some(l) => l.min_cpu_moe_within(budget_mib.saturating_mul(MIB)),
+            None => {
+                let overflow = self.full_offload_mib().saturating_sub(budget_mib) as f64;
+                // Legacy heuristic: experts assumed to be ~84% of each layer.
+                let expert_mib_per_layer = (self.mean_layer_mib() * 0.84).max(1.0);
+                ((overflow / expert_mib_per_layer).ceil() as u32).min(self.model.block_count)
+            }
+        }
+    }
+}
+
 /// Builds a hardware-aware anti-WDDM-spill memory plan and architecture tweak matrix
 /// for the primary (discrete preferred) GPU.
 pub fn plan_llm_configuration(
@@ -982,6 +1183,7 @@ pub fn plan_llm_configuration_for_device(
         })
         .or_else(|| telemetry.first());
 
+    let mut capacity_warnings: Vec<String> = Vec::new();
     let total_vram_mib: u64 = active_tel
         .and_then(|s| s.total_vram_mib.map(u64::from))
         .or_else(|| (primary_gpu.vram_bytes > 0).then_some(primary_gpu.vram_bytes / (1024 * 1024)))
@@ -990,10 +1192,22 @@ pub fn plan_llm_configuration_for_device(
                 .as_ref()
                 .map(|m| m.profile.memory.vram_bytes / (1024 * 1024))
         })
-        .unwrap_or(8_192);
+        .unwrap_or_else(|| {
+            capacity_warnings.push(
+                "GPU VRAM capacity could not be read from telemetry, Vulkan or a hardware profile; 8192 MiB is a placeholder, not a measurement. Plan figures are unreliable."
+                    .to_string(),
+            );
+            8_192
+        });
     let used_vram_mib: u64 = active_tel
         .and_then(|s| s.vram_used_mib.map(|v| v.max(0) as u64))
-        .unwrap_or(1_024)
+        .unwrap_or_else(|| {
+            capacity_warnings.push(
+                "Current VRAM usage could not be read; 1024 MiB is an assumed placeholder, not a measurement."
+                    .to_string(),
+            );
+            1_024
+        })
         .min(total_vram_mib);
 
     let ctx = LlmTargetGpuContext {
@@ -1016,9 +1230,9 @@ pub fn plan_llm_configuration_for_device(
 
     let mut plan =
         plan_llm_configuration_for_gpu(model, &ctx, target_context_tokens, safety_margin_mib);
+    plan.warnings.extend(capacity_warnings);
 
-    let model_weights_mib = model.file_size_bytes.div_ceil(1024 * 1024);
-    let mib_per_layer = (model_weights_mib as f64 / f64::from(model.block_count.max(1))).max(1.0);
+    let mib_per_layer = WeightModel::new(model).mean_layer_mib();
     plan.top_vram_processes = query_top_vram_processes(6)
         .unwrap_or_default()
         .into_iter()
@@ -1063,8 +1277,13 @@ pub fn plan_llm_configuration_for_gpu(
         ));
     }
 
-    let model_weights_mib = model.file_size_bytes.div_ceil(1024 * 1024);
-    let mib_per_layer = (model_weights_mib as f64 / f64::from(model.block_count.max(1))).max(1.0);
+    let weights = WeightModel::new(model);
+    let model_weights_mib = weights.full_offload_mib();
+    let model_file_mib = weights.file_mib();
+    let mib_per_layer = weights.mean_layer_mib();
+    for note in model.tensor_layout_notes() {
+        warnings.push(format!("Estimate qualification: {note}"));
+    }
     let compute_scratch_mib = if model.embedding_length <= 4096 && target_ctx <= 8192 {
         256u64
     } else if model.embedding_length >= 6144 || target_ctx >= 32_768 {
@@ -1086,7 +1305,9 @@ pub fn plan_llm_configuration_for_gpu(
     for kv_q in [KvCacheQuant::F16, KvCacheQuant::Q8_0, KvCacheQuant::Q4_0] {
         let kv_bytes = estimate_kv_and_state_bytes(model, target_ctx, kv_q);
         let kv_and_state_mib = kv_bytes.div_ceil(1024 * 1024);
-        let total_required_mib = model_weights_mib + kv_and_state_mib + compute_scratch_mib;
+        let total_required_mib = model_weights_mib
+            .saturating_add(kv_and_state_mib)
+            .saturating_add(compute_scratch_mib);
 
         let usable_free_mib = free_vram_mib.saturating_sub(safety_margin_mib);
         let fits_in_free_vram = total_required_mib <= usable_free_mib;
@@ -1094,28 +1315,26 @@ pub fn plan_llm_configuration_for_gpu(
         // With GGML_VK_ENABLE_MEMORY_PRIORITY=1 (VK_EXT_memory_priority), Windows WDDM VidMm
         // can page out non-pinned background app VRAM down to OS baseline.
         let priority_budget_mib = total_vram_mib
-            .saturating_sub(baseline_os_vram_mib + safety_margin_mib / 2)
+            .saturating_sub(baseline_os_vram_mib.saturating_add(safety_margin_mib / 2))
             .max(usable_free_mib);
         let fits_with_wddm_memory_priority = total_required_mib <= priority_budget_mib;
 
         let budget_for_weights_strict =
-            usable_free_mib.saturating_sub(kv_and_state_mib + compute_scratch_mib);
-        let strict_zero_spill_ngl = ((budget_for_weights_strict as f64 / mib_per_layer).floor()
-            as u32)
-            .min(model.block_count);
+            usable_free_mib.saturating_sub(kv_and_state_mib.saturating_add(compute_scratch_mib));
+        let strict_zero_spill_ngl = weights.max_ngl(budget_for_weights_strict);
 
-        let budget_for_weights_prio =
-            priority_budget_mib.saturating_sub(kv_and_state_mib + compute_scratch_mib);
-        let memory_priority_ngl = ((budget_for_weights_prio as f64 / mib_per_layer).floor() as u32)
-            .min(model.block_count);
+        let budget_for_weights_prio = priority_budget_mib
+            .saturating_sub(kv_and_state_mib.saturating_add(compute_scratch_mib));
+        let memory_priority_ngl = weights.max_ngl(budget_for_weights_prio);
 
-        // For MoE models (expert_count > 1), routed expert FFN tensors account for ~84% of each
-        // layer's size while attention + shared tensors take ~16%. Offloading `-ncmoe N` layers
-        // keeps `-ngl 99` (all attention layers + KV cache on GPU) and moves only N layers' experts to system RAM.
+        // For MoE models, `--n-cpu-moe N` keeps `-ngl 99` (attention, shared tensors and KV cache
+        // on GPU) and moves only the routed-expert tensors of the first N layers to system RAM.
+        // With tensor metadata N is computed from the real expert bytes of those layers; without it
+        // the legacy "experts are ~84% of a layer" heuristic is used (see `WeightModel`).
         let recommended_n_cpu_moe = if model.is_moe && total_required_mib > usable_free_mib {
-            let overflow_mib = (total_required_mib - usable_free_mib) as f64;
-            let expert_mib_per_layer = (mib_per_layer * 0.84).max(1.0);
-            ((overflow_mib / expert_mib_per_layer).ceil() as u32).min(model.block_count)
+            let weights_budget_mib = usable_free_mib
+                .saturating_sub(kv_and_state_mib.saturating_add(compute_scratch_mib));
+            weights.min_cpu_moe(weights_budget_mib)
         } else {
             0
         };
@@ -1125,6 +1344,8 @@ pub fn plan_llm_configuration_for_gpu(
             requires_flash_attn: kv_q.requires_flash_attn_for_v(),
             context_tokens: target_ctx,
             model_weights_mib,
+            model_file_mib,
+            weights_estimate_basis: weights.basis().to_string(),
             kv_and_state_mib,
             compute_scratch_mib,
             total_required_mib,
