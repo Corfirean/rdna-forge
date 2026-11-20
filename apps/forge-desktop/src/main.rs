@@ -7,7 +7,7 @@ use commands::{
     get_llm_assets, get_llm_plan, get_llm_recommendations, get_telemetry_snapshot,
     get_top_vram_processes, get_tuning_report, get_video_caps, reset_tuning, rollback_env_patch,
     rollback_lm_studio_patch, run_live_verification, run_llm_autotune, run_video_benchmark,
-    run_vulkan_benchmark, set_power_limit, AppState,
+    run_video_decode_benchmark, run_vulkan_benchmark, set_power_limit, AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -31,6 +31,7 @@ fn main() {
             reset_tuning,
             get_video_caps,
             run_video_benchmark,
+            run_video_decode_benchmark,
             run_vulkan_benchmark,
             get_llm_assets,
             get_llm_plan,

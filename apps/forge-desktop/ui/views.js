@@ -1156,6 +1156,104 @@ export function renderVideo(root, state, actions) {
 
   root.appendChild(makePanel("AMD AMF Hardware Video Capabilities", `${caps.codecs.length} components probed`, codecTable, true));
 
+  const buildCommonVideoFields = (cfg, disabled, onUpdate, includePreset) => {
+    const fields = [
+      el(
+        "div",
+        { className: "form-field" },
+        el("label", { className: "field-label" }, "Resolution"),
+        el(
+          "select",
+          {
+            className: "select-input mono",
+            disabled,
+            onChange: (e) => onUpdate("resolution", e.target.value),
+          },
+          [
+            ["1280x720", "1280x720 (720p HD)"],
+            ["1920x1080", "1920x1080 (1080p FHD)"],
+            ["2560x1440", "2560x1440 (1440p QHD)"],
+            ["3840x2160", "3840x2160 (4K UHD)"],
+          ].map(([val, label]) =>
+            el("option", { value: val, selected: cfg.resolution === val }, label)
+          )
+        )
+      ),
+    ];
+    if (includePreset) {
+      fields.push(
+        el(
+          "div",
+          { className: "form-field" },
+          el("label", { className: "field-label" }, "Preset"),
+          el(
+            "select",
+            {
+              className: "select-input mono",
+              disabled,
+              onChange: (e) => onUpdate("preset", e.target.value),
+            },
+            [
+              ["speed", "speed"],
+              ["balanced", "balanced"],
+              ["quality", "quality"],
+            ].map(([val, label]) =>
+              el("option", { value: val, selected: cfg.preset === val }, label)
+            )
+          )
+        )
+      );
+    }
+    fields.push(
+      el(
+        "div",
+        { className: "form-field" },
+        el("label", { className: "field-label" }, includePreset ? "Bitrate (Mbps)" : "Source Bitrate (Mbps)"),
+        el("input", {
+          type: "number",
+          className: "text-input mono",
+          style: "width:78px",
+          min: "1",
+          max: "500",
+          disabled,
+          value: String(cfg.bitrate_mbps),
+          onChange: (e) => onUpdate("bitrate_mbps", Number(e.target.value)),
+        })
+      ),
+      el(
+        "div",
+        { className: "form-field" },
+        el("label", { className: "field-label" }, "Warmup"),
+        el("input", {
+          type: "number",
+          className: "text-input mono",
+          style: "width:68px",
+          min: "0",
+          max: "120",
+          disabled,
+          value: String(cfg.warmup_frames),
+          onChange: (e) => onUpdate("warmup_frames", Number(e.target.value)),
+        })
+      ),
+      el(
+        "div",
+        { className: "form-field" },
+        el("label", { className: "field-label" }, "Frames"),
+        el("input", {
+          type: "number",
+          className: "text-input mono",
+          style: "width:74px",
+          min: "10",
+          max: "600",
+          disabled,
+          value: String(cfg.measured_frames),
+          onChange: (e) => onUpdate("measured_frames", Number(e.target.value)),
+        })
+      )
+    );
+    return fields;
+  };
+
   const vcfg = state.videoBenchForm || {
     codec: "all",
     resolution: "1920x1080",
@@ -1181,101 +1279,18 @@ export function renderVideo(root, state, actions) {
           onChange: (e) => actions.updateVideoBenchField("codec", e.target.value),
         },
         [
-          ["all", "all (H.264 + HEVC + HEVC 10-bit)"],
+          ["all", "all (H.264 + HEVC + HEVC10 + AV1 if supported)"],
           ["h264", "h264 (AMFVideoEncoderVCE_AVC NV12)"],
           ["hevc", "hevc (AMFVideoEncoderHW_HEVC NV12)"],
           ["hevc10", "hevc10 (AMFVideoEncoderHW_HEVC P010)"],
+          ["av1", "av1 (AMFVideoEncoderHW_AV1 NV12, RDNA3/4 only)"],
+          ["av1_10bit", "av1_10bit (AMFVideoEncoderHW_AV1 P010, RDNA3/4 only)"],
         ].map(([val, label]) =>
           el("option", { value: val, selected: vcfg.codec === val }, label)
         )
       )
     ),
-    el(
-      "div",
-      { className: "form-field" },
-      el("label", { className: "field-label" }, "Resolution"),
-      el(
-        "select",
-        {
-          className: "select-input mono",
-          disabled: state.runningVideoBench,
-          onChange: (e) => actions.updateVideoBenchField("resolution", e.target.value),
-        },
-        [
-          ["1280x720", "1280x720 (720p HD)"],
-          ["1920x1080", "1920x1080 (1080p FHD)"],
-          ["2560x1440", "2560x1440 (1440p QHD)"],
-          ["3840x2160", "3840x2160 (4K UHD)"],
-        ].map(([val, label]) =>
-          el("option", { value: val, selected: vcfg.resolution === val }, label)
-        )
-      )
-    ),
-    el(
-      "div",
-      { className: "form-field" },
-      el("label", { className: "field-label" }, "Preset"),
-      el(
-        "select",
-        {
-          className: "select-input mono",
-          disabled: state.runningVideoBench,
-          onChange: (e) => actions.updateVideoBenchField("preset", e.target.value),
-        },
-        [
-          ["speed", "speed"],
-          ["balanced", "balanced"],
-          ["quality", "quality"],
-        ].map(([val, label]) =>
-          el("option", { value: val, selected: vcfg.preset === val }, label)
-        )
-      )
-    ),
-    el(
-      "div",
-      { className: "form-field" },
-      el("label", { className: "field-label" }, "Bitrate (Mbps)"),
-      el("input", {
-        type: "number",
-        className: "text-input mono",
-        style: "width:78px",
-        min: "1",
-        max: "500",
-        disabled: state.runningVideoBench,
-        value: String(vcfg.bitrate_mbps),
-        onChange: (e) => actions.updateVideoBenchField("bitrate_mbps", Number(e.target.value)),
-      })
-    ),
-    el(
-      "div",
-      { className: "form-field" },
-      el("label", { className: "field-label" }, "Warmup"),
-      el("input", {
-        type: "number",
-        className: "text-input mono",
-        style: "width:68px",
-        min: "0",
-        max: "120",
-        disabled: state.runningVideoBench,
-        value: String(vcfg.warmup_frames),
-        onChange: (e) => actions.updateVideoBenchField("warmup_frames", Number(e.target.value)),
-      })
-    ),
-    el(
-      "div",
-      { className: "form-field" },
-      el("label", { className: "field-label" }, "Frames"),
-      el("input", {
-        type: "number",
-        className: "text-input mono",
-        style: "width:74px",
-        min: "10",
-        max: "600",
-        disabled: state.runningVideoBench,
-        value: String(vcfg.measured_frames),
-        onChange: (e) => actions.updateVideoBenchField("measured_frames", Number(e.target.value)),
-      })
-    ),
+    ...buildCommonVideoFields(vcfg, state.runningVideoBench, actions.updateVideoBenchField, true),
     el(
       "div",
       { className: "form-field", style: "align-self:flex-end" },
@@ -1320,6 +1335,16 @@ export function renderVideo(root, state, actions) {
 
   const vrep = state.videoBenchReport;
   if (vrep && Array.isArray(vrep.results)) {
+    if (Array.isArray(vrep.skipped_codecs) && vrep.skipped_codecs.length > 0) {
+      root.appendChild(
+        el(
+          "div",
+          { className: "banner banner-warn mono" },
+          `Skipped unsupported VCN encode codecs: ${vrep.skipped_codecs.join("; ")}`
+        )
+      );
+    }
+
     const vrows = vrep.results.map((r) =>
       el(
         "tr",
@@ -1341,7 +1366,7 @@ export function renderVideo(root, state, actions) {
         el(
           "td",
           {},
-          r.valid_annex_b
+          r.valid_bitstream || r.valid_annex_b
             ? el("span", { className: "badge badge-ok" }, "VALID")
             : el("span", { className: "badge badge-err" }, "INVALID")
         )
@@ -1369,7 +1394,7 @@ export function renderVideo(root, state, actions) {
             el("th", { className: "num" }, "Avg Frame"),
             el("th", { className: "num" }, "Effective Bitrate"),
             el("th", { className: "num" }, "Packets"),
-            el("th", {}, "Annex-B NAL")
+            el("th", {}, "Bitstream")
           )
         ),
         el("tbody", {}, vrows)
@@ -1381,6 +1406,146 @@ export function renderVideo(root, state, actions) {
         `VCN Hardware Encode Results (AMF ${vrep.runtime_version})`,
         vrep.peak_rss_bytes ? `Peak RSS: ${(vrep.peak_rss_bytes / (1024 ** 2)).toFixed(1)} MiB` : "",
         vtable,
+        true
+      )
+    );
+  }
+
+  const dcfg = state.videoDecodeForm || {
+    codec: "all",
+    resolution: "1920x1080",
+    fps: 60,
+    bitrate_mbps: 12,
+    warmup_frames: 15,
+    measured_frames: 120,
+  };
+
+  const decodeFormNode = el(
+    "div",
+    { className: "form-row" },
+    el(
+      "div",
+      { className: "form-field" },
+      el("label", { className: "field-label" }, "VCN Decoder Codec"),
+      el(
+        "select",
+        {
+          className: "select-input mono",
+          disabled: state.runningVideoDecodeBench,
+          onChange: (e) => actions.updateVideoDecodeField("codec", e.target.value),
+        },
+        [
+          ["all", "all (H.264 + HEVC + HEVC 10-bit)"],
+          ["h264", "h264 (AMFVideoDecoderUVD_H264_AVC NV12)"],
+          ["hevc", "hevc (AMFVideoDecoderHW_H265_HEVC NV12)"],
+          ["hevc10", "hevc10 (AMFVideoDecoderHW_H265_HEVC P010)"],
+        ].map(([val, label]) =>
+          el("option", { value: val, selected: dcfg.codec === val }, label)
+        )
+      )
+    ),
+    ...buildCommonVideoFields(dcfg, state.runningVideoDecodeBench, actions.updateVideoDecodeField, false),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-primary",
+          disabled: state.runningVideoDecodeBench || state.busyOp,
+          onClick: actions.runVideoDecodeBenchmark,
+        },
+        state.runningVideoDecodeBench ? "Decoding on VCN..." : "Run Decode Benchmark"
+      )
+    ),
+    el(
+      "div",
+      { className: "form-field", style: "align-self:flex-end" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: !state.videoDecodeBenchReport,
+          onClick: actions.exportVideoDecodeJson,
+        },
+        "Export Decode JSON"
+      )
+    )
+  );
+
+  root.appendChild(
+    makePanel(
+      "VCN Hardware Decode Benchmark Runner",
+      "Synthesizes an in-memory GOP stream then times VCN hardware decode to DX11 surfaces",
+      decodeFormNode
+    )
+  );
+
+  if (state.videoDecodeBenchError) {
+    root.appendChild(el("div", { className: "banner banner-err" }, state.videoDecodeBenchError));
+  }
+
+  const drep = state.videoDecodeBenchReport;
+  if (drep && Array.isArray(drep.results)) {
+    const drows = drep.results.map((r) =>
+      el(
+        "tr",
+        {},
+        el(
+          "td",
+          { className: "mono" },
+          r.codec,
+          el("div", { className: "sub-detail mono" }, r.component_id)
+        ),
+        el("td", { className: "mono" }, r.surface_format),
+        el("td", { className: "mono" }, `${r.width}x${r.height}`),
+        el("td", { className: "num mono" }, `${r.decode_fps.toFixed(2)} FPS`),
+        el("td", { className: "num mono" }, `${r.megapixels_per_sec.toFixed(2)} MPix/s`),
+        el("td", { className: "num mono muted-text" }, `${r.avg_frame_ms.toFixed(3)} ms`),
+        el("td", { className: "num mono muted-text" }, `${r.decoded_frames}/${r.submitted_packets}`),
+        el(
+          "td",
+          {},
+          r.valid_surfaces
+            ? el("span", { className: "badge badge-ok" }, "VALID")
+            : el("span", { className: "badge badge-err" }, "INVALID")
+        )
+      )
+    );
+
+    const dtable = el(
+      "div",
+      { className: "data-table-wrap" },
+      el(
+        "table",
+        { className: "data-table" },
+        el(
+          "thead",
+          {},
+          el(
+            "tr",
+            {},
+            el("th", {}, "Codec / Component"),
+            el("th", {}, "Format"),
+            el("th", {}, "Resolution"),
+            el("th", { className: "num" }, "Decode FPS"),
+            el("th", { className: "num" }, "Throughput"),
+            el("th", { className: "num" }, "Avg Frame"),
+            el("th", { className: "num" }, "Decoded"),
+            el("th", {}, "DX11 Surface")
+          )
+        ),
+        el("tbody", {}, drows)
+      )
+    );
+
+    root.appendChild(
+      makePanel(
+        `VCN Hardware Decode Results (AMF ${drep.runtime_version})`,
+        drep.peak_rss_bytes ? `Peak RSS: ${(drep.peak_rss_bytes / (1024 ** 2)).toFixed(1)} MiB` : "",
+        dtable,
         true
       )
     );

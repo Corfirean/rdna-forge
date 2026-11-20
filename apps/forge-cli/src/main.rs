@@ -7,9 +7,10 @@ use forge_benchmark::{
     discover_local_llm_assets, generate_github_hardware_report, inspect_gguf_model,
     peak_process_rss_bytes, plan_llm_configuration_for_device, recommend_models_for_device,
     resolve_default_triton_script, rollback_lm_studio_config, rollback_windows_env_tweaks,
-    run_llama_comparison, run_triton_suite, run_video_benchmark_suite, run_vulkan_suite,
-    EnvRollbackResult, KvCacheQuant, LlamaBenchConfig, LlmAutotuneConfig, LmStudioRollbackResult,
-    ModelFitVerdict, TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig,
+    run_llama_comparison, run_triton_suite, run_video_benchmark_suite,
+    run_video_decode_benchmark_suite, run_vulkan_suite, EnvRollbackResult, KvCacheQuant,
+    LlamaBenchConfig, LlmAutotuneConfig, LmStudioRollbackResult, ModelFitVerdict,
+    TritonBenchConfig, VideoBenchSuiteConfig, VideoDecodeBenchSuiteConfig, VulkanBenchConfig,
     VulkanKernelSelection,
 };
 use forge_core::{
@@ -23,7 +24,7 @@ use forge_profiler::{
 };
 use forge_runtime::{
     default_untested_capabilities, probe_all_backends, probe_amf_capabilities,
-    run_live_capability_checks, AmfAcceleration, AmfEncodeCodec, AmfQualityPreset,
+    run_live_capability_checks, AmfAcceleration, AmfDecodeCodec, AmfEncodeCodec, AmfQualityPreset,
 };
 mod monitor_tune;
 
@@ -200,8 +201,10 @@ enum VideoSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Benchmark AMD VCN hardware video encoders (H.264/AVC, HEVC 8-bit NV12, HEVC 10-bit P010).
+    /// Benchmark AMD VCN hardware video encoders (H.264/AVC, HEVC, and AV1 on RDNA3/RDNA4).
     Bench(VideoBenchArgs),
+    /// Benchmark AMD VCN hardware video decoders (H.264/AVC, HEVC 8-bit & 10-bit) using in-memory GOP streams.
+    DecodeBench(VideoDecodeBenchArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -210,6 +213,8 @@ enum VideoCodecChoice {
     H264,
     Hevc,
     Hevc10,
+    Av1,
+    Av110,
 }
 
 impl VideoCodecChoice {
@@ -219,12 +224,69 @@ impl VideoCodecChoice {
                 AmfEncodeCodec::H264Avc,
                 AmfEncodeCodec::Hevc,
                 AmfEncodeCodec::Hevc10Bit,
+                AmfEncodeCodec::Av1,
             ],
             Self::H264 => vec![AmfEncodeCodec::H264Avc],
             Self::Hevc => vec![AmfEncodeCodec::Hevc],
             Self::Hevc10 => vec![AmfEncodeCodec::Hevc10Bit],
+            Self::Av1 => vec![AmfEncodeCodec::Av1],
+            Self::Av110 => vec![AmfEncodeCodec::Av110Bit],
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VideoDecodeCodecChoice {
+    All,
+    H264,
+    Hevc,
+    Hevc10,
+}
+
+impl VideoDecodeCodecChoice {
+    fn to_codecs(self) -> Vec<AmfDecodeCodec> {
+        match self {
+            Self::All => vec![
+                AmfDecodeCodec::H264Avc,
+                AmfDecodeCodec::Hevc,
+                AmfDecodeCodec::Hevc10Bit,
+            ],
+            Self::H264 => vec![AmfDecodeCodec::H264Avc],
+            Self::Hevc => vec![AmfDecodeCodec::Hevc],
+            Self::Hevc10 => vec![AmfDecodeCodec::Hevc10Bit],
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct VideoDecodeBenchArgs {
+    /// Target hardware decoder codec(s) to benchmark.
+    #[arg(long, value_enum, default_value_t = VideoDecodeCodecChoice::All)]
+    codec: VideoDecodeCodecChoice,
+    /// Frame width in pixels (even integer in 128..=7680).
+    #[arg(long, default_value_t = 1920)]
+    width: u32,
+    /// Frame height in pixels (even integer in 128..=4320).
+    #[arg(long, default_value_t = 1080)]
+    height: u32,
+    /// Nominal stream frame rate in FPS (1..=240).
+    #[arg(long, default_value_t = 60)]
+    fps: u32,
+    /// Source GOP encode bitrate in megabits per second (1..=500).
+    #[arg(long, default_value_t = 12)]
+    bitrate_mbps: u32,
+    /// Number of untimed warmup frames per codec.
+    #[arg(long, default_value_t = 15)]
+    warmup: u32,
+    /// Number of timed frames per codec.
+    #[arg(long, default_value_t = 120)]
+    frames: u32,
+    /// Emit machine-readable JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+    /// Optional path to write JSON decode benchmark report.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -572,6 +634,7 @@ fn main() -> Result<()> {
         Commands::Video { action } => match action {
             VideoSubcommand::Caps { json } => cmd_video_caps(json),
             VideoSubcommand::Bench(args) => cmd_video_bench(&args),
+            VideoSubcommand::DecodeBench(args) => cmd_video_decode_bench(&args),
         },
         Commands::Llm { action } => match action {
             LlmSubcommand::Discover { json } => cmd_llm_discover(json),
@@ -1209,6 +1272,7 @@ fn cmd_video_bench(args: &VideoBenchArgs) -> Result<()> {
         preset: args.preset.into(),
         warmup_frames: args.warmup,
         measured_frames: args.frames,
+        skip_unsupported: matches!(args.codec, VideoCodecChoice::All),
     };
 
     let report = run_video_benchmark_suite(&suite_cfg)
@@ -1235,12 +1299,13 @@ fn cmd_video_bench(args: &VideoBenchArgs) -> Result<()> {
     );
     println!();
     println!(
-        "  {:<18} {:<6} {:<10} {:<10} {:<10} {:<11} {:<9} {:<8}",
-        "Codec", "Format", "Encode FPS", "MPix/s", "Avg ms/f", "Eff. Mbps", "Packets", "Annex-B"
+        "  {:<18} {:<6} {:<10} {:<10} {:<10} {:<11} {:<9} {:<10}",
+        "Codec", "Format", "Encode FPS", "MPix/s", "Avg ms/f", "Eff. Mbps", "Packets", "Bitstream"
     );
     for r in &report.results {
+        let valid = r.valid_bitstream || r.valid_annex_b;
         println!(
-            "  {:<18} {:<6} {:<10.2} {:<10.2} {:<10.3} {:<11.2} {:<9} {:<8}",
+            "  {:<18} {:<6} {:<10.2} {:<10.2} {:<10.3} {:<11.2} {:<9} {:<10}",
             r.codec,
             r.surface_format,
             r.encode_fps,
@@ -1248,13 +1313,85 @@ fn cmd_video_bench(args: &VideoBenchArgs) -> Result<()> {
             r.avg_frame_ms,
             r.effective_bitrate_mbps,
             format!("{}/{}", r.output_packets, r.submitted_frames),
-            if r.valid_annex_b { "VALID" } else { "INVALID" }
+            if valid {
+                if r.codec.starts_with("AV1") {
+                    "VALID OBU"
+                } else {
+                    "VALID"
+                }
+            } else {
+                "INVALID"
+            }
         );
+    }
+    if !report.skipped_codecs.is_empty() {
+        println!();
+        for skipped in &report.skipped_codecs {
+            println!("  Skipped: {skipped}");
+        }
     }
 
     if let Some(ref t) = report.telemetry {
         println!();
         print_telemetry_summary("VCN Telemetry", t);
+    }
+
+    Ok(())
+}
+
+fn cmd_video_decode_bench(args: &VideoDecodeBenchArgs) -> Result<()> {
+    let suite_cfg = VideoDecodeBenchSuiteConfig {
+        codecs: args.codec.to_codecs(),
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        source_bitrate_bps: u64::from(args.bitrate_mbps).saturating_mul(1_000_000),
+        warmup_frames: args.warmup,
+        measured_frames: args.frames,
+    };
+
+    let report = run_video_decode_benchmark_suite(&suite_cfg)
+        .context("failed to run AMD AMF VCN hardware video decode benchmark")?;
+    let json_text = serde_json::to_string_pretty(&report)?;
+    write_optional_output(args.output.as_deref(), &json_text)?;
+
+    if args.json {
+        println!("{json_text}");
+        return Ok(());
+    }
+
+    println!("RDNA FORGE AMF VCN HARDWARE DECODE BENCHMARK");
+    println!(
+        "  AMF Runtime: {} | Resolution: {}x{} @ {} FPS | GOP Source: {} Mbps | Warmup/Frames: {}/{}",
+        report.runtime_version,
+        args.width,
+        args.height,
+        args.fps,
+        args.bitrate_mbps,
+        args.warmup,
+        args.frames
+    );
+    println!();
+    println!(
+        "  {:<18} {:<6} {:<10} {:<10} {:<10} {:<11} {:<10}",
+        "Codec", "Format", "Decode FPS", "MPix/s", "Avg ms/f", "Decoded", "DX11 Surf"
+    );
+    for r in &report.results {
+        println!(
+            "  {:<18} {:<6} {:<10.2} {:<10.2} {:<10.3} {:<11} {:<10}",
+            r.codec,
+            r.surface_format,
+            r.decode_fps,
+            r.megapixels_per_sec,
+            r.avg_frame_ms,
+            format!("{}/{}", r.decoded_frames, r.submitted_packets),
+            if r.valid_surfaces { "VALID" } else { "INVALID" }
+        );
+    }
+
+    if let Some(ref t) = report.telemetry {
+        println!();
+        print_telemetry_summary("VCN Decode Telemetry", t);
     }
 
     Ok(())
@@ -2282,5 +2419,84 @@ mod tests {
                 }
             }
         ));
+
+        let vram = Cli::try_parse_from(["forge", "vram-top", "--limit", "5", "--json"])
+            .expect("vram-top args must parse");
+        assert!(matches!(
+            vram.command,
+            Commands::VramTop(VramTopArgs {
+                limit: 5,
+                json: true
+            })
+        ));
+
+        let rec = Cli::try_parse_from(["forge", "llm", "recommend", "--device", "0"])
+            .expect("llm recommend must parse");
+        assert!(matches!(
+            rec.command,
+            Commands::Llm {
+                action: LlmSubcommand::Recommend(LlmRecommendArgs {
+                    device: Some(0),
+                    ..
+                })
+            }
+        ));
+
+        let rb = Cli::try_parse_from(["forge", "llm", "rollback", "--env"])
+            .expect("llm rollback must parse");
+        match rb.command {
+            Commands::Llm {
+                action: LlmSubcommand::Rollback(args),
+            } => {
+                assert!(args.env);
+                assert!(!args.apply, "rollback must default to dry-run");
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+
+        let rep = Cli::try_parse_from(["forge", "report", "--verify"])
+            .expect("report --verify must parse");
+        assert!(matches!(
+            rep.command,
+            Commands::Report(ReportArgs { verify: true, .. })
+        ));
+
+        let av1 = Cli::try_parse_from(["forge", "video", "bench", "--codec", "av1"])
+            .expect("video bench --codec av1 must parse");
+        assert!(matches!(
+            av1.command,
+            Commands::Video {
+                action: VideoSubcommand::Bench(VideoBenchArgs {
+                    codec: VideoCodecChoice::Av1,
+                    ..
+                })
+            }
+        ));
+
+        let dec = Cli::try_parse_from([
+            "forge",
+            "video",
+            "decode-bench",
+            "--codec",
+            "hevc",
+            "--width",
+            "3840",
+            "--height",
+            "2160",
+            "--frames",
+            "60",
+        ])
+        .expect("video decode-bench must parse");
+        match dec.command {
+            Commands::Video {
+                action: VideoSubcommand::DecodeBench(args),
+            } => {
+                assert_eq!(args.codec, VideoDecodeCodecChoice::Hevc);
+                assert_eq!(args.width, 3840);
+                assert_eq!(args.height, 2160);
+                assert_eq!(args.frames, 60);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
     }
 }

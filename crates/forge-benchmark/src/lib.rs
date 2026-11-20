@@ -38,7 +38,10 @@ pub use triton::{
     parse_triton_suite_json, resolve_default_triton_script, run_triton_suite, TritonBenchConfig,
     TritonKernelOutcome, TritonProvenance, TritonSuiteReport,
 };
-pub use video::{run_video_benchmark_suite, VideoBenchReport, VideoBenchSuiteConfig};
+pub use video::{
+    run_video_benchmark_suite, run_video_decode_benchmark_suite, VideoBenchReport,
+    VideoBenchSuiteConfig, VideoDecodeBenchReport, VideoDecodeBenchSuiteConfig,
+};
 pub use vulkan_suite::{
     run_vulkan_suite, VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
 };

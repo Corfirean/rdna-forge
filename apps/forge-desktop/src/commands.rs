@@ -6,11 +6,12 @@ use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     discover_local_llm_assets, generate_github_hardware_report, inspect_gguf_model,
     plan_llm_configuration_for_device, recommend_models_for_device, rollback_lm_studio_config,
-    rollback_windows_env_tweaks, run_video_benchmark_suite, run_vulkan_suite,
-    EnvAndOllamaPatchResult, EnvRollbackResult, GpuModelRecommendationReport, HardwareReportOutput,
-    KvCacheQuant, LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult,
-    LmStudioRollbackResult, LocalLlmAssets, VideoBenchReport, VideoBenchSuiteConfig,
-    VulkanBenchConfig, VulkanBenchReport, VulkanKernelSelection,
+    rollback_windows_env_tweaks, run_video_benchmark_suite, run_video_decode_benchmark_suite,
+    run_vulkan_suite, EnvAndOllamaPatchResult, EnvRollbackResult, GpuModelRecommendationReport,
+    HardwareReportOutput, KvCacheQuant, LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan,
+    LmStudioPatchResult, LmStudioRollbackResult, LocalLlmAssets, VideoBenchReport,
+    VideoBenchSuiteConfig, VideoDecodeBenchReport, VideoDecodeBenchSuiteConfig, VulkanBenchConfig,
+    VulkanBenchReport, VulkanKernelSelection,
 };
 use forge_core::{
     match_profile_for_device, ArchitectureCapabilities, CapabilityResult, DiagnosticReport,
@@ -25,7 +26,8 @@ use forge_profiler::{
 };
 use forge_runtime::{
     default_untested_capabilities, probe_all_backends, probe_amf_capabilities,
-    run_live_capability_checks, AmfCapabilitiesReport, AmfEncodeCodec, AmfQualityPreset,
+    run_live_capability_checks, AmfCapabilitiesReport, AmfDecodeCodec, AmfEncodeCodec,
+    AmfQualityPreset,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -186,6 +188,45 @@ impl DesktopBenchRequest {
     }
 }
 
+fn validate_video_bench_geometry(
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_mbps: u32,
+    warmup_frames: u32,
+    measured_frames: u32,
+) -> Result<(), String> {
+    if !(128..=7680).contains(&width) || !width.is_multiple_of(2) {
+        return Err(format!(
+            "width must be an even integer in 128..=7680 (got {width})."
+        ));
+    }
+    if !(128..=4320).contains(&height) || !height.is_multiple_of(2) {
+        return Err(format!(
+            "height must be an even integer in 128..=4320 (got {height})."
+        ));
+    }
+    if !(1..=240).contains(&fps) {
+        return Err(format!("fps must be in 1..=240 (got {fps})."));
+    }
+    if !(1..=500).contains(&bitrate_mbps) {
+        return Err(format!(
+            "bitrate_mbps must be in 1..=500 (got {bitrate_mbps})."
+        ));
+    }
+    if warmup_frames > 120 {
+        return Err(format!(
+            "warmup_frames must be <= 120 (got {warmup_frames})."
+        ));
+    }
+    if !(10..=600).contains(&measured_frames) {
+        return Err(format!(
+            "measured_frames must be in 10..=600 (got {measured_frames})."
+        ));
+    }
+    Ok(())
+}
+
 /// AMF VCN hardware video encode benchmark parameters submitted by the Video view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopVideoBenchRequest {
@@ -202,15 +243,20 @@ pub struct DesktopVideoBenchRequest {
 impl DesktopVideoBenchRequest {
     /// Parses codec/preset strings and validates safe bounded VCN benchmark parameters.
     pub fn validate_and_build_config(&self) -> Result<VideoBenchSuiteConfig, String> {
-        let codecs = match self.codec.trim() {
+        let trimmed_codec = self.codec.trim();
+        let skip_unsupported = trimmed_codec == "all";
+        let codecs = match trimmed_codec {
             "all" => vec![
                 AmfEncodeCodec::H264Avc,
                 AmfEncodeCodec::Hevc,
                 AmfEncodeCodec::Hevc10Bit,
+                AmfEncodeCodec::Av1,
             ],
             "h264" | "h264_avc" => vec![AmfEncodeCodec::H264Avc],
             "hevc" => vec![AmfEncodeCodec::Hevc],
             "hevc10" | "hevc_10bit" => vec![AmfEncodeCodec::Hevc10Bit],
+            "av1" => vec![AmfEncodeCodec::Av1],
+            "av110" | "av1_10bit" => vec![AmfEncodeCodec::Av110Bit],
             other => return Err(format!("Unsupported AMF video codec selection '{other}'.")),
         };
 
@@ -221,39 +267,14 @@ impl DesktopVideoBenchRequest {
             other => return Err(format!("Unsupported AMF quality preset '{other}'.")),
         };
 
-        if !(128..=7680).contains(&self.width) || !self.width.is_multiple_of(2) {
-            return Err(format!(
-                "width must be an even integer in 128..=7680 (got {}).",
-                self.width
-            ));
-        }
-        if !(128..=4320).contains(&self.height) || !self.height.is_multiple_of(2) {
-            return Err(format!(
-                "height must be an even integer in 128..=4320 (got {}).",
-                self.height
-            ));
-        }
-        if !(1..=240).contains(&self.fps) {
-            return Err(format!("fps must be in 1..=240 (got {}).", self.fps));
-        }
-        if !(1..=500).contains(&self.bitrate_mbps) {
-            return Err(format!(
-                "bitrate_mbps must be in 1..=500 (got {}).",
-                self.bitrate_mbps
-            ));
-        }
-        if self.warmup_frames > 120 {
-            return Err(format!(
-                "warmup_frames must be <= 120 (got {}).",
-                self.warmup_frames
-            ));
-        }
-        if !(10..=600).contains(&self.measured_frames) {
-            return Err(format!(
-                "measured_frames must be in 10..=600 (got {}).",
-                self.measured_frames
-            ));
-        }
+        validate_video_bench_geometry(
+            self.width,
+            self.height,
+            self.fps,
+            self.bitrate_mbps,
+            self.warmup_frames,
+            self.measured_frames,
+        )?;
 
         Ok(VideoBenchSuiteConfig {
             codecs,
@@ -262,6 +283,60 @@ impl DesktopVideoBenchRequest {
             fps: self.fps,
             target_bitrate_bps: u64::from(self.bitrate_mbps) * 1_000_000,
             preset,
+            warmup_frames: self.warmup_frames,
+            measured_frames: self.measured_frames,
+            skip_unsupported,
+        })
+    }
+}
+
+/// AMF VCN hardware video decode benchmark parameters submitted by the Video view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopVideoDecodeBenchRequest {
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    #[serde(alias = "source_bitrate_mbps")]
+    pub bitrate_mbps: u32,
+    pub warmup_frames: u32,
+    pub measured_frames: u32,
+}
+
+impl DesktopVideoDecodeBenchRequest {
+    /// Parses decode codec strings and validates safe bounded VCN decode parameters.
+    pub fn validate_and_build_config(&self) -> Result<VideoDecodeBenchSuiteConfig, String> {
+        let codecs = match self.codec.trim() {
+            "all" => vec![
+                AmfDecodeCodec::H264Avc,
+                AmfDecodeCodec::Hevc,
+                AmfDecodeCodec::Hevc10Bit,
+            ],
+            "h264" | "h264_avc" => vec![AmfDecodeCodec::H264Avc],
+            "hevc" => vec![AmfDecodeCodec::Hevc],
+            "hevc10" | "hevc_10bit" => vec![AmfDecodeCodec::Hevc10Bit],
+            other => {
+                return Err(format!(
+                    "Unsupported AMF video decode codec selection '{other}'."
+                ))
+            }
+        };
+
+        validate_video_bench_geometry(
+            self.width,
+            self.height,
+            self.fps,
+            self.bitrate_mbps,
+            self.warmup_frames,
+            self.measured_frames,
+        )?;
+
+        Ok(VideoDecodeBenchSuiteConfig {
+            codecs,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            source_bitrate_bps: u64::from(self.bitrate_mbps) * 1_000_000,
             warmup_frames: self.warmup_frames,
             measured_frames: self.measured_frames,
         })
@@ -601,6 +676,21 @@ pub async fn run_video_benchmark(
     .map_err(|e| format!("VCN video benchmark task failed: {e}"))?
 }
 
+#[tauri::command]
+pub async fn run_video_decode_benchmark(
+    state: State<'_, AppState>,
+    request: DesktopVideoDecodeBenchRequest,
+) -> Result<VideoDecodeBenchReport, String> {
+    let config = request.validate_and_build_config()?;
+    let guard = state.acquire_gpu("VCN video decode benchmark")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        run_video_decode_benchmark_suite(&config).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("VCN video decode benchmark task failed: {e}"))?
+}
+
 fn resolve_desktop_model_path(explicit: Option<&str>) -> Result<PathBuf, String> {
     if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(s));
@@ -903,12 +993,22 @@ mod tests {
         let cfg = valid
             .validate_and_build_config()
             .expect("valid video bench config");
-        assert_eq!(cfg.codecs.len(), 3);
+        assert_eq!(cfg.codecs.len(), 4);
+        assert!(cfg.skip_unsupported);
         assert_eq!(cfg.target_bitrate_bps, 12_000_000);
         assert_eq!(cfg.preset, AmfQualityPreset::Speed);
 
-        assert!(DesktopVideoBenchRequest {
+        let av1_cfg = DesktopVideoBenchRequest {
             codec: "av1".to_string(),
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .expect("explicit av1 codec should validate cleanly");
+        assert_eq!(av1_cfg.codecs, vec![AmfEncodeCodec::Av1]);
+        assert!(!av1_cfg.skip_unsupported);
+
+        assert!(DesktopVideoBenchRequest {
+            codec: "vp8".to_string(),
             ..valid.clone()
         }
         .validate_and_build_config()
@@ -922,6 +1022,60 @@ mod tests {
         .is_err());
 
         assert!(DesktopVideoBenchRequest {
+            measured_frames: 5,
+            ..valid
+        }
+        .validate_and_build_config()
+        .is_err());
+    }
+
+    #[test]
+    fn video_decode_bench_request_validates_codecs_and_bounds() {
+        let valid = DesktopVideoDecodeBenchRequest {
+            codec: "all".to_string(),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 12,
+            warmup_frames: 15,
+            measured_frames: 120,
+        };
+        let cfg = valid
+            .validate_and_build_config()
+            .expect("valid video decode bench config");
+        assert_eq!(
+            cfg.codecs,
+            vec![
+                AmfDecodeCodec::H264Avc,
+                AmfDecodeCodec::Hevc,
+                AmfDecodeCodec::Hevc10Bit
+            ]
+        );
+        assert_eq!(cfg.source_bitrate_bps, 12_000_000);
+
+        let hevc_cfg = DesktopVideoDecodeBenchRequest {
+            codec: "hevc".to_string(),
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .expect("single hevc decode codec");
+        assert_eq!(hevc_cfg.codecs, vec![AmfDecodeCodec::Hevc]);
+
+        assert!(DesktopVideoDecodeBenchRequest {
+            codec: "av1".to_string(),
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .is_err());
+
+        assert!(DesktopVideoDecodeBenchRequest {
+            width: 1921,
+            ..valid.clone()
+        }
+        .validate_and_build_config()
+        .is_err());
+
+        assert!(DesktopVideoDecodeBenchRequest {
             measured_frames: 5,
             ..valid
         }

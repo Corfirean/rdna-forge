@@ -77,6 +77,18 @@ const state = {
   videoBenchReport: null,
   videoBenchError: null,
 
+  videoDecodeForm: {
+    codec: "all",
+    resolution: "1920x1080",
+    fps: 60,
+    bitrate_mbps: 12,
+    warmup_frames: 15,
+    measured_frames: 120,
+  },
+  runningVideoDecodeBench: false,
+  videoDecodeBenchReport: null,
+  videoDecodeBenchError: null,
+
   benchForm: {
     device_index: 0,
     kernel: "gemv_w8",
@@ -473,14 +485,20 @@ async function refreshVideoCaps() {
   }
 }
 
+function parseVideoResolution(res) {
+  const [wStr, hStr] = String(res || "1920x1080").split("x");
+  return {
+    width: Number(wStr) || 1920,
+    height: Number(hStr) || 1080,
+  };
+}
+
 async function runVideoBenchmark() {
   if (state.runningVideoBench || state.busyOp) return;
   state.runningVideoBench = true;
   state.busyOp = true;
   state.videoBenchError = null;
-  const [wStr, hStr] = String(state.videoBenchForm.resolution || "1920x1080").split("x");
-  const width = Number(wStr) || 1920;
-  const height = Number(hStr) || 1080;
+  const { width, height } = parseVideoResolution(state.videoBenchForm.resolution);
   setStatusNote(`Running VCN hardware encode benchmark (${state.videoBenchForm.codec}, ${width}x${height})...`);
   renderActiveView();
 
@@ -502,6 +520,37 @@ async function runVideoBenchmark() {
     state.videoBenchError = String(err);
   } finally {
     state.runningVideoBench = false;
+    state.busyOp = false;
+    renderActiveView();
+  }
+}
+
+async function runVideoDecodeBenchmark() {
+  if (state.runningVideoDecodeBench || state.busyOp) return;
+  state.runningVideoDecodeBench = true;
+  state.busyOp = true;
+  state.videoDecodeBenchError = null;
+  const { width, height } = parseVideoResolution(state.videoDecodeForm.resolution);
+  setStatusNote(`Running VCN hardware decode benchmark (${state.videoDecodeForm.codec}, ${width}x${height})...`);
+  renderActiveView();
+
+  try {
+    state.videoDecodeBenchReport = await invokeCommand("run_video_decode_benchmark", {
+      request: {
+        codec: state.videoDecodeForm.codec,
+        width,
+        height,
+        fps: Number(state.videoDecodeForm.fps) || 60,
+        bitrate_mbps: Number(state.videoDecodeForm.bitrate_mbps) || 12,
+        warmup_frames: Number(state.videoDecodeForm.warmup_frames),
+        measured_frames: Number(state.videoDecodeForm.measured_frames),
+      },
+    });
+    setStatusNote(`Completed VCN hardware decode benchmark (${width}x${height}).`);
+  } catch (err) {
+    state.videoDecodeBenchError = String(err);
+  } finally {
+    state.runningVideoDecodeBench = false;
     state.busyOp = false;
     renderActiveView();
   }
@@ -666,6 +715,18 @@ const actions = {
     downloadTextFile(
       `rdna-forge-video-bench-${state.videoBenchForm.resolution}.json`,
       JSON.stringify(state.videoBenchReport, null, 2),
+      "application/json"
+    );
+  },
+  updateVideoDecodeField: (key, value) => {
+    state.videoDecodeForm[key] = value;
+  },
+  runVideoDecodeBenchmark,
+  exportVideoDecodeJson: () => {
+    if (!state.videoDecodeBenchReport) return;
+    downloadTextFile(
+      `rdna-forge-video-decode-bench-${state.videoDecodeForm.resolution}.json`,
+      JSON.stringify(state.videoDecodeBenchReport, null, 2),
       "application/json"
     );
   },

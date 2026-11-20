@@ -7,10 +7,11 @@ pub mod verify;
 pub mod vulkan_compute;
 
 pub use amf::{
-    amf_surface_format_name, format_amf_version, has_annex_b_start_code, probe_amf_capabilities,
-    run_amf_encode_benchmark, AmfAcceleration, AmfCapabilitiesReport, AmfCodecCapability,
-    AmfCodecDirection, AmfEncodeBenchConfig, AmfEncodeBenchResult, AmfEncodeCodec,
-    AmfQualityPreset, AmfVariantStruct,
+    amf_surface_format_name, format_amf_version, has_annex_b_start_code, has_av1_obu_header,
+    probe_amf_capabilities, run_amf_decode_benchmark, run_amf_encode_benchmark, AmfAcceleration,
+    AmfCapabilitiesReport, AmfCodecCapability, AmfCodecDirection, AmfDecodeBenchConfig,
+    AmfDecodeBenchResult, AmfDecodeCodec, AmfEncodeBenchConfig, AmfEncodeBenchResult,
+    AmfEncodeCodec, AmfQualityPreset, AmfVariantStruct,
 };
 pub use hip_verify::{verify_hip_transfer, HipVerificationResult};
 pub use probe::probe_all_backends;
@@ -417,6 +418,45 @@ mod tests {
         assert!(AmfEncodeBenchConfig {
             measured_frames: 0,
             ..valid
+        }
+        .validate()
+        .is_err());
+
+        // AV1 metadata, preset enum mapping, OBU header validation & decode config validation
+        assert!(AmfEncodeCodec::Av1.is_av1());
+        assert!(AmfEncodeCodec::Av110Bit.is_av1());
+        assert_eq!(AmfEncodeCodec::Av1.surface_format_name(), "NV12");
+        assert_eq!(AmfEncodeCodec::Av110Bit.surface_format_name(), "P010");
+        assert_eq!(AmfQualityPreset::Quality.av1_value(), 30);
+        assert_eq!(AmfQualityPreset::Balanced.av1_value(), 70);
+        assert_eq!(AmfQualityPreset::Speed.av1_value(), 100);
+
+        // Temporal Delimiter OBU (type=2 -> 0x12) and Sequence Header OBU (type=1 -> 0x0A)
+        assert!(has_av1_obu_header(&[0x12, 0x00, 0x0A]));
+        assert!(has_av1_obu_header(&[0x0A, 0x10]));
+        assert!(!has_av1_obu_header(&[0x80, 0x00])); // forbidden bit set
+        assert!(!has_av1_obu_header(&[0x00, 0x00, 0x00, 0x01])); // Annex-B / type 0
+        assert!(!has_av1_obu_header(&[]));
+
+        let dec_valid = AmfDecodeBenchConfig {
+            codec: AmfDecodeCodec::Hevc,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            source_bitrate_bps: 12_000_000,
+            warmup_frames: 10,
+            measured_frames: 60,
+        };
+        assert!(dec_valid.validate().is_ok());
+        assert!(AmfDecodeBenchConfig {
+            width: 1921,
+            ..dec_valid.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(AmfDecodeBenchConfig {
+            measured_frames: 0,
+            ..dec_valid
         }
         .validate()
         .is_err());
