@@ -8,6 +8,9 @@ pub struct AdlxProbeReport {
     pub available: bool,
     pub version: Option<String>,
     pub full_version: Option<String>,
+    /// Verified absolute path of the loaded `amdadlx64.dll` (System32 only; see `forge_core::loader`).
+    #[serde(default)]
+    pub loaded_library: Option<String>,
     pub error: Option<String>,
 }
 
@@ -23,17 +26,20 @@ pub fn decode_adlx_full_version(raw: u64) -> String {
 /// Probes `amdadlx64.dll` dynamically without vendoring proprietary ADLX headers.
 #[cfg(windows)]
 pub fn probe_adlx() -> AdlxProbeReport {
-    let lib = match unsafe { libloading::Library::new("amdadlx64.dll") } {
-        Ok(lib) => lib,
+    let loaded = match forge_core::load_system_library("amdadlx64.dll") {
+        Ok(loaded) => loaded,
         Err(err) => {
             return AdlxProbeReport {
                 available: false,
                 version: None,
                 full_version: None,
-                error: Some(format!("amdadlx64.dll unavailable: {err}")),
+                loaded_library: None,
+                error: Some(err.to_string()),
             };
         }
     };
+    let loaded_library = Some(loaded.path.display().to_string());
+    let lib = loaded.library;
 
     unsafe {
         type QueryVersionFn = extern "C" fn(*mut *const c_char) -> i32;
@@ -60,11 +66,15 @@ pub fn probe_adlx() -> AdlxProbeReport {
                 (f(&mut raw) == 0 && raw != 0).then(|| decode_adlx_full_version(raw))
             });
 
+        // The DLL loaded, but a version query that fails is surfaced instead of being ignored.
+        let error = (version.is_none() && full_version.is_none())
+            .then(|| "amdadlx64.dll loaded but exposes no usable version query".to_string());
         AdlxProbeReport {
             available: true,
             version,
             full_version,
-            error: None,
+            loaded_library,
+            error,
         }
     }
 }
@@ -75,6 +85,7 @@ pub fn probe_adlx() -> AdlxProbeReport {
         available: false,
         version: None,
         full_version: None,
+        loaded_library: None,
         error: Some("ADLX is Windows-only".to_string()),
     }
 }

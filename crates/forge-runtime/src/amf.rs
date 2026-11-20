@@ -980,12 +980,9 @@ mod imp {
             .lock()
             .map_err(|_| ForgeError::ExecutionFailed("AMF probe mutex poisoned".to_string()))?;
 
-        let lib = unsafe { libloading::Library::new("amfrt64.dll") }.map_err(|e| {
-            ForgeError::RuntimeUnavailable {
-                runtime: "AMF".to_string(),
-                reason: format!("amfrt64.dll unavailable: {e}"),
-            }
-        })?;
+        let lib = forge_core::load_system_library("amfrt64.dll")
+            .map_err(|e| e.into_forge_error("AMF"))?
+            .library;
 
         let (raw_ver, factory_ptr) = unsafe {
             let query_ver = *lib
@@ -1316,12 +1313,9 @@ mod imp {
 
     fn init_amf_dx11_context() -> ForgeResult<(libloading::Library, *mut AmfFactory, OwnedContext)>
     {
-        let lib = unsafe { libloading::Library::new("amfrt64.dll") }.map_err(|e| {
-            ForgeError::RuntimeUnavailable {
-                runtime: "AMF".to_string(),
-                reason: format!("amfrt64.dll unavailable: {e}"),
-            }
-        })?;
+        let lib = forge_core::load_system_library("amfrt64.dll")
+            .map_err(|e| e.into_forge_error("AMF"))?
+            .library;
 
         let factory_ptr = unsafe {
             let query_ver = *lib

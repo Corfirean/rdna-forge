@@ -60,16 +60,56 @@ fn c_char_slice_to_string(buf: &[std::ffi::c_char]) -> String {
     cstr.to_string_lossy().trim().to_string()
 }
 
+/// Process-lifetime handle to the system Vulkan loader. It is intentionally never unloaded:
+/// Vulkan loaders are not designed to be unloaded and every `ash::Entry` borrows its symbols.
+#[cfg(windows)]
+static VULKAN_LOADER: std::sync::OnceLock<
+    Result<forge_core::LoadedLibrary, forge_core::LibraryLoadError>,
+> = std::sync::OnceLock::new();
+
+/// Loads the Vulkan loader and returns an `ash::Entry` plus the verified loader path.
+///
+/// On Windows `vulkan-1.dll` is resolved from System32 only (see `forge_core::loader`); `ash`'s
+/// own `Entry::load()` would use the default DLL search order and is therefore not used.
+pub fn load_vulkan_entry() -> Result<(ash::Entry, std::path::PathBuf), String> {
+    #[cfg(windows)]
+    {
+        let loaded = VULKAN_LOADER
+            .get_or_init(|| forge_core::load_system_library("vulkan-1.dll"))
+            .as_ref()
+            .map_err(|e| e.to_string())?;
+        // SAFETY: `vkGetInstanceProcAddr` has the signature mandated by the Vulkan loader ABI, and
+        // `loaded.library` lives in a `static`, so the pointer outlives the returned Entry.
+        let entry = unsafe {
+            let sym = loaded
+                .library
+                .get::<vk::PFN_vkGetInstanceProcAddr>(b"vkGetInstanceProcAddr\0")
+                .map_err(|e| format!("vulkan-1.dll lacks vkGetInstanceProcAddr: {e}"))?;
+            ash::Entry::from_static_fn(ash::StaticFn {
+                get_instance_proc_addr: *sym,
+            })
+        };
+        Ok((entry, loaded.path.clone()))
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: platform `dlopen` of the system Vulkan loader.
+        unsafe { ash::Entry::load() }
+            .map(|e| (e, std::path::PathBuf::from("libvulkan")))
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Probes the system Vulkan loader and enumerates every physical device.
 pub fn probe_vulkan() -> VulkanProbeReport {
-    let entry = match unsafe { ash::Entry::load() } {
-        Ok(entry) => entry,
+    let entry = match load_vulkan_entry() {
+        Ok((entry, _path)) => entry,
         Err(err) => {
             return VulkanProbeReport {
                 available: false,
                 instance_version: None,
                 devices: Vec::new(),
-                error: Some(format!("failed to load vulkan-1.dll: {err}")),
+                error: Some(format!("failed to load the Vulkan loader: {err}")),
             };
         }
     };

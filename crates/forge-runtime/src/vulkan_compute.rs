@@ -183,9 +183,11 @@ impl VulkanComputeEngine {
             ForgeError::DeviceNotFound(format!("GPU device index {device_index} not found"))
         })?;
 
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| ForgeError::RuntimeUnavailable {
-            runtime: "Vulkan".to_string(),
-            reason: format!("failed to load vulkan-1.dll: {e}"),
+        let (entry, _loader_path) = forge_device::vulkan::load_vulkan_entry().map_err(|e| {
+            ForgeError::RuntimeUnavailable {
+                runtime: "Vulkan".to_string(),
+                reason: format!("failed to load the Vulkan loader: {e}"),
+            }
         })?;
 
         let raw_ver = unsafe { entry.try_enumerate_instance_version() }

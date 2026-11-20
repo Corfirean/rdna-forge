@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::time::Instant;
 
 use forge_core::{ForgeError, ForgeResult};
-use forge_device::hip::{load_hip_library, probe_hip};
+use forge_device::hip::{load_hip_library_checked, probe_hip};
 use serde::{Deserialize, Serialize};
 
 /// Result of a live HIP memory allocation, round-trip transfer, and event timing verification.
@@ -73,10 +73,9 @@ pub fn verify_hip_transfer(
         })?
         .clone();
 
-    let (_path, lib) = load_hip_library().ok_or_else(|| ForgeError::RuntimeUnavailable {
-        runtime: "HIP".to_string(),
-        reason: "failed to load amdhip64 library".to_string(),
-    })?;
+    let lib = load_hip_library_checked()
+        .map_err(|e| e.into_forge_error("HIP"))?
+        .library;
 
     unsafe {
         type SetDeviceFn = extern "C" fn(i32) -> i32;

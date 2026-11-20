@@ -323,12 +323,9 @@ mod imp {
     /// Queries Windows PDH `\GPU Process Memory(*)` counters (no administrator privileges required)
     /// and returns the top processes sorted by dedicated VRAM consumption.
     pub fn query_top_vram_processes(limit: usize) -> ForgeResult<Vec<ProcessVramUsage>> {
-        let lib = unsafe { libloading::Library::new("pdh.dll") }.map_err(|e| {
-            ForgeError::RuntimeUnavailable {
-                runtime: "PDH".to_string(),
-                reason: format!("pdh.dll unavailable: {e}"),
-            }
-        })?;
+        let lib = forge_core::load_system_library("pdh.dll")
+            .map_err(|e| e.into_forge_error("PDH"))?
+            .library;
 
         let (open_query, add_counter, collect_data, get_array, close_query) = unsafe {
             let open_query = *lib

@@ -1,5 +1,6 @@
 pub mod architecture;
 pub mod error;
+pub mod loader;
 pub mod policy;
 pub mod profile;
 pub mod status;
@@ -9,6 +10,10 @@ pub use architecture::{
     AMD_PCI_VENDOR_ID,
 };
 pub use error::{ForgeError, ForgeResult};
+pub use loader::{
+    load_system_library, load_vendor_library, trusted_runtime_roots, LibraryLoadError,
+    LoadedLibrary,
+};
 pub use policy::{select_preferred_device, validate_kernel_execution, KernelRequirements};
 pub use profile::{
     builtin_profile_by_id, builtin_profiles, match_profile_for_device, BuiltinProfileInfo,

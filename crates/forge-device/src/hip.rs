@@ -165,6 +165,11 @@ pub fn format_hip_version(ver: i32) -> String {
 }
 
 /// Returns candidate HIP shared library paths in descending search priority.
+///
+/// On Windows every candidate is an absolute path: SDK locations from `HIP_PATH` / `ROCM_PATH`
+/// (kept only if the file exists), then the System32 copy installed by the AMD driver. There is
+/// no bare-name entry, so the Windows DLL search order is never consulted. Whether a candidate
+/// is acceptable is decided by [`forge_core::load_vendor_library`] (trusted install roots only).
 pub fn hip_library_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -191,6 +196,13 @@ pub fn hip_library_candidates() -> Vec<PathBuf> {
         }
     }
 
+    #[cfg(windows)]
+    if let Some(sys) = forge_core::loader::system_directory() {
+        for name in dll_names {
+            candidates.push(sys.join(name));
+        }
+    }
+    #[cfg(not(windows))]
     for name in dll_names {
         candidates.push(PathBuf::from(name));
     }
@@ -203,27 +215,56 @@ fn c_chars_to_string(buf: &[c_char]) -> String {
     cstr.to_string_lossy().trim().to_string()
 }
 
-pub fn load_hip_library() -> Option<(PathBuf, libloading::Library)> {
-    for candidate in hip_library_candidates() {
-        if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
-            debug!(path = %candidate.display(), "loaded HIP runtime library");
-            return Some((candidate, lib));
+/// Loads the HIP runtime under the secure loading policy, reporting exactly why it failed
+/// (not installed vs. untrusted location vs. OS load failure).
+pub fn load_hip_library_checked() -> Result<forge_core::LoadedLibrary, forge_core::LibraryLoadError>
+{
+    let candidates = hip_library_candidates();
+    #[cfg(windows)]
+    let loaded = forge_core::load_vendor_library("amdhip64", &candidates)?;
+    #[cfg(not(windows))]
+    let loaded = {
+        let mut last = None;
+        let mut found = None;
+        for c in &candidates {
+            match forge_core::load_system_library(&c.to_string_lossy()) {
+                Ok(l) => {
+                    found = Some(l);
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
         }
-    }
-    None
+        found.ok_or_else(|| {
+            last.unwrap_or(forge_core::LibraryLoadError::NotFound {
+                name: "libamdhip64".to_string(),
+                searched: Vec::new(),
+            })
+        })?
+    };
+    debug!(path = %loaded.path.display(), "loaded HIP runtime library");
+    Ok(loaded)
+}
+
+/// Compatibility wrapper around [`load_hip_library_checked`] that discards the failure reason.
+pub fn load_hip_library() -> Option<(PathBuf, libloading::Library)> {
+    load_hip_library_checked().ok().map(|l| (l.path, l.library))
 }
 
 /// Probes the installed AMD HIP driver/runtime without requiring a full ROCm SDK install.
 pub fn probe_hip() -> HipProbeReport {
-    let Some((lib_path, lib)) = load_hip_library() else {
-        return HipProbeReport {
-            available: false,
-            loaded_library: None,
-            runtime_version: None,
-            driver_version: None,
-            devices: Vec::new(),
-            error: Some("amdhip64_7.dll / amdhip64_6.dll / amdhip64.dll not found".to_string()),
-        };
+    let (lib_path, lib) = match load_hip_library_checked() {
+        Ok(l) => (l.path, l.library),
+        Err(err) => {
+            return HipProbeReport {
+                available: false,
+                loaded_library: None,
+                runtime_version: None,
+                driver_version: None,
+                devices: Vec::new(),
+                error: Some(format!("HIP runtime unavailable: {err}")),
+            };
+        }
     };
 
     unsafe {

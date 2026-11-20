@@ -137,27 +137,31 @@ pub fn detect_system_info() -> SystemInfo {
         wReserved: u8,
     }
 
-    let (major, minor, build) = unsafe {
+    // `None` when RtlGetVersion is unavailable: the version is reported as unknown rather than
+    // invented.
+    let version: Option<(u32, u32, u32)> = unsafe {
         let mut info: OsVersionInfoExW = zeroed();
         info.dwOSVersionInfoSize = size_of::<OsVersionInfoExW>() as u32;
-        if let Ok(ntdll) = libloading::Library::new("ntdll.dll") {
-            if let Ok(rtl_get_version) = ntdll
+        match forge_core::load_system_library("ntdll.dll") {
+            Ok(loaded) => loaded
+                .library
                 .get::<unsafe extern "system" fn(*mut OsVersionInfoExW) -> i32>(b"RtlGetVersion\0")
-            {
-                if rtl_get_version(&mut info) == 0 {
-                    (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber)
-                } else {
-                    (10, 0, 0)
-                }
-            } else {
-                (10, 0, 0)
-            }
-        } else {
-            (10, 0, 0)
+                .ok()
+                .and_then(|rtl_get_version| {
+                    (rtl_get_version(&mut info) == 0).then_some((
+                        info.dwMajorVersion,
+                        info.dwMinorVersion,
+                        info.dwBuildNumber,
+                    ))
+                }),
+            Err(_) => None,
         }
     };
+    let (major, minor, build) = version.unwrap_or((0, 0, 0));
 
-    let os_name = if major == 10 && build >= 22000 {
+    let os_name = if version.is_none() {
+        "Windows (version unknown)".to_string()
+    } else if major == 10 && build >= 22000 {
         "Windows 11".to_string()
     } else if major == 10 {
         "Windows 10".to_string()
@@ -167,7 +171,11 @@ pub fn detect_system_info() -> SystemInfo {
         format!("Windows {major}.{minor}")
     };
 
-    let os_version = format!("{major}.{minor}.{build}");
+    let os_version = if version.is_some() {
+        format!("{major}.{minor}.{build}")
+    } else {
+        "unknown".to_string()
+    };
 
     let cpu_name = unsafe {
         let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\0"

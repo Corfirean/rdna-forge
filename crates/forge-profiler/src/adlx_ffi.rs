@@ -275,12 +275,9 @@ mod imp {
                 ForgeError::ExecutionFailed("ADLX lifecycle mutex poisoned".to_string())
             })?;
 
-            let lib = unsafe { libloading::Library::new("amdadlx64.dll") }.map_err(|e| {
-                ForgeError::RuntimeUnavailable {
-                    runtime: "ADLX".to_string(),
-                    reason: format!("amdadlx64.dll unavailable: {e}"),
-                }
-            })?;
+            let lib = forge_core::load_system_library("amdadlx64.dll")
+                .map_err(|e| e.into_forge_error("ADLX"))?
+                .library;
 
             let (full_ver, init_fn, terminate_fn) = unsafe {
                 let qfv = *lib
