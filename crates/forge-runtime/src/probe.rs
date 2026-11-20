@@ -308,9 +308,21 @@ fn probe_triton_python(
     python_override: Option<&Path>,
     primary_arch: Option<GpuArchitecture>,
 ) -> BackendStatus {
-    let python_cmd = python_override
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "python".to_string());
+    // Resolve through the shared validator: explicit paths must be files, bare names come from PATH
+    // only. The path is kept as a `Path` (not stringified) so non-Unicode paths survive.
+    let requested = python_override.unwrap_or_else(|| Path::new("python"));
+    let python_cmd = match forge_core::resolve_python_executable(requested) {
+        Ok(p) => p,
+        Err(e) => {
+            return BackendStatus {
+                kind: BackendKind::Triton,
+                status: SupportStatus::Unsupported,
+                version: None,
+                summary: format!("Python interpreter unavailable: {e}"),
+                details: Vec::new(),
+            };
+        }
+    };
 
     const PROBE_SCRIPT: &str = r#"
 import importlib.metadata, json, sys
@@ -363,7 +375,10 @@ print(json.dumps(out))
             kind: BackendKind::Triton,
             status: SupportStatus::Unsupported,
             version: None,
-            summary: format!("Python executable '{python_cmd}' not found"),
+            summary: format!(
+                "Python executable '{}' could not be launched",
+                python_cmd.display()
+            ),
             details: Vec::new(),
         };
     };

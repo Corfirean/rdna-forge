@@ -1,5 +1,6 @@
 pub mod architecture;
 pub mod error;
+pub mod exec;
 pub mod loader;
 pub mod policy;
 pub mod profile;
@@ -10,6 +11,7 @@ pub use architecture::{
     AMD_PCI_VENDOR_ID,
 };
 pub use error::{ForgeError, ForgeResult};
+pub use exec::{resolve_python_executable, InterpreterError};
 pub use loader::{
     load_system_library, load_vendor_library, trusted_runtime_roots, LibraryLoadError,
     LoadedLibrary,

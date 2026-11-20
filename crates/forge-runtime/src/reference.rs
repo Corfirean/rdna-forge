@@ -741,11 +741,12 @@ pub fn pack_q4_k_block(
         scale_bytes[j + 8] = (sc_hi & 0x0F) | ((m_hi & 0x0F) << 4);
     }
 
-    for (dst, chunk) in words[1..4].iter_mut().zip(scale_bytes.chunks_exact(4)) {
-        *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    // 12 and 128 are exact multiples of 4, so the (empty) remainder of `as_chunks` is irrelevant.
+    for (dst, chunk) in words[1..4].iter_mut().zip(scale_bytes.as_chunks::<4>().0) {
+        *dst = u32::from_le_bytes(*chunk);
     }
-    for (dst, chunk) in words[4..36].iter_mut().zip(qs.chunks_exact(4)) {
-        *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (dst, chunk) in words[4..36].iter_mut().zip(qs.as_chunks::<4>().0) {
+        *dst = u32::from_le_bytes(*chunk);
     }
     words
 }

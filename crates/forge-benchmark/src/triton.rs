@@ -101,8 +101,17 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
         )));
     }
 
+    // Validate and resolve the interpreter up front: a clear error instead of a failed launch, and
+    // bare names are searched on PATH only (never the application directory).
+    let python_exe = forge_core::resolve_python_executable(&config.python_exe).map_err(|e| {
+        ForgeError::RuntimeUnavailable {
+            runtime: "Python/Triton".to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+
     let run_cmd = || {
-        let mut cmd = Command::new(&config.python_exe);
+        let mut cmd = Command::new(&python_exe);
         cmd.arg(&config.script_path);
         if config.smoke {
             cmd.arg("--smoke");
@@ -123,7 +132,7 @@ pub fn run_triton_suite(config: &TritonBenchConfig) -> ForgeResult<TritonSuiteRe
     };
     let output = output_res.map_err(|e| ForgeError::RuntimeUnavailable {
         runtime: "Python/Triton".to_string(),
-        reason: format!("failed to launch '{}': {e}", config.python_exe.display()),
+        reason: format!("failed to launch '{}': {e}", python_exe.display()),
     })?;
 
     if !output.status.success() {
