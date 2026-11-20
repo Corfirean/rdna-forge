@@ -4,7 +4,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use forge_core::{ForgeError, ForgeResult};
+use forge_core::{match_profile_for_device, ForgeError, ForgeResult, GpuArchitecture};
 use forge_device::discover_all;
 use forge_profiler::snapshot_all_gpus;
 use serde::{Deserialize, Serialize};
@@ -125,12 +125,28 @@ pub struct LlmTweakProfile {
     pub llama_server_cmd: String,
 }
 
-/// Complete static analysis, VRAM anti-spill budget, and RDNA2 tweak recommendations for a GGUF model.
+/// Complete static analysis, VRAM anti-spill budget, and hardware-aware tweak recommendations for a GGUF model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmOptimizationPlan {
     pub model: GgufModelMetadata,
+    #[serde(default)]
+    pub gpu_index: usize,
     pub gpu_name: String,
     pub gfx_target: String,
+    #[serde(default)]
+    pub gpu_architecture: String,
+    #[serde(default)]
+    pub matched_profile_id: Option<String>,
+    #[serde(default)]
+    pub matched_profile_name: Option<String>,
+    #[serde(default)]
+    pub vk_visible_device: usize,
+    #[serde(default)]
+    pub hip_visible_device: usize,
+    #[serde(default)]
+    pub disabled_gpu_indices: Vec<usize>,
+    #[serde(default)]
+    pub is_apu_unified_memory: bool,
     pub has_secondary_igpu: bool,
     pub secondary_igpu_name: Option<String>,
     pub physical_cpu_cores: u32,
@@ -144,6 +160,26 @@ pub struct LlmOptimizationPlan {
     pub kv_budgets: Vec<KvCacheMemoryBudget>,
     pub recommended_profiles: Vec<LlmTweakProfile>,
     pub lm_studio_tips: Vec<String>,
+}
+
+/// Target GPU properties supplied to the pure multi-GPU LLM planner.
+#[derive(Debug, Clone)]
+pub struct LlmTargetGpuContext {
+    pub gpu_index: usize,
+    pub gpu_name: String,
+    pub gfx_target: String,
+    pub architecture: GpuArchitecture,
+    pub discrete: bool,
+    pub matched_profile_id: Option<String>,
+    pub matched_profile_name: Option<String>,
+    pub vk_visible_device: usize,
+    pub hip_visible_device: usize,
+    pub disabled_gpu_indices: Vec<usize>,
+    pub secondary_igpu_name: Option<String>,
+    pub physical_cpu_cores: u32,
+    pub total_ram_mib: u64,
+    pub total_vram_mib: u64,
+    pub used_vram_mib: u64,
 }
 
 /// Auto-discovered local GGUF models and `llama.cpp` binaries on the host system.
@@ -161,6 +197,8 @@ pub struct LocalLlmAssets {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmAutotuneConfig {
     pub model_path: PathBuf,
+    #[serde(default)]
+    pub device_index: Option<usize>,
     pub vulkan_bin: Option<PathBuf>,
     pub hip_bin: Option<PathBuf>,
     pub rocm_lib_dir: Option<PathBuf>,
@@ -232,6 +270,8 @@ pub struct EnvVarChange {
     pub key: String,
     pub previous_value: Option<String>,
     pub new_value: String,
+    #[serde(default)]
+    pub purpose: String,
 }
 
 /// Result of previewing (`dry_run = true`) or applying (`dry_run = false`) Windows & Ollama RDNA2 environment tweaks and `Modelfile`.
@@ -742,52 +782,238 @@ fn collect_gguf_files(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<
     }
 }
 
-/// Builds a hardware-aware anti-WDDM-spill memory plan and RDNA2 tweak matrix for `model`.
+fn gpu_names_roughly_match(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.to_ascii_lowercase()
+            .replace("(tm)", "")
+            .replace("(r)", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let na = norm(a);
+    let nb = norm(b);
+    !na.is_empty() && !nb.is_empty() && (na == nb || na.contains(&nb) || nb.contains(&na))
+}
+
+fn resolve_vulkan_visible_index(
+    primary_gpu: &forge_core::GpuDeviceInfo,
+    vulkan_devices: &[forge_device::VulkanDeviceProbe],
+) -> usize {
+    if let Some(ref pci) = primary_gpu.pci_bus_id {
+        if let Some(found) = vulkan_devices
+            .iter()
+            .find(|v| v.pci_bus_id.as_deref() == Some(pci.as_str()))
+        {
+            return found.index;
+        }
+    }
+    if let Some(found) = vulkan_devices.iter().find(|v| {
+        v.vendor_id == primary_gpu.vendor_id
+            && v.device_id == primary_gpu.device_id
+            && v.discrete == primary_gpu.discrete
+            && v.name == primary_gpu.name
+    }) {
+        return found.index;
+    }
+    vulkan_devices
+        .iter()
+        .find(|v| {
+            v.vendor_id == primary_gpu.vendor_id
+                && v.device_id == primary_gpu.device_id
+                && v.discrete == primary_gpu.discrete
+        })
+        .map(|v| v.index)
+        .unwrap_or(0)
+}
+
+fn resolve_hip_visible_index(
+    primary_gpu: &forge_core::GpuDeviceInfo,
+    hip_devices: &[forge_device::HipDeviceProbe],
+) -> usize {
+    if let Some(ref pci) = primary_gpu.pci_bus_id {
+        if let Some(found) = hip_devices
+            .iter()
+            .find(|h| h.pci_bus_id.as_deref() == Some(pci.as_str()))
+        {
+            return found.hip_index.max(0) as usize;
+        }
+    }
+    if let Some(found) = hip_devices.iter().find(|h| {
+        gpu_names_roughly_match(&primary_gpu.name, &h.name)
+            && h.integrated
+                .map(|int| int != primary_gpu.discrete)
+                .unwrap_or(true)
+    }) {
+        return found.hip_index.max(0) as usize;
+    }
+    hip_devices
+        .iter()
+        .find(|h| gpu_names_roughly_match(&primary_gpu.name, &h.name))
+        .map(|h| h.hip_index.max(0) as usize)
+        .unwrap_or(0)
+}
+
+/// Builds a hardware-aware anti-WDDM-spill memory plan and architecture tweak matrix
+/// for the primary (discrete preferred) GPU.
 pub fn plan_llm_configuration(
     model: &GgufModelMetadata,
     target_context_tokens: u32,
     safety_margin_mib: u64,
 ) -> ForgeResult<LlmOptimizationPlan> {
-    let target_ctx = target_context_tokens.clamp(512, 262_144);
+    plan_llm_configuration_for_device(model, None, target_context_tokens, safety_margin_mib)
+}
+
+/// Builds a hardware-aware anti-WDDM-spill memory plan and architecture tweak matrix
+/// for the discovered GPU at `device_index` (or primary GPU when `None`).
+pub fn plan_llm_configuration_for_device(
+    model: &GgufModelMetadata,
+    device_index: Option<usize>,
+    target_context_tokens: u32,
+    safety_margin_mib: u64,
+) -> ForgeResult<LlmOptimizationPlan> {
     let snapshot = discover_all();
-    let primary_gpu = snapshot
+    let primary_gpu = match device_index {
+        Some(idx) => snapshot.gpus.get(idx).ok_or_else(|| {
+            ForgeError::DeviceNotFound(format!("GPU device index {idx} not found"))
+        })?,
+        None => snapshot
+            .gpus
+            .iter()
+            .find(|g| g.discrete)
+            .or_else(|| snapshot.gpus.first())
+            .ok_or_else(|| ForgeError::DeviceNotFound("no GPU devices discovered".to_string()))?,
+    };
+
+    let matched = match_profile_for_device(primary_gpu);
+    let gpu_name = primary_gpu.name.clone();
+    let gfx_target = primary_gpu
+        .gfx_target
+        .as_ref()
+        .map(|t| t.base.clone())
+        .or_else(|| {
+            matched
+                .as_ref()
+                .map(|m| m.profile.device.gfx_target.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let vk_visible_device = resolve_vulkan_visible_index(primary_gpu, &snapshot.vulkan.devices);
+    let hip_visible_device = resolve_hip_visible_index(primary_gpu, &snapshot.hip.devices);
+    let disabled_gpu_indices: Vec<usize> = snapshot
+        .vulkan
+        .devices
+        .iter()
+        .filter(|v| v.index != vk_visible_device)
+        .map(|v| v.index)
+        .collect();
+
+    let secondary_igpu = snapshot
         .gpus
         .iter()
-        .find(|g| g.discrete)
-        .or_else(|| snapshot.gpus.first());
-
-    let gpu_name = primary_gpu
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| "AMD Radeon GPU".to_string());
-    let gfx_target = primary_gpu
-        .and_then(|g| g.gfx_target.as_ref().map(|t| t.base.clone()))
-        .unwrap_or_else(|| "gfx1030".to_string());
-    let secondary_igpu = snapshot.gpus.iter().find(|g| !g.discrete);
-    let has_secondary_igpu = secondary_igpu.is_some();
+        .find(|g| g.index != primary_gpu.index && !g.discrete);
     let secondary_igpu_name = secondary_igpu.map(|g| g.name.clone());
 
     let logical_cores = snapshot.system.logical_cores;
-    let physical_cpu_cores = (logical_cores / 2).clamp(4, 16) as u32;
+    let physical_cpu_cores = (logical_cores / 2).clamp(4, 32) as u32;
+    let total_ram_mib = snapshot.system.total_ram_bytes / (1024 * 1024);
 
     let telemetry = snapshot_all_gpus().ok().unwrap_or_default();
     let active_tel = telemetry
         .iter()
-        .find(|s| s.discrete)
+        .find(|s| s.pci_device_id == Some(primary_gpu.device_id))
+        .or_else(|| {
+            telemetry
+                .iter()
+                .find(|s| s.discrete == primary_gpu.discrete)
+        })
         .or_else(|| telemetry.first());
 
     let total_vram_mib: u64 = active_tel
         .and_then(|s| s.total_vram_mib.map(u64::from))
-        .or_else(|| primary_gpu.map(|g| g.vram_bytes / (1024 * 1024)))
-        .unwrap_or(16_368);
+        .or_else(|| (primary_gpu.vram_bytes > 0).then_some(primary_gpu.vram_bytes / (1024 * 1024)))
+        .or_else(|| {
+            matched
+                .as_ref()
+                .map(|m| m.profile.memory.vram_bytes / (1024 * 1024))
+        })
+        .unwrap_or(8_192);
     let used_vram_mib: u64 = active_tel
         .and_then(|s| s.vram_used_mib.map(|v| v.max(0) as u64))
-        .unwrap_or(2_048)
+        .unwrap_or(1_024)
         .min(total_vram_mib);
-    let free_vram_mib: u64 = total_vram_mib.saturating_sub(used_vram_mib);
+
+    let ctx = LlmTargetGpuContext {
+        gpu_index: primary_gpu.index,
+        gpu_name,
+        gfx_target,
+        architecture: primary_gpu.architecture,
+        discrete: primary_gpu.discrete,
+        matched_profile_id: matched.as_ref().map(|m| m.id.clone()),
+        matched_profile_name: matched.as_ref().map(|m| m.profile.device.name.clone()),
+        vk_visible_device,
+        hip_visible_device,
+        disabled_gpu_indices,
+        secondary_igpu_name,
+        physical_cpu_cores,
+        total_ram_mib,
+        total_vram_mib,
+        used_vram_mib,
+    };
+
+    Ok(plan_llm_configuration_for_gpu(
+        model,
+        &ctx,
+        target_context_tokens,
+        safety_margin_mib,
+    ))
+}
+
+/// Pure multi-GPU LLM memory & launch planner over an explicit `LlmTargetGpuContext`.
+pub fn plan_llm_configuration_for_gpu(
+    model: &GgufModelMetadata,
+    ctx: &LlmTargetGpuContext,
+    target_context_tokens: u32,
+    safety_margin_mib: u64,
+) -> LlmOptimizationPlan {
+    let target_ctx = target_context_tokens.clamp(512, 262_144);
+    let is_apu_unified_memory = !ctx.discrete;
+
+    let mut warnings = Vec::new();
+    let (total_vram_mib, apu_small_carveout_scaled) =
+        if is_apu_unified_memory && ctx.total_vram_mib < 2_048 && ctx.total_ram_mib >= 8_192 {
+            ((ctx.total_ram_mib / 2).max(ctx.total_vram_mib), true)
+        } else {
+            (ctx.total_vram_mib, false)
+        };
+    let used_vram_mib = ctx.used_vram_mib.min(total_vram_mib);
+    let free_vram_mib = total_vram_mib.saturating_sub(used_vram_mib);
+
+    if apu_small_carveout_scaled {
+        warnings.push(format!(
+            "Integrated APU ({}) reports {} MiB dedicated UMA carveout out of {} MiB system RAM. Windows WDDM allocates shared system RAM dynamically (~{} MiB usable half-RAM ceiling). On RDNA3.5 / Strix Halo APUs, increase UMA Frame Buffer Size in BIOS or Adrenalin Variable Graphics Memory (VGM) for optimal ROCm/Vulkan stability with large models.",
+            ctx.gpu_name, ctx.total_vram_mib, ctx.total_ram_mib, total_vram_mib
+        ));
+    }
 
     let model_weights_mib = model.file_size_bytes.div_ceil(1024 * 1024);
     let mib_per_layer = (model_weights_mib as f64 / f64::from(model.block_count.max(1))).max(1.0);
-    let compute_scratch_mib = 384u64;
+    let compute_scratch_mib = if model.embedding_length <= 4096 && target_ctx <= 8192 {
+        256u64
+    } else if model.embedding_length >= 6144 || target_ctx >= 32_768 {
+        512u64
+    } else {
+        384u64
+    };
+
+    let baseline_os_vram_mib = (if total_vram_mib <= 8_192 {
+        768u64
+    } else if total_vram_mib <= 12_288 {
+        950u64
+    } else {
+        1_150u64
+    })
+    .min(total_vram_mib / 4);
 
     let mut kv_budgets = Vec::with_capacity(3);
     for kv_q in [KvCacheQuant::F16, KvCacheQuant::Q8_0, KvCacheQuant::Q4_0] {
@@ -799,8 +1025,10 @@ pub fn plan_llm_configuration(
         let fits_in_free_vram = total_required_mib <= usable_free_mib;
 
         // With GGML_VK_ENABLE_MEMORY_PRIORITY=1 (VK_EXT_memory_priority), Windows WDDM VidMm
-        // can page out non-pinned background app VRAM down to ~1100 MiB OS baseline.
-        let priority_budget_mib = total_vram_mib.saturating_sub(1_150 + safety_margin_mib / 2);
+        // can page out non-pinned background app VRAM down to OS baseline.
+        let priority_budget_mib = total_vram_mib
+            .saturating_sub(baseline_os_vram_mib + safety_margin_mib / 2)
+            .max(usable_free_mib);
         let fits_with_wddm_memory_priority = total_required_mib <= priority_budget_mib;
 
         let budget_for_weights_strict =
@@ -816,7 +1044,7 @@ pub fn plan_llm_configuration(
 
         // For MoE models (expert_count > 1), routed expert FFN tensors account for ~84% of each
         // layer's size while attention + shared tensors take ~16%. Offloading `-ncmoe N` layers
-        // keeps `-ngl 99` (all attention layers + KV cache on GPU) and moves only N layers' experts to DDR5.
+        // keeps `-ngl 99` (all attention layers + KV cache on GPU) and moves only N layers' experts to system RAM.
         let recommended_n_cpu_moe = if model.is_moe && total_required_mib > usable_free_mib {
             let overflow_mib = (total_required_mib - usable_free_mib) as f64;
             let expert_mib_per_layer = (mib_per_layer * 0.84).max(1.0);
@@ -841,12 +1069,10 @@ pub fn plan_llm_configuration(
         });
     }
 
-    let baseline_os_vram_mib = 1_150u64;
     let reclaimable_vram_mib = used_vram_mib.saturating_sub(baseline_os_vram_mib);
     let recoverable_layers_if_apps_closed =
         ((reclaimable_vram_mib as f64 / mib_per_layer).floor() as u32).min(model.block_count);
 
-    let mut warnings = Vec::new();
     if model.declared_context_length > 16_384 {
         warnings.push(format!(
             "Model metadata declares a default context of {} tokens ({}K). Loading without an explicit context cap (-c {}) will over-allocate VRAM and spill into system RAM.",
@@ -855,18 +1081,25 @@ pub fn plan_llm_configuration(
             target_ctx
         ));
     }
-    if has_secondary_igpu {
+    if let Some(ref igpu_name) = ctx.secondary_igpu_name {
         warnings.push(format!(
-            "Secondary integrated GPU ({}) detected. On Windows ROCm, this iGPU reports ~12 GiB of shared DDR5 RAM as 'VRAM', causing llama.cpp's default '-sm layer' to split layers onto the slow iGPU unless HIP_VISIBLE_DEVICES=0 / GGML_VK_VISIBLE_DEVICES=0 and '-sm none' are set.",
-            secondary_igpu_name.as_deref().unwrap_or("Radeon iGPU")
+            "Secondary integrated GPU ({igpu_name}) detected. On Windows ROCm/Vulkan, this iGPU exposes shared system RAM as 'VRAM', causing llama.cpp's default '-sm layer' to split layers onto the slow iGPU unless GGML_VK_VISIBLE_DEVICES={} / HIP_VISIBLE_DEVICES={} and '-sm none' are set.",
+            ctx.vk_visible_device, ctx.hip_visible_device
+        ));
+    }
+    if ctx.architecture == GpuArchitecture::Rdna1 {
+        warnings.push(format!(
+            "{} uses RDNA1 ({}), where ROCm/HIP lacks official Windows support and hardware INT8 DP4A instructions are unavailable. Use the Vulkan backend.",
+            ctx.gpu_name, ctx.gfx_target
         ));
     }
     if !kv_budgets[0].fits_in_free_vram {
         warnings.push(format!(
-            "Model weights ({} MiB) + KV/scratch ({} MiB) = {} MiB exceed currently free physical VRAM ({} MiB; {} MiB currently occupied by Windows/apps). Enable GGML_VK_ENABLE_MEMORY_PRIORITY=1 and/or quantized KV cache (-ctk q4_0 -ctv q4_0) or cap -ngl to {} to prevent WDDM PCIe thrashing.",
+            "Model weights ({} MiB) + KV/scratch ({} MiB) = {} MiB exceed currently free {} VRAM ({} MiB; {} MiB currently occupied by Windows/apps). Enable GGML_VK_ENABLE_MEMORY_PRIORITY=1 and/or quantized KV cache (-ctk q4_0 -ctv q4_0) or cap -ngl to {} to prevent WDDM PCIe thrashing.",
             model_weights_mib,
             kv_budgets[0].kv_and_state_mib + compute_scratch_mib,
             kv_budgets[0].total_required_mib,
+            if is_apu_unified_memory { "unified" } else { "physical" },
             free_vram_mib,
             used_vram_mib,
             kv_budgets[0].strict_zero_spill_ngl
@@ -874,8 +1107,14 @@ pub fn plan_llm_configuration(
     }
 
     let is_hybrid_ssm = model.full_attention_interval.unwrap_or(1) > 1;
-    let q4_budget = &kv_budgets[2];
+    let physical_cpu_cores = ctx.physical_cpu_cores.clamp(1, 128);
+    let vk_dev_str = ctx.vk_visible_device.to_string();
+    let hip_dev_str = ctx.hip_visible_device.to_string();
+    let arch_label = ctx.architecture.to_string();
+
     let f16_budget = &kv_budgets[0];
+    let q8_budget = &kv_budgets[1];
+    let q4_budget = &kv_budgets[2];
     let vk_prio_ngl = if f16_budget.fits_with_wddm_memory_priority {
         99
     } else {
@@ -886,17 +1125,36 @@ pub fn plan_llm_configuration(
     } else {
         q4_budget.memory_priority_ngl
     };
-    let rocm_q4_ngl = if q4_budget.fits_in_free_vram {
-        99
-    } else {
-        q4_budget
-            .strict_zero_spill_ngl
-            .max(q4_budget.memory_priority_ngl.saturating_sub(2))
-    };
 
     let mut recommended_profiles = Vec::new();
 
-    // Profile 1: Vulkan WDDM High-Priority Interactive (Verified fastest on Qwen3.8-27B up to 2K-3K context)
+    // Profile 1: Vulkan WDDM High-Priority Interactive
+    let vk_prio_fa = match ctx.architecture {
+        GpuArchitecture::Rdna1 | GpuArchitecture::Rdna2 => !is_hybrid_ssm,
+        _ => !is_hybrid_ssm,
+    };
+    let vk_prio_rationale = if is_hybrid_ssm
+        && matches!(
+            ctx.architecture,
+            GpuArchitecture::Rdna1 | GpuArchitecture::Rdna2
+        ) {
+        if ctx.architecture == GpuArchitecture::Rdna2 {
+            format!(
+                "Activates VK_EXT_memory_priority (1.0) so Windows WDDM keeps weights resident in {} ({}) VRAM, pins Vulkan device {}, and disables Vulkan FlashAttention (-fa off) which suffers a severe prefill slowdown at depth on hybrid qwen35 layers. Verified on RX 6900 XT (RDNA2) + Qwen3.8-27B: 343.2 tok/s prefill (+108%) and 26.81 tok/s generation (+63%) at 2048 context.",
+                ctx.gpu_name, ctx.gfx_target, vk_dev_str
+            )
+        } else {
+            format!(
+                "Activates VK_EXT_memory_priority (1.0) on {} ({}), pins Vulkan device {}, and disables Vulkan FlashAttention (-fa off) for hybrid SSM/attention layers.",
+                ctx.gpu_name, ctx.gfx_target, vk_dev_str
+            )
+        }
+    } else {
+        format!(
+            "Activates VK_EXT_memory_priority (1.0) to prevent Windows WDDM from paging LLM weights out to system RAM and isolates execution strictly to {} ({}, Vulkan index {}).",
+            ctx.gpu_name, ctx.gfx_target, vk_dev_str
+        )
+    };
     recommended_profiles.push(LlmTweakProfile {
         id: "vulkan_wddm_priority".to_string(),
         title: "Vulkan WDDM High-Priority (Fastest Interactive Chat <= 2K-3K Context)".to_string(),
@@ -905,7 +1163,7 @@ pub fn plan_llm_configuration(
         n_gpu_layers: vk_prio_ngl,
         n_cpu_moe: 0,
         split_mode: "none".to_string(),
-        flash_attn: !is_hybrid_ssm,
+        flash_attn: vk_prio_fa,
         cache_type_k: "f16".to_string(),
         cache_type_v: "f16".to_string(),
         batch_size: 2048,
@@ -913,50 +1171,125 @@ pub fn plan_llm_configuration(
         threads: physical_cpu_cores,
         env_vars: vec![
             ("GGML_VK_ENABLE_MEMORY_PRIORITY".to_string(), "1".to_string()),
-            ("GGML_VK_VISIBLE_DEVICES".to_string(), "0".to_string()),
+            ("GGML_VK_VISIBLE_DEVICES".to_string(), vk_dev_str.clone()),
         ],
-        rationale: if is_hybrid_ssm {
-            "Activates VK_EXT_memory_priority (1.0) so Windows WDDM keeps all 27B weights resident in RX 6900 XT VRAM (evicting background desktop allocations first), hides the Ryzen iGPU, and disables Vulkan FlashAttention (-fa 0) which suffers a 15x prefill slowdown at depth on hybrid qwen35 layers. Verified on RX 6900 XT + Qwen3.8-27B: 343.2 tok/s prefill (+108%) and 26.81 tok/s generation (+63%) at 2048 context.".to_string()
-        } else {
-            "Activates VK_EXT_memory_priority (1.0) to prevent Windows WDDM from paging LLM weights out to system RAM and isolates execution strictly to the discrete RX 6900 XT.".to_string()
-        },
+        rationale: vk_prio_rationale,
         llama_server_cmd: format!(
-            "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"0\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev Vulkan0 -sm none -mg 0 -fa {} -ctk f16 -ctv f16 -b 2048 -ub 512 -t {}",
+            "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"{}\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev Vulkan0 -sm none -mg 0 -fa {} -ctk f16 -ctv f16 -b 2048 -ub 512 -t {}",
+            vk_dev_str,
             model.file_path,
             target_ctx,
             vk_prio_ngl,
-            if is_hybrid_ssm { "off" } else { "on" },
+            if vk_prio_fa { "on" } else { "off" },
             physical_cpu_cores
         ),
     });
 
-    // Profile 2: ROCm/HIP Long-Context & Heavy Prompt Ingestion (q4_0 KV Cache + FlashAttention)
-    recommended_profiles.push(LlmTweakProfile {
-        id: "rocm_q4_kv_long_ctx".to_string(),
-        title: "ROCm / HIP FlashAttention + Q4_0 KV Cache (Fastest Prefill & 4K-16K Context)".to_string(),
-        backend: "hip".to_string(),
-        device_selector: "ROCm0".to_string(),
-        n_gpu_layers: rocm_q4_ngl,
-        n_cpu_moe: 0,
-        split_mode: "none".to_string(),
-        flash_attn: true,
-        cache_type_k: "q4_0".to_string(),
-        cache_type_v: "q4_0".to_string(),
-        batch_size: 2048,
-        ubatch_size: 512,
-        threads: physical_cpu_cores,
-        env_vars: vec![("HIP_VISIBLE_DEVICES".to_string(), "0".to_string())],
-        rationale: "Hides the Ryzen 7700X iGPU (which ROCm misreports as a 12.4 GiB GPU), enables native ROCm FlashAttention (-fa 1), and compresses the KV cache 3.5x (-ctk q4_0 -ctv q4_0). Verified on RX 6900 XT + Qwen3.8-27B: 522.6 tok/s initial prefill, 246.2 tok/s prefill at 4096 context (20.3x faster than Vulkan -fa 1), and 27.2 -> 22.1 -> 19.0 tok/s generation.".to_string(),
-        llama_server_cmd: format!(
-            "$env:HIP_VISIBLE_DEVICES=\"0\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev ROCm0 -sm none -mg 0 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 512 -t {}",
-            model.file_path, target_ctx, rocm_q4_ngl, physical_cpu_cores
-        ),
-    });
+    // Profile 2: ROCm/HIP (WMMA + hipBLASLt on RDNA3/3.5/4; standard ROCm on RDNA2; skipped on RDNA1)
+    if ctx.architecture != GpuArchitecture::Rdna1 {
+        if ctx.architecture.supports_hipblaslt() {
+            let use_q8 = q8_budget.fits_in_free_vram || q8_budget.fits_with_wddm_memory_priority;
+            let (rocm_kv_enum, rocm_budget) = if use_q8 {
+                (KvCacheQuant::Q8_0, q8_budget)
+            } else {
+                (KvCacheQuant::Q4_0, q4_budget)
+            };
+            let rocm_kv = rocm_kv_enum.as_cli_str();
+            let rocm_ngl = if rocm_budget.fits_in_free_vram {
+                99
+            } else {
+                rocm_budget
+                    .strict_zero_spill_ngl
+                    .max(rocm_budget.memory_priority_ngl.saturating_sub(2))
+            };
+            recommended_profiles.push(LlmTweakProfile {
+                id: "rocm_wmma_hipblaslt".to_string(),
+                title: format!(
+                    "ROCm / HIP WMMA + hipBLASLt + FlashAttention (Fastest Prefill on {arch_label})"
+                ),
+                backend: "hip".to_string(),
+                device_selector: "ROCm0".to_string(),
+                n_gpu_layers: rocm_ngl,
+                n_cpu_moe: 0,
+                split_mode: "none".to_string(),
+                flash_attn: true,
+                cache_type_k: rocm_kv.to_string(),
+                cache_type_v: rocm_kv.to_string(),
+                batch_size: 2048,
+                ubatch_size: 512,
+                threads: physical_cpu_cores,
+                env_vars: vec![
+                    ("HIP_VISIBLE_DEVICES".to_string(), hip_dev_str.clone()),
+                    ("ROCBLAS_USE_HIPBLASLT".to_string(), "1".to_string()),
+                ],
+                rationale: format!(
+                    "Isolates HIP device {hip_dev_str} ({} / {}), enables ROCBLAS_USE_HIPBLASLT=1 for {arch_label} matrix-core paths alongside native rocWMMA FlashAttention (-fa on), and uses {rocm_kv} KV cache quantization to maximize prefill speed and context capacity.",
+                    ctx.gpu_name, ctx.gfx_target
+                ),
+                llama_server_cmd: format!(
+                    "$env:HIP_VISIBLE_DEVICES=\"{}\"; $env:ROCBLAS_USE_HIPBLASLT=\"1\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev ROCm0 -sm none -mg 0 -fa on -ctk {} -ctv {} -b 2048 -ub 512 -t {}",
+                    hip_dev_str, model.file_path, target_ctx, rocm_ngl, rocm_kv, rocm_kv, physical_cpu_cores
+                ),
+            });
+        } else {
+            let rocm_q4_ngl = if q4_budget.fits_in_free_vram {
+                99
+            } else {
+                q4_budget
+                    .strict_zero_spill_ngl
+                    .max(q4_budget.memory_priority_ngl.saturating_sub(2))
+            };
+            let rocm_rationale = if ctx.architecture == GpuArchitecture::Rdna2 {
+                format!(
+                    "Pins HIP execution to {} ({}) via HIP_VISIBLE_DEVICES={} (preventing any integrated GPU shared-RAM layer split), enables native ROCm FlashAttention (-fa on), and compresses the KV cache 3.5x (-ctk q4_0 -ctv q4_0). Verified on RX 6900 XT (RDNA2) + Qwen3.8-27B: 522.6 tok/s initial prefill and 246.2 tok/s prefill at 4096 context (20.3x faster than Vulkan -fa 1).",
+                    ctx.gpu_name, ctx.gfx_target, hip_dev_str
+                )
+            } else {
+                format!(
+                    "Pins HIP execution to {} ({}) via HIP_VISIBLE_DEVICES={}, enables native ROCm FlashAttention (-fa on), and uses Q4_0 KV cache quantization (-ctk q4_0 -ctv q4_0) to fit 4K-16K context cleanly.",
+                    ctx.gpu_name, ctx.gfx_target, hip_dev_str
+                )
+            };
+            recommended_profiles.push(LlmTweakProfile {
+                id: "rocm_q4_kv_long_ctx".to_string(),
+                title: "ROCm / HIP FlashAttention + Q4_0 KV Cache (Fastest Prefill & 4K-16K Context)".to_string(),
+                backend: "hip".to_string(),
+                device_selector: "ROCm0".to_string(),
+                n_gpu_layers: rocm_q4_ngl,
+                n_cpu_moe: 0,
+                split_mode: "none".to_string(),
+                flash_attn: true,
+                cache_type_k: "q4_0".to_string(),
+                cache_type_v: "q4_0".to_string(),
+                batch_size: 2048,
+                ubatch_size: 512,
+                threads: physical_cpu_cores,
+                env_vars: vec![("HIP_VISIBLE_DEVICES".to_string(), hip_dev_str.clone())],
+                rationale: rocm_rationale,
+                llama_server_cmd: format!(
+                    "$env:HIP_VISIBLE_DEVICES=\"{}\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev ROCm0 -sm none -mg 0 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 512 -t {}",
+                    hip_dev_str, model.file_path, target_ctx, rocm_q4_ngl, physical_cpu_cores
+                ),
+            });
+        }
+    }
 
     // Profile 3: Vulkan Long-Context Decode with Q4_0 KV Cache
+    let vk_q4_rationale = if ctx.architecture == GpuArchitecture::Rdna2 {
+        format!(
+            "Combines VK_EXT_memory_priority with 4-bit KV cache quantization (-ctk q4_0 -ctv q4_0 -fa on) on {} ({}, Vulkan index {}) to keep 4K+ context inside VRAM. Verified on RX 6900 XT (RDNA2) + Qwen3.8-27B: sustains 25.63 tok/s token generation at 4096 context (+61% vs f16 KV).",
+            ctx.gpu_name, ctx.gfx_target, vk_dev_str
+        )
+    } else {
+        format!(
+            "Combines VK_EXT_memory_priority with 4-bit KV cache quantization (-ctk q4_0 -ctv q4_0 -fa on) on {} ({}, Vulkan index {}) to keep 4K+ context inside VRAM.",
+            ctx.gpu_name, ctx.gfx_target, vk_dev_str
+        )
+    };
     recommended_profiles.push(LlmTweakProfile {
         id: "vulkan_q4_kv_decode".to_string(),
-        title: "Vulkan WDDM Priority + Q4_0 KV Cache (Max Token Generation Speed at 4K+ Context)".to_string(),
+        title: "Vulkan WDDM Priority + Q4_0 KV Cache (Max Token Generation Speed at 4K+ Context)"
+            .to_string(),
         backend: "vulkan".to_string(),
         device_selector: "Vulkan0".to_string(),
         n_gpu_layers: vk_q4_ngl,
@@ -970,12 +1303,12 @@ pub fn plan_llm_configuration(
         threads: physical_cpu_cores,
         env_vars: vec![
             ("GGML_VK_ENABLE_MEMORY_PRIORITY".to_string(), "1".to_string()),
-            ("GGML_VK_VISIBLE_DEVICES".to_string(), "0".to_string()),
+            ("GGML_VK_VISIBLE_DEVICES".to_string(), vk_dev_str.clone()),
         ],
-        rationale: "Combines VK_EXT_memory_priority with 4-bit KV cache quantization (-ctk q4_0 -ctv q4_0 -fa 1) to keep 4K+ context entirely inside RX 6900 XT physical VRAM. Verified on RX 6900 XT + Qwen3.8-27B: sustains 25.63 tok/s token generation at 4096 context (+61% faster than f16 KV cache at 4K depth).".to_string(),
+        rationale: vk_q4_rationale,
         llama_server_cmd: format!(
-            "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"0\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev Vulkan0 -sm none -mg 0 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 512 -t {}",
-            model.file_path, target_ctx, vk_q4_ngl, physical_cpu_cores
+            "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"{}\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev Vulkan0 -sm none -mg 0 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 512 -t {}",
+            vk_dev_str, model.file_path, target_ctx, vk_q4_ngl, physical_cpu_cores
         ),
     });
 
@@ -985,7 +1318,7 @@ pub fn plan_llm_configuration(
         recommended_profiles.push(LlmTweakProfile {
             id: "moe_expert_offload".to_string(),
             title: format!(
-                "MoE Smart Expert Offload (100% Attention on GPU + -ncmoe {ncmoe} Experts on Ryzen DDR5)"
+                "MoE Smart Expert Offload (100% Attention on GPU + -ncmoe {ncmoe} Experts on Host RAM)"
             ),
             backend: "vulkan".to_string(),
             device_selector: "Vulkan0".to_string(),
@@ -1000,26 +1333,26 @@ pub fn plan_llm_configuration(
             threads: physical_cpu_cores,
             env_vars: vec![
                 ("GGML_VK_ENABLE_MEMORY_PRIORITY".to_string(), "1".to_string()),
-                ("GGML_VK_VISIBLE_DEVICES".to_string(), "0".to_string()),
+                ("GGML_VK_VISIBLE_DEVICES".to_string(), vk_dev_str.clone()),
             ],
             rationale: format!(
-                "MoE model detected ({:?} routed experts, {:?} active per token). Keeps -ngl 99 so 100% of attention layers and KV cache remain in fast RX 6900 XT VRAM while offloading {}/{} layers' sparse expert FFN blocks (-ncmoe {}) to Ryzen DDR5.",
-                model.expert_count, model.expert_used_count, ncmoe, model.block_count, ncmoe
+                "MoE model detected ({:?} routed experts, {:?} active per token). Keeps -ngl 99 so 100% of attention layers and KV cache remain in {} VRAM while offloading {}/{} layers' sparse expert FFN blocks (-ncmoe {}) to host RAM.",
+                model.expert_count, model.expert_used_count, ctx.gpu_name, ncmoe, model.block_count, ncmoe
             ),
             llama_server_cmd: format!(
-                "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"0\"; llama-server.exe -m \"{}\" -c {} -ngl 99 -ncmoe {} -dev Vulkan0 -sm none -mg 0 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 -t {}",
-                model.file_path, target_ctx, ncmoe, physical_cpu_cores
+                "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"{}\"; llama-server.exe -m \"{}\" -c {} -ngl 99 -ncmoe {} -dev Vulkan0 -sm none -mg 0 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 -t {}",
+                vk_dev_str, model.file_path, target_ctx, ncmoe, physical_cpu_cores
             ),
         });
     }
 
-    // Profile 4: Strict Zero-Spill Hybrid GPU+CPU Split (Guaranteed fit without evicting background apps)
+    // Profile 4: Strict Zero-Spill Hybrid GPU+CPU Split
     if f16_budget.strict_zero_spill_ngl < model.block_count {
-        let safe_ngl = kv_budgets[1].strict_zero_spill_ngl; // q8_0 strict fit
+        let safe_ngl = q8_budget.strict_zero_spill_ngl;
         recommended_profiles.push(LlmTweakProfile {
             id: "vulkan_strict_zero_spill".to_string(),
             title: format!(
-                "Strict Zero-Spill Hybrid ({}/{} GPU Layers + Ryzen {} Threads)",
+                "Strict Zero-Spill Hybrid ({}/{} GPU Layers + {} CPU Threads)",
                 safe_ngl, model.block_count, physical_cpu_cores
             ),
             backend: "vulkan".to_string(),
@@ -1035,42 +1368,74 @@ pub fn plan_llm_configuration(
             threads: physical_cpu_cores,
             env_vars: vec![
                 ("GGML_VK_ENABLE_MEMORY_PRIORITY".to_string(), "1".to_string()),
-                ("GGML_VK_VISIBLE_DEVICES".to_string(), "0".to_string()),
+                ("GGML_VK_VISIBLE_DEVICES".to_string(), vk_dev_str.clone()),
             ],
             rationale: format!(
-                "Caps GPU layers to exactly {}/{} ({} MiB safety margin) so the model fits strictly inside currently unallocated VRAM ({} MiB) while heavy background apps remain open.",
-                safe_ngl, model.block_count, safety_margin_mib, free_vram_mib
+                "Caps GPU layers to exactly {}/{} on {} ({} MiB safety margin) so the model fits strictly inside currently unallocated VRAM ({} MiB) while background apps remain open.",
+                safe_ngl, model.block_count, ctx.gpu_name, safety_margin_mib, free_vram_mib
             ),
             llama_server_cmd: format!(
-                "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"0\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev Vulkan0 -sm none -mg 0 -fa off -ctk q8_0 -ctv f16 -b 2048 -ub 512 -t {}",
-                model.file_path, target_ctx, safe_ngl, physical_cpu_cores
+                "$env:GGML_VK_ENABLE_MEMORY_PRIORITY=\"1\"; $env:GGML_VK_VISIBLE_DEVICES=\"{}\"; llama-server.exe -m \"{}\" -c {} -ngl {} -dev Vulkan0 -sm none -mg 0 -fa off -ctk q8_0 -ctv f16 -b 2048 -ub 512 -t {}",
+                vk_dev_str, model.file_path, target_ctx, safe_ngl, physical_cpu_cores
             ),
         });
     }
 
-    let lm_studio_tips = vec![
-        "1. Set Windows User Environment Variables: GGML_VK_ENABLE_MEMORY_PRIORITY=1, GGML_VK_VISIBLE_DEVICES=0, and HIP_VISIBLE_DEVICES=0 (LM Studio's llama.cpp 2.73.0 backend reads these directly, boosting WDDM VRAM residency priority and hiding the Ryzen 7700X iGPU).".to_string(),
-        format!(
-            "2. Context Length: Change from the GGUF metadata default ({} tokens) to 4096 or 8192 tokens so the KV cache does not overflow the remaining {} MiB of free physical VRAM.",
-            model.declared_context_length, free_vram_mib
-        ),
-        if is_hybrid_ssm {
-            "3. Flash Attention & KV Cache (qwen35 hybrid architecture): On the Vulkan backend at <= 3072 context, turn Flash Attention OFF (2.08x-15x faster prefill and 26.8 tok/s generation). For >= 4096 context, either switch to the ROCm backend with Flash Attention ON + K/V Cache Quantization = Q4_0 (246 tok/s prefill at 4K), or use Vulkan with Flash Attention ON + K/V Cache Quantization = Q4_0 (25.6 tok/s decode at 4K).".to_string()
+    let mut lm_studio_tips = vec![
+        if ctx.architecture.supports_hipblaslt() {
+            format!(
+                "1. Set Windows User Environment Variables: GGML_VK_ENABLE_MEMORY_PRIORITY=1, GGML_VK_VISIBLE_DEVICES={vk_dev_str}, HIP_VISIBLE_DEVICES={hip_dev_str}, and ROCBLAS_USE_HIPBLASLT=1 (enabling WDDM residency priority on Vulkan and WMMA/hipBLASLt paths on {arch_label} {}).",
+                ctx.gpu_name
+            )
+        } else if ctx.architecture == GpuArchitecture::Rdna1 {
+            format!(
+                "1. Set Windows User Environment Variables: GGML_VK_ENABLE_MEMORY_PRIORITY=1 and GGML_VK_VISIBLE_DEVICES={vk_dev_str}, and select the Vulkan llama.cpp runtime in LM Studio for {} ({}).",
+                ctx.gpu_name, ctx.gfx_target
+            )
         } else {
-            "3. Flash Attention & KV Cache: Enable Flash Attention and set K/V Cache Quantization to Q8_0 or Q4_0 to save 50%-72% of context VRAM.".to_string()
+            format!(
+                "1. Set Windows User Environment Variables: GGML_VK_ENABLE_MEMORY_PRIORITY=1, GGML_VK_VISIBLE_DEVICES={vk_dev_str}, and HIP_VISIBLE_DEVICES={hip_dev_str} (boosts Windows WDDM VRAM residency priority and pins execution to {}).",
+                ctx.gpu_name
+            )
         },
         format!(
-            "4. CPU Thread Count: Set CPU Threads to {} (matching physical Zen 4 cores rather than 16 SMT threads) and pin GPU Offload strictly to GPU 0 (AMD Radeon RX 6900 XT).",
-            physical_cpu_cores
+            "2. Context Length: Change from the GGUF metadata default ({} tokens) to 4096 or 8192 tokens so the KV cache does not overflow the remaining {} MiB of free {} VRAM.",
+            model.declared_context_length,
+            free_vram_mib,
+            if is_apu_unified_memory { "unified" } else { "physical" }
+        ),
+        if is_hybrid_ssm && matches!(ctx.architecture, GpuArchitecture::Rdna1 | GpuArchitecture::Rdna2) {
+            "3. Flash Attention & KV Cache (hybrid SSM+Attention architecture): On RDNA1/RDNA2 Vulkan at <= 3072 context, turn Flash Attention OFF to avoid prefill slowdowns. For >= 4096 context, use ROCm with Flash Attention ON + Q4_0 KV Cache, or Vulkan with Flash Attention ON + Q4_0 KV Cache.".to_string()
+        } else {
+            "3. Flash Attention & KV Cache: Enable Flash Attention and set K/V Cache Quantization to Q8_0 (or Q4_0 for very long contexts) to save 50%-72% of context VRAM.".to_string()
+        },
+        format!(
+            "4. CPU Thread Count & Device Isolation: Set CPU Threads to {} (matching physical cores rather than SMT threads) and target {}.",
+            physical_cpu_cores, ctx.gpu_name
         ),
     ];
 
-    Ok(LlmOptimizationPlan {
+    if is_apu_unified_memory {
+        lm_studio_tips.push(format!(
+            "5. APU Unified Memory Tuning ({}): Configure BIOS UMA Frame Buffer Size or Adrenalin Variable Graphics Memory (VGM) large enough to hold model weights + KV cache without Windows paging.",
+            ctx.gpu_name
+        ));
+    }
+
+    LlmOptimizationPlan {
         model: model.clone(),
-        gpu_name,
-        gfx_target,
-        has_secondary_igpu,
-        secondary_igpu_name,
+        gpu_index: ctx.gpu_index,
+        gpu_name: ctx.gpu_name.clone(),
+        gfx_target: ctx.gfx_target.clone(),
+        gpu_architecture: arch_label,
+        matched_profile_id: ctx.matched_profile_id.clone(),
+        matched_profile_name: ctx.matched_profile_name.clone(),
+        vk_visible_device: ctx.vk_visible_device,
+        hip_visible_device: ctx.hip_visible_device,
+        disabled_gpu_indices: ctx.disabled_gpu_indices.clone(),
+        is_apu_unified_memory,
+        has_secondary_igpu: ctx.secondary_igpu_name.is_some(),
+        secondary_igpu_name: ctx.secondary_igpu_name.clone(),
         physical_cpu_cores,
         total_vram_mib,
         used_vram_mib,
@@ -1082,10 +1447,10 @@ pub fn plan_llm_configuration(
         kv_budgets,
         recommended_profiles,
         lm_studio_tips,
-    })
+    }
 }
 
-/// Runs an empirical `llama-bench` autotuning sweep across RDNA2 tweak candidates on the target GGUF model.
+/// Runs an empirical `llama-bench` autotuning sweep across architecture-aware tweak candidates on the target GGUF model.
 pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotuneReport> {
     if !config.model_path.exists() {
         return Err(ForgeError::Io(std::io::Error::new(
@@ -1102,10 +1467,45 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
     }
 
     let meta = inspect_gguf_model(&config.model_path)?;
-    let plan = plan_llm_configuration(&meta, config.context_depth.max(2048), 512)?;
+    let plan = plan_llm_configuration_for_device(
+        &meta,
+        config.device_index,
+        config.context_depth.max(2048),
+        512,
+    )?;
     let reps = config.reps.clamp(1, 5);
     let prompt_tokens = config.prompt_tokens.clamp(32, 2048);
     let gen_tokens = config.gen_tokens.clamp(16, 512);
+
+    let f16_safe_ngl = plan
+        .kv_budgets
+        .first()
+        .map(|b| {
+            if b.fits_with_wddm_memory_priority {
+                99
+            } else {
+                b.memory_priority_ngl.max(1)
+            }
+        })
+        .unwrap_or(99);
+    let q4_safe_ngl = plan
+        .kv_budgets
+        .get(2)
+        .map(|b| {
+            if b.fits_with_wddm_memory_priority {
+                99
+            } else {
+                b.memory_priority_ngl.max(1)
+            }
+        })
+        .unwrap_or(99);
+
+    let vk_dev_str = plan.vk_visible_device.to_string();
+    let hip_dev_str = plan.hip_visible_device.to_string();
+    let supports_hipblaslt = matches!(
+        plan.gpu_architecture.as_str(),
+        "RDNA3" | "RDNA3.5" | "RDNA4" | "CDNA2" | "CDNA3" | "CDNA4"
+    );
 
     struct ProbeSpec {
         id: &'static str,
@@ -1116,7 +1516,7 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
         fa: bool,
         ctk: &'static str,
         ctv: &'static str,
-        envs: Vec<(&'static str, &'static str)>,
+        envs: Vec<(&'static str, String)>,
     }
 
     let mut specs = Vec::new();
@@ -1126,24 +1526,24 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
             title: "Baseline Vulkan (-fa 1, f16 KV, default WDDM priority)",
             backend: "vulkan",
             dev: "Vulkan0",
-            ngl: 99,
+            ngl: f16_safe_ngl,
             fa: true,
             ctk: "f16",
             ctv: "f16",
-            envs: vec![],
+            envs: vec![("GGML_VK_VISIBLE_DEVICES", vk_dev_str.clone())],
         });
         specs.push(ProbeSpec {
             id: "vulkan_wddm_priority_fa0",
-            title: "Tuned Vulkan (GGML_VK_ENABLE_MEMORY_PRIORITY=1 + -fa 0 + iGPU isolated)",
+            title: "Tuned Vulkan (GGML_VK_ENABLE_MEMORY_PRIORITY=1 + -fa 0 + GPU isolated)",
             backend: "vulkan",
             dev: "Vulkan0",
-            ngl: 99,
+            ngl: f16_safe_ngl,
             fa: false,
             ctk: "f16",
             ctv: "f16",
             envs: vec![
-                ("GGML_VK_ENABLE_MEMORY_PRIORITY", "1"),
-                ("GGML_VK_VISIBLE_DEVICES", "0"),
+                ("GGML_VK_ENABLE_MEMORY_PRIORITY", "1".to_string()),
+                ("GGML_VK_VISIBLE_DEVICES", vk_dev_str.clone()),
             ],
         });
         specs.push(ProbeSpec {
@@ -1151,28 +1551,40 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
             title: "Tuned Vulkan Long-Context (MEMORY_PRIORITY=1 + -fa 1 + q4_0 KV cache)",
             backend: "vulkan",
             dev: "Vulkan0",
-            ngl: 99,
+            ngl: q4_safe_ngl,
             fa: true,
             ctk: "q4_0",
             ctv: "q4_0",
             envs: vec![
-                ("GGML_VK_ENABLE_MEMORY_PRIORITY", "1"),
-                ("GGML_VK_VISIBLE_DEVICES", "0"),
+                ("GGML_VK_ENABLE_MEMORY_PRIORITY", "1".to_string()),
+                ("GGML_VK_VISIBLE_DEVICES", vk_dev_str),
             ],
         });
     }
 
-    if config.hip_bin.is_some() {
+    if config.hip_bin.is_some() && plan.gpu_architecture != "RDNA1" {
+        let mut hip_envs = vec![("HIP_VISIBLE_DEVICES", hip_dev_str)];
+        if supports_hipblaslt {
+            hip_envs.push(("ROCBLAS_USE_HIPBLASLT", "1".to_string()));
+        }
         specs.push(ProbeSpec {
-            id: "rocm_isolated_q4_kv",
-            title: "Tuned ROCm/HIP (HIP_VISIBLE_DEVICES=0 + -fa 1 + q4_0 KV cache)",
+            id: if supports_hipblaslt {
+                "rocm_wmma_hipblaslt"
+            } else {
+                "rocm_isolated_q4_kv"
+            },
+            title: if supports_hipblaslt {
+                "Tuned ROCm/HIP (HIP_VISIBLE_DEVICES + hipBLASLt + -fa 1 + q4_0 KV cache)"
+            } else {
+                "Tuned ROCm/HIP (HIP_VISIBLE_DEVICES + -fa 1 + q4_0 KV cache)"
+            },
             backend: "hip",
             dev: "ROCm0",
-            ngl: 99,
+            ngl: q4_safe_ngl,
             fa: true,
             ctk: "q4_0",
             ctv: "q4_0",
-            envs: vec![("HIP_VISIBLE_DEVICES", "0")],
+            envs: hip_envs,
         });
     }
 
@@ -1220,7 +1632,7 @@ pub fn autotune_llm_model(config: &LlmAutotuneConfig) -> ForgeResult<LlmAutotune
             .arg("-o")
             .arg("json");
 
-        for &(k, v) in &spec.envs {
+        for (k, v) in &spec.envs {
             cmd.env(k, v);
         }
 
@@ -1430,7 +1842,7 @@ pub fn build_lm_studio_model_config_json(
     profile: &LlmTweakProfile,
     block_count: u32,
     context_length: u32,
-    disable_igpu: bool,
+    disabled_gpus: &[usize],
 ) -> (String, String) {
     let mut root = existing_json
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -1481,12 +1893,12 @@ pub fn build_lm_studio_model_config_json(
         )
     };
 
-    if disable_igpu {
+    if !disabled_gpus.is_empty() {
         preserved_fields.push(serde_json::json!({
             "key": "load.gpuSplitConfig",
             "value": {
                 "strategy": "evenly",
-                "disabledGpus": [1],
+                "disabledGpus": disabled_gpus,
                 "priority": [],
                 "customRatio": []
             }
@@ -1551,17 +1963,45 @@ pub fn build_lm_studio_model_config_json(
     (formatted, offload_str)
 }
 
+fn detect_lmstudio_backend_version(lms_root: &Path, backend_id: &str) -> Option<String> {
+    let backends_dir = lms_root.join("extensions").join("backends");
+    let entries = std::fs::read_dir(backends_dir).ok()?;
+    let prefix = format!("{backend_id}-");
+    let mut best: Option<String> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            let trimmed = rest.trim_start_matches('v').trim();
+            if !trimmed.is_empty() {
+                best = Some(trimmed.to_string());
+            }
+        } else if name == backend_id {
+            let manifest = entry.path().join("manifest.json");
+            if let Ok(raw) = std::fs::read_to_string(manifest) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(ver) = val.get("version").and_then(|v| v.as_str()) {
+                        best = Some(ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
 /// Previews (`dry_run = true`) or writes (`dry_run = false`, with `.bak` backups) optimized
-/// LM Studio per-model load settings and backend selection for the given GGUF model.
+/// LM Studio per-model load settings and backend selection for the given GGUF model and target GPU.
 pub fn apply_lm_studio_config(
     model_path: &Path,
+    device_index: Option<usize>,
     profile_id: Option<&str>,
     context_tokens: u32,
     safety_margin_mib: u64,
     dry_run: bool,
 ) -> ForgeResult<LmStudioPatchResult> {
     let meta = inspect_gguf_model(model_path)?;
-    let plan = plan_llm_configuration(&meta, context_tokens, safety_margin_mib)?;
+    let plan =
+        plan_llm_configuration_for_device(&meta, device_index, context_tokens, safety_margin_mib)?;
 
     let profile = match profile_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(want) => plan
@@ -1616,7 +2056,7 @@ pub fn apply_lm_studio_config(
         profile,
         meta.block_count,
         plan.target_context_tokens,
-        plan.has_secondary_igpu,
+        &plan.disabled_gpu_indices,
     );
 
     let selected_lmstudio_backend = if profile.backend == "hip" {
@@ -1656,9 +2096,16 @@ pub fn apply_lm_studio_config(
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
-        versions
-            .entry(selected_lmstudio_backend.clone())
-            .or_insert_with(|| serde_json::Value::String("2.73.0".to_string()));
+        if !versions.contains_key(&selected_lmstudio_backend) {
+            if let Some(detected_ver) =
+                detect_lmstudio_backend_version(&lms_root, &selected_lmstudio_backend)
+            {
+                versions.insert(
+                    selected_lmstudio_backend.clone(),
+                    serde_json::Value::String(detected_ver),
+                );
+            }
+        }
         obj.insert("versions".to_string(), serde_json::Value::Object(versions));
     }
 
@@ -1703,7 +2150,7 @@ pub fn apply_lm_studio_config(
         cache_type_k: profile.cache_type_k.clone(),
         cache_type_v: profile.cache_type_v.clone(),
         cpu_threads: profile.threads,
-        disabled_igpu: plan.has_secondary_igpu,
+        disabled_igpu: !plan.disabled_gpu_indices.is_empty(),
         patched_model_json_preview,
         patched_backend_json_preview,
     })
@@ -1733,29 +2180,83 @@ fn query_hkcu_env_var(key: &str) -> Option<String> {
     None
 }
 
-/// Previews (`dry_run = true`) or writes (`dry_run = false`) RDNA2 Windows User Environment
+/// Previews (`dry_run = true`) or writes (`dry_run = false`) hardware-tailored Windows User Environment
 /// variables (`HKCU\Environment`, inherited by both LM Studio and Ollama) and generates an optimized Ollama `Modelfile`.
 pub fn apply_windows_and_ollama_env_tweaks(
     model_path: &Path,
+    device_index: Option<usize>,
     context_tokens: u32,
     kv_quant: KvCacheQuant,
     modelfile_out: Option<&Path>,
     dry_run: bool,
 ) -> ForgeResult<EnvAndOllamaPatchResult> {
     let meta = inspect_gguf_model(model_path)?;
-    let plan = plan_llm_configuration(&meta, context_tokens, 512)?;
+    let plan = plan_llm_configuration_for_device(&meta, device_index, context_tokens, 512)?;
 
-    let desired = [
-        ("GGML_VK_ENABLE_MEMORY_PRIORITY", "1".to_string()),
-        ("GGML_VK_VISIBLE_DEVICES", "0".to_string()),
-        ("HIP_VISIBLE_DEVICES", "0".to_string()),
-        ("OLLAMA_FLASH_ATTENTION", "1".to_string()),
-        ("OLLAMA_KV_CACHE_TYPE", kv_quant.as_cli_str().to_string()),
-        ("OLLAMA_NUM_PARALLEL", "1".to_string()),
+    let supports_hipblaslt = matches!(
+        plan.gpu_architecture.as_str(),
+        "RDNA3" | "RDNA3.5" | "RDNA4" | "CDNA2" | "CDNA3" | "CDNA4"
+    );
+
+    let mut desired: Vec<(&'static str, String, String)> = vec![
+        (
+            "GGML_VK_ENABLE_MEMORY_PRIORITY",
+            "1".to_string(),
+            "Enables VK_EXT_memory_priority so Windows WDDM keeps LLM weights resident in physical VRAM".to_string(),
+        ),
+        (
+            "GGML_VK_VISIBLE_DEVICES",
+            plan.vk_visible_device.to_string(),
+            format!(
+                "Pins Vulkan llama.cpp / LM Studio execution to {} (Vulkan index {})",
+                plan.gpu_name, plan.vk_visible_device
+            ),
+        ),
     ];
 
+    if plan.gpu_architecture != "RDNA1" {
+        desired.push((
+            "HIP_VISIBLE_DEVICES",
+            plan.hip_visible_device.to_string(),
+            format!(
+                "Pins ROCm/HIP execution to {} (HIP index {}) and prevents integrated GPU layer split",
+                plan.gpu_name, plan.hip_visible_device
+            ),
+        ));
+    }
+
+    if supports_hipblaslt {
+        desired.push((
+            "ROCBLAS_USE_HIPBLASLT",
+            "1".to_string(),
+            format!(
+                "Enables hipBLASLt WMMA matrix-core paths on {} ({})",
+                plan.gpu_architecture, plan.gfx_target
+            ),
+        ));
+    }
+
+    desired.extend([
+        (
+            "OLLAMA_FLASH_ATTENTION",
+            "1".to_string(),
+            "Enables Flash Attention in Ollama to reduce long-context VRAM usage".to_string(),
+        ),
+        (
+            "OLLAMA_KV_CACHE_TYPE",
+            kv_quant.as_cli_str().to_string(),
+            "Quantizes Ollama KV cache precision to save 50%-72% context VRAM".to_string(),
+        ),
+        (
+            "OLLAMA_NUM_PARALLEL",
+            "1".to_string(),
+            "Prevents Ollama from multiplying KV cache allocation across parallel slots"
+                .to_string(),
+        ),
+    ]);
+
     let mut env_changes = Vec::with_capacity(desired.len());
-    for (k, v) in desired {
+    for (k, v, purpose) in desired {
         let prev = query_hkcu_env_var(k);
         if !dry_run {
             let status = Command::new("reg.exe")
@@ -1782,6 +2283,7 @@ pub fn apply_windows_and_ollama_env_tweaks(
             key: k.to_string(),
             previous_value: prev,
             new_value: v,
+            purpose,
         });
     }
 
@@ -1791,8 +2293,9 @@ pub fn apply_windows_and_ollama_env_tweaks(
         .map(|p| p.n_gpu_layers)
         .unwrap_or(99);
     let ollama_modelfile_content = format!(
-        "# Generated by RDNA Forge for {} ({})\n# Model: {} ({}, {} layers)\nFROM \"{}\"\nPARAMETER num_ctx {}\nPARAMETER num_gpu {}\nPARAMETER num_thread {}\nPARAMETER num_batch 512\n",
+        "# Generated by RDNA Forge for {} ({}, {})\n# Model: {} ({}, {} layers)\nFROM \"{}\"\nPARAMETER num_ctx {}\nPARAMETER num_gpu {}\nPARAMETER num_thread {}\nPARAMETER num_batch 512\n",
         plan.gpu_name,
+        plan.gpu_architecture,
         plan.gfx_target,
         meta.file_name,
         meta.quantization_name,

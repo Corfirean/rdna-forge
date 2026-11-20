@@ -13,10 +13,11 @@ pub use llama::{
 pub use llm_optimizer::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     build_lm_studio_model_config_json, discover_local_llm_assets, estimate_kv_and_state_bytes,
-    gguf_file_type_name, inspect_gguf_model, plan_llm_configuration, EnvAndOllamaPatchResult,
+    gguf_file_type_name, inspect_gguf_model, plan_llm_configuration,
+    plan_llm_configuration_for_device, plan_llm_configuration_for_gpu, EnvAndOllamaPatchResult,
     EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult,
-    LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LlmTweakProfile,
-    LmStudioPatchResult, LocalLlmAssets,
+    LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LlmTargetGpuContext,
+    LlmTweakProfile, LmStudioPatchResult, LocalLlmAssets,
 };
 pub use memory::peak_process_rss_bytes;
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
@@ -247,11 +248,243 @@ mod tests {
             llama_server_cmd: "llama-server".to_string(),
         };
         let (merged_json, ratio_str) =
-            build_lm_studio_model_config_json(Some(existing), &profile, 65, 4096, true);
+            build_lm_studio_model_config_json(Some(existing), &profile, 65, 4096, &[1]);
         assert_eq!(ratio_str, "1.00 (100% GPU)");
         assert!(merged_json.contains("custom-jinja"));
         assert!(merged_json.contains("\"disabledGpus\": [\n            1\n          ]"));
         assert!(merged_json.contains("\"key\": \"llm.load.contextLength\""));
         assert!(merged_json.contains("\"value\": 4096"));
+
+        let (merged_zero, _) = build_lm_studio_model_config_json(None, &profile, 65, 4096, &[0]);
+        assert!(merged_zero.contains("\"disabledGpus\": [\n            0\n          ]"));
+
+        let (merged_empty, _) = build_lm_studio_model_config_json(None, &profile, 65, 4096, &[]);
+        assert!(!merged_empty.contains("load.gpuSplitConfig"));
+    }
+
+    #[test]
+    fn multi_architecture_llm_planner_tailors_profiles_for_rdna1_2_3_35_and_4() {
+        use forge_core::GpuArchitecture;
+
+        let sample_27b = GgufModelMetadata {
+            file_path: "Qwen3.8-27B-UD-IQ4_XS.gguf".to_string(),
+            file_name: "Qwen3.8-27B-UD-IQ4_XS.gguf".to_string(),
+            file_size_bytes: 14_403_496_864,
+            gguf_version: 3,
+            tensor_count: 866,
+            kv_count: 50,
+            architecture: "qwen35".to_string(),
+            model_name: Some("Qwen3.8-27B".to_string()),
+            size_label: Some("27B".to_string()),
+            quantized_by: Some("Unsloth".to_string()),
+            file_type_code: Some(30),
+            quantization_name: "UD-IQ4_XS".to_string(),
+            block_count: 65,
+            nextn_predict_layers: 1,
+            declared_context_length: 262_144,
+            embedding_length: 5120,
+            feed_forward_length: Some(17408),
+            head_count: 24,
+            head_count_kv: 4,
+            key_length: 256,
+            value_length: 256,
+            full_attention_interval: Some(4),
+            ssm_state_size: Some(128),
+            ssm_inner_size: Some(6144),
+            ssm_group_count: Some(16),
+            expert_count: None,
+            expert_used_count: None,
+            expert_feed_forward_length: None,
+            is_moe: false,
+            bytes_per_layer: 14_403_496_864 / 65,
+        };
+
+        // 1. RX 6900 XT (RDNA2, 16 GiB + iGPU)
+        let rx6900_ctx = LlmTargetGpuContext {
+            gpu_index: 0,
+            gpu_name: "AMD Radeon RX 6900 XT".to_string(),
+            gfx_target: "gfx1030".to_string(),
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+            matched_profile_id: Some("rx6900xt".to_string()),
+            matched_profile_name: Some("AMD Radeon RX 6900 XT".to_string()),
+            vk_visible_device: 0,
+            hip_visible_device: 0,
+            disabled_gpu_indices: vec![1],
+            secondary_igpu_name: Some("AMD Radeon(TM) Graphics".to_string()),
+            physical_cpu_cores: 8,
+            total_ram_mib: 32_768,
+            total_vram_mib: 16_368,
+            used_vram_mib: 1_500,
+        };
+        let p_6900 = plan_llm_configuration_for_gpu(&sample_27b, &rx6900_ctx, 4096, 512);
+        assert_eq!(p_6900.gpu_architecture, "RDNA2");
+        assert!(p_6900
+            .recommended_profiles
+            .iter()
+            .any(|p| p.id == "rocm_q4_kv_long_ctx"));
+        assert!(!p_6900
+            .recommended_profiles
+            .iter()
+            .any(|p| p.id == "rocm_wmma_hipblaslt"));
+        assert!(p_6900.has_secondary_igpu);
+        assert_eq!(p_6900.disabled_gpu_indices, vec![1]);
+
+        // 2. RX 6600 XT (RDNA2, 8 GiB, partial offload)
+        let rx6600_ctx = LlmTargetGpuContext {
+            gpu_index: 0,
+            gpu_name: "AMD Radeon RX 6600 XT".to_string(),
+            gfx_target: "gfx1032".to_string(),
+            architecture: GpuArchitecture::Rdna2,
+            discrete: true,
+            matched_profile_id: Some("rx6600xt".to_string()),
+            matched_profile_name: Some("AMD Radeon RX 6600 XT".to_string()),
+            vk_visible_device: 0,
+            hip_visible_device: 0,
+            disabled_gpu_indices: vec![],
+            secondary_igpu_name: None,
+            physical_cpu_cores: 6,
+            total_ram_mib: 32_768,
+            total_vram_mib: 8_176,
+            used_vram_mib: 800,
+        };
+        let p_6600 = plan_llm_configuration_for_gpu(&sample_27b, &rx6600_ctx, 4096, 512);
+        assert!(!p_6600.kv_budgets[0].fits_in_free_vram);
+        assert!(p_6600.kv_budgets[0].strict_zero_spill_ngl < 65);
+        assert!(p_6600
+            .recommended_profiles
+            .iter()
+            .any(|p| p.id == "vulkan_strict_zero_spill"));
+        assert!(!p_6600.has_secondary_igpu);
+
+        // 3. RX 7900 XTX (RDNA3, 24 GiB, WMMA + hipBLASLt)
+        let rx7900_ctx = LlmTargetGpuContext {
+            gpu_index: 0,
+            gpu_name: "AMD Radeon RX 7900 XTX".to_string(),
+            gfx_target: "gfx1100".to_string(),
+            architecture: GpuArchitecture::Rdna3,
+            discrete: true,
+            matched_profile_id: Some("rx7900xtx".to_string()),
+            matched_profile_name: Some("AMD Radeon RX 7900 XTX".to_string()),
+            vk_visible_device: 0,
+            hip_visible_device: 0,
+            disabled_gpu_indices: vec![],
+            secondary_igpu_name: None,
+            physical_cpu_cores: 8,
+            total_ram_mib: 65_536,
+            total_vram_mib: 24_560,
+            used_vram_mib: 1_200,
+        };
+        let p_7900 = plan_llm_configuration_for_gpu(&sample_27b, &rx7900_ctx, 4096, 512);
+        let rocm_7900 = p_7900
+            .recommended_profiles
+            .iter()
+            .find(|p| p.id == "rocm_wmma_hipblaslt")
+            .expect("RDNA3 must expose rocm_wmma_hipblaslt");
+        assert!(rocm_7900
+            .env_vars
+            .iter()
+            .any(|(k, v)| k == "ROCBLAS_USE_HIPBLASLT" && v == "1"));
+        assert_eq!(rocm_7900.cache_type_k, "q8_0");
+
+        // 4. RX 9070 XT (RDNA4, 16 GiB, WMMA + hipBLASLt)
+        let rx9070_ctx = LlmTargetGpuContext {
+            gpu_index: 0,
+            gpu_name: "AMD Radeon RX 9070 XT".to_string(),
+            gfx_target: "gfx1201".to_string(),
+            architecture: GpuArchitecture::Rdna4,
+            discrete: true,
+            matched_profile_id: Some("rx9070xt".to_string()),
+            matched_profile_name: Some("AMD Radeon RX 9070 XT".to_string()),
+            vk_visible_device: 1,
+            hip_visible_device: 0,
+            disabled_gpu_indices: vec![0],
+            secondary_igpu_name: None,
+            physical_cpu_cores: 8,
+            total_ram_mib: 32_768,
+            total_vram_mib: 16_304,
+            used_vram_mib: 1_000,
+        };
+        let p_9070 = plan_llm_configuration_for_gpu(&sample_27b, &rx9070_ctx, 4096, 512);
+        assert_eq!(p_9070.gpu_architecture, "RDNA4");
+        assert_eq!(p_9070.vk_visible_device, 1);
+        assert!(p_9070
+            .recommended_profiles
+            .iter()
+            .any(|p| p.id == "rocm_wmma_hipblaslt"));
+        assert!(p_9070
+            .recommended_profiles
+            .iter()
+            .find(|p| p.id == "vulkan_wddm_priority")
+            .unwrap()
+            .env_vars
+            .iter()
+            .any(|(k, v)| k == "GGML_VK_VISIBLE_DEVICES" && v == "1"));
+
+        // 5. Radeon 8060S Strix Halo (RDNA3.5 APU, 64 GiB unified pool + 512 MiB carveout test)
+        let halo_ctx = LlmTargetGpuContext {
+            gpu_index: 0,
+            gpu_name: "AMD Radeon 8060S Graphics".to_string(),
+            gfx_target: "gfx1151".to_string(),
+            architecture: GpuArchitecture::Rdna35,
+            discrete: false,
+            matched_profile_id: Some("radeon8060s".to_string()),
+            matched_profile_name: Some("AMD Radeon 8060S Graphics".to_string()),
+            vk_visible_device: 0,
+            hip_visible_device: 0,
+            disabled_gpu_indices: vec![],
+            secondary_igpu_name: None,
+            physical_cpu_cores: 16,
+            total_ram_mib: 131_072,
+            total_vram_mib: 65_536,
+            used_vram_mib: 2_048,
+        };
+        let p_halo = plan_llm_configuration_for_gpu(&sample_27b, &halo_ctx, 8192, 512);
+        assert!(p_halo.is_apu_unified_memory);
+        assert!(!p_halo.has_secondary_igpu);
+        assert!(p_halo.disabled_gpu_indices.is_empty());
+        assert!(p_halo.kv_budgets[0].fits_in_free_vram);
+
+        let small_uma_apu = LlmTargetGpuContext {
+            total_vram_mib: 512,
+            total_ram_mib: 65_536,
+            used_vram_mib: 256,
+            ..halo_ctx
+        };
+        let p_apu_scaled = plan_llm_configuration_for_gpu(&sample_27b, &small_uma_apu, 4096, 512);
+        assert_eq!(p_apu_scaled.total_vram_mib, 32_768);
+        assert!(p_apu_scaled
+            .warnings
+            .iter()
+            .any(|w| w.contains("Variable Graphics Memory")));
+
+        // 6. RX 5700 XT (RDNA1, 8 GiB, Vulkan-only + ROCm warning)
+        let rdna1_ctx = LlmTargetGpuContext {
+            gpu_index: 0,
+            gpu_name: "AMD Radeon RX 5700 XT".to_string(),
+            gfx_target: "gfx1010".to_string(),
+            architecture: GpuArchitecture::Rdna1,
+            discrete: true,
+            matched_profile_id: None,
+            matched_profile_name: None,
+            vk_visible_device: 0,
+            hip_visible_device: 0,
+            disabled_gpu_indices: vec![],
+            secondary_igpu_name: None,
+            physical_cpu_cores: 8,
+            total_ram_mib: 16_384,
+            total_vram_mib: 8_176,
+            used_vram_mib: 900,
+        };
+        let p_5700 = plan_llm_configuration_for_gpu(&sample_27b, &rdna1_ctx, 4096, 512);
+        assert_eq!(p_5700.gpu_architecture, "RDNA1");
+        assert!(p_5700
+            .warnings
+            .iter()
+            .any(|w| w.contains("RDNA1") && w.contains("ROCm/HIP")));
+        assert!(!p_5700
+            .recommended_profiles
+            .iter()
+            .any(|p| p.backend == "hip"));
     }
 }
