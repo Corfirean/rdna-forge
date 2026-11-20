@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-20
+
 ### Added — Milestone 7 (Per-Process VRAM Monitor, Windows GPU Audit, Safe Rollback, LLM Recommender, VCN Decode & Release Packaging)
 - **Per-process WDDM VRAM monitor (`forge-profiler`, `forge-cli`, `forge-desktop`)**:
   - Added pure-Rust dynamic `pdh.dll` `\GPU Process Memory(*)` (`Dedicated Usage` / `Shared Usage`) wrapper + Win32 `CreateToolhelp32Snapshot` process name resolution in `crates/forge-profiler/src/vram_processes.rs`.

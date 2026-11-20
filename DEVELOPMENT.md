@@ -65,7 +65,7 @@ python -m py_compile modules/ai/triton/bench_suite.py
 ```
 
 ### Portable Windows Release Workflow
-`.github/workflows/release.yml` packages tagged `v*` releases (and manual `workflow_dispatch` runs) into a portable Windows `x64` `.zip` bundle (`rdna-forge-<tag>-windows-x64.zip`) containing `forge.exe`, `forge-desktop.exe`, `README.md`, `COMPATIBILITY.md`, `BENCHMARKS.md`, `CHANGELOG.md`, and `LICENSE`.
+`.github/workflows/release.yml` packages tagged `v*` releases (and manual `workflow_dispatch` runs) into a portable Windows `x64` `.zip` bundle (`RDNA-Forge-<tag>-win-x64.zip` with `SHA256SUMS.txt`) containing `forge.exe`, `forge-desktop.exe`, `profiles/`, `README.md`, `COMPATIBILITY.md`, `BENCHMARKS.md`, `CHANGELOG.md`, and `LICENSE`.
 
 ### Live GPU Correctness Tests
 Runs device discovery, live ADLX telemetry snapshots, read-only ADLX tuning inspection and dry-run range validation (never mutating GPU settings), live AMF (`amfrt64.dll`) VCN codec probing, HIP 4 MiB H2D/D2H verification, Vulkan baseline / tiled `vec4` / INT8 DP4A (`OpSDot`) / Wave32 `W8A32` & `Q4_0` GEMV / fused subgroup `RMSNorm+RoPE` edge-case and batched (`dispatches_per_submit`) equivalence tests, and a repeated-dispatch stability check on physical AMD hardware (use `--test-threads=1` so ADLX, AMF, and HIP tests run sequentially):

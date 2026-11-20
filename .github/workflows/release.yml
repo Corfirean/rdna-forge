@@ -57,7 +57,7 @@ jobs:
           Copy-Item "target\release\forge.exe" -Destination $stage
           Copy-Item "target\release\forge-desktop.exe" -Destination $stage
           Copy-Item "profiles" -Destination (Join-Path $stage "profiles") -Recurse
-          Copy-Item "README.md", "COMPATIBILITY.md", "CHANGELOG.md", "LICENSE" -Destination $stage
+          Copy-Item "README.md", "COMPATIBILITY.md", "BENCHMARKS.md", "CHANGELOG.md", "LICENSE" -Destination $stage
 
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
           $zipPath = "dist\$bundleName.zip"
