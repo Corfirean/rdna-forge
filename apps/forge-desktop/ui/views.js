@@ -929,7 +929,7 @@ export function renderTuning(root, state, actions) {
     const text =
       res.kind === "power"
         ? `Power Limit ${res.data.applied ? String(res.data.status).replace(/_/g, " ").toUpperCase() : "DRY-RUN VALIDATED"} (rollback: ${String(res.data.rollback).replace(/_/g, " ")}${res.data.error ? `; ${res.data.error}` : ""}): current=${res.data.previous_limit_pct}%, requested=${res.data.requested_limit_pct}%, verified=${res.data.verified_limit_pct ?? "n/a"}%, range=${res.data.allowed_range.min}..=${res.data.allowed_range.max}%`
-        : `Factory Reset ${res.data.applied ? String(res.data.status).replace(/_/g, " ").toUpperCase() : "DRY-RUN"}${res.data.error ? ` (${res.data.error})` : ""}: was_at_factory=${res.data.was_at_factory}, now_at_factory=${res.data.now_at_factory}`;
+        : `Factory Reset ${res.data.applied ? `${String(res.data.status).replace(/_/g, " ").toUpperCase()} (reset API ${String(res.data.api).replace(/_/g, " ").toUpperCase()}${res.data.api_result_code != null ? `, code ${res.data.api_result_code}` : ""})` : "DRY-RUN"}${res.data.error ? ` (${res.data.error})` : ""}: was_at_factory=${res.data.was_at_factory}, now_at_factory=${res.data.now_at_factory}`;
     // A dry run without error, or a CONFIRMED change, is a success; anything else is shown as an error.
     const actionOk = res.data.applied ? res.data.status === "confirmed" : !res.data.error;
     powerPanelContent.appendChild(

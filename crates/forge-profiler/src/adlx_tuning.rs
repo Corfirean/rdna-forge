@@ -7,9 +7,9 @@ use forge_core::{ForgeError, ForgeResult};
 
 use crate::adlx_ffi::{AdlxSession, IAdlxGpu, IAdlxInterface, OwnedGpu, OwnedInterface, ADLX_OK};
 use crate::tuning::{
-    adlx_succeeded, change_power_limit, reset_to_factory, FactoryResetControl, FanCurvePoint,
-    FanTuningInfo, GfxTuningInfo, GpuTuningReport, IntRange, MemoryTimingMode, OperationStatus,
-    PowerLimitChangeResult, PowerLimitControl, PowerTuningInfo, PresetTuningInfo,
+    adlx_succeeded, change_power_limit, reset_to_factory, ApiResult, FactoryResetControl,
+    FanCurvePoint, FanTuningInfo, GfxTuningInfo, GpuTuningReport, IntRange, MemoryTimingMode,
+    OperationStatus, PowerLimitChangeResult, PowerLimitControl, PowerTuningInfo, PresetTuningInfo,
     TuningCapabilities, TuningResetResult, VramTuningInfo,
 };
 
@@ -302,14 +302,10 @@ impl FactoryResetControl for AdlxResetControl<'_> {
         unsafe { call_gpu_bool(self.vt, self.svc_ptr, self.vt.is_at_factory, self.gpu) }
     }
 
-    fn reset(&mut self) -> Result<(), i32> {
-        // SAFETY: slot [5] of IADLXGPUTuningServices is `ResetToFactory(IADLXGPU*)`.
-        let rc = unsafe { (self.vt.reset_to_factory)(self.svc_ptr, self.gpu) };
-        if adlx_succeeded(rc) {
-            Ok(())
-        } else {
-            Err(rc)
-        }
+    fn reset(&mut self) -> i32 {
+        // SAFETY: slot [5] of IADLXGPUTuningServices is `ResetToFactory(IADLXGPU*)`. The raw
+        // ADLX_RESULT is returned unchanged; the state machine decides what it means.
+        unsafe { (self.vt.reset_to_factory)(self.svc_ptr, self.gpu) }
     }
 }
 
@@ -992,11 +988,13 @@ impl AdlxSession {
             gpu_name,
             pci_device_id: dev_id,
             was_at_factory: outcome.was_at_factory,
-            applied: outcome.status != OperationStatus::NotApplied,
+            applied: outcome.api != ApiResult::NotCalled,
             now_at_factory: outcome.now_at_factory,
             confirmed: outcome.status == OperationStatus::Confirmed,
             status: outcome.status,
             rollback: outcome.rollback,
+            api: outcome.api,
+            api_result_code: outcome.api_result_code,
             error: outcome.error,
         })
     }

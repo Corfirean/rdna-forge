@@ -402,6 +402,16 @@ async function refreshTuning() {
   }
 }
 
+// A tuning change counts as successful only when ADLX read-back confirmed it (or it was a dry run
+// without error). An accepted API call alone, or an unreadable state, is not success.
+function tuningOutcomeOk(data) {
+  return data.applied ? data.status === "confirmed" : !data.error;
+}
+
+function tuningStatusLabel(status) {
+  return String(status || "unknown").replace(/_/g, " ").toUpperCase();
+}
+
 async function submitPowerLimit(pciDeviceId, dryRun) {
   if (state.busyOp) return;
   state.busyOp = true;
@@ -422,7 +432,13 @@ async function submitPowerLimit(pciDeviceId, dryRun) {
     if (data.applied) {
       await refreshTuningAfterMutation();
     }
-    setStatusNote(dryRun ? "Power limit dry-run passed." : "Power limit applied via ADLX.");
+    setStatusNote(
+      dryRun
+        ? "Power limit dry-run passed."
+        : tuningOutcomeOk(data)
+          ? "Power limit change CONFIRMED by ADLX read-back."
+          : `Power limit change ${tuningStatusLabel(data.status)}; check the GPU state before continuing.`
+    );
   } catch (err) {
     state.tuningUi.actionError = String(err);
   } finally {
@@ -450,7 +466,13 @@ async function submitResetTuning(pciDeviceId, dryRun) {
     if (data.applied) {
       await refreshTuningAfterMutation();
     }
-    setStatusNote(dryRun ? "Factory reset dry-run complete." : "GPU tuning reset to factory defaults.");
+    setStatusNote(
+      dryRun
+        ? "Factory reset dry-run complete."
+        : tuningOutcomeOk(data)
+          ? "GPU tuning is at factory settings (CONFIRMED by ADLX read-back)."
+          : `Factory reset ${tuningStatusLabel(data.status)}; the GPU state is not confirmed. Check it before continuing.`
+    );
   } catch (err) {
     state.tuningUi.actionError = String(err);
   } finally {

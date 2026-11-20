@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use forge_profiler::{
-    check_competing_workload_warning, check_vram_pressure_warning, format_sample_csv_row,
-    format_sample_table_row, parse_pci_device_id, read_all_gpu_tuning, reset_gpu_tuning_to_factory,
-    set_gpu_power_limit, summarize_samples, AdlxSession, GpuTelemetrySample, GpuTuningReport,
-    MonitorRecord, TELEMETRY_CSV_HEADER, TELEMETRY_TABLE_HEADER,
+    adlx_result_name, check_competing_workload_warning, check_vram_pressure_warning,
+    format_sample_csv_row, format_sample_table_row, parse_pci_device_id, read_all_gpu_tuning,
+    reset_gpu_tuning_to_factory, set_gpu_power_limit, summarize_samples, AdlxSession,
+    GpuTelemetrySample, GpuTuningReport, MonitorRecord, TELEMETRY_CSV_HEADER,
+    TELEMETRY_TABLE_HEADER,
 };
 
 use crate::print_telemetry_summary_to;
@@ -680,7 +681,14 @@ pub fn cmd_tune_reset(device_id: Option<&str>, apply: bool, json: bool) -> Resul
                 "  No GPU setting was modified. Pass --apply to reset all ADLX tuning profiles."
             );
         } else {
-            println!("  Operation: {}", res.status);
+            println!(
+                "  Reset API: {}{}",
+                res.api,
+                res.api_result_code
+                    .map(|rc| format!(" ({})", adlx_result_name(rc)))
+                    .unwrap_or_default()
+            );
+            println!("  GPU state: {}", res.status);
             println!(
                 "  Rollback:  {} (a factory reset discards the previous tuning profile; it cannot be restored automatically)",
                 res.rollback

@@ -457,11 +457,37 @@ fn append_error(slot: &mut Option<String>, msg: String) {
     });
 }
 
+/// Outcome of the `ResetToFactory` *API call*, kept separate from whether the GPU is actually at
+/// factory settings (see [`OperationStatus`]). A successful return code proves only that the call
+/// completed; it does not prove the GPU state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiResult {
+    /// No call was made (dry run, or the GPU was already at factory settings).
+    #[default]
+    NotCalled,
+    /// The call returned `ADLX_SUCCEEDED` (0, 1 or 2).
+    Accepted,
+    /// The call returned an error code.
+    Rejected,
+}
+
+impl fmt::Display for ApiResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotCalled => "NOT CALLED",
+            Self::Accepted => "ACCEPTED",
+            Self::Rejected => "REJECTED",
+        })
+    }
+}
+
 /// Minimal hardware surface for a factory reset.
 pub trait FactoryResetControl {
     fn is_at_factory(&mut self) -> Option<bool>;
-    /// Requests the reset. `Err` carries the raw `ADLX_RESULT`.
-    fn reset(&mut self) -> Result<(), i32>;
+    /// Requests the reset and returns the raw `ADLX_RESULT` (never discarded, so success codes
+    /// such as `ADLX_ALREADY_ENABLED` stay visible).
+    fn reset(&mut self) -> i32;
 }
 
 /// Result of [`reset_to_factory`].
@@ -469,21 +495,37 @@ pub trait FactoryResetControl {
 pub struct ResetOutcome {
     pub was_at_factory: Option<bool>,
     pub now_at_factory: Option<bool>,
+    /// What the API call returned.
+    pub api: ApiResult,
+    /// The raw `ADLX_RESULT` returned by `ResetToFactory`, if the call was made.
+    pub api_result_code: Option<i32>,
+    /// Whether the GPU is confirmed to be at factory settings.
     pub status: OperationStatus,
     pub rollback: RollbackStatus,
+    /// Diagnostics: the returned code by name and what the read-back showed.
     pub error: Option<String>,
 }
 
 /// Requests a factory reset and verifies it by reading `IsAtFactory` back.
 ///
+/// The API result and the application status are reported separately:
+///
+/// | Reset API | Read-back   | API        | Status         |
+/// |-----------|-------------|------------|----------------|
+/// | success   | factory     | `Accepted` | `Confirmed`    |
+/// | success   | not factory | `Accepted` | `NotConfirmed` |
+/// | success   | unavailable | `Accepted` | `NotConfirmed` |
+/// | error     | factory     | `Rejected` | `Confirmed`    |
+/// | error     | not factory | `Rejected` | `NotConfirmed` |
+/// | error     | unavailable | `Rejected` | `NotConfirmed` |
+///
+/// `Confirmed` is returned only when the read-back actually shows factory state; an unknown state
+/// is never reported as applied. `NotApplied` is reserved for dry runs and for a GPU that was
+/// already at factory settings before the call (no call is made in either case).
+///
 /// A reset discards the user's tuning profile and the previous profile is not captured, so there
 /// is nothing to restore: `rollback` is always [`RollbackStatus::Unsupported`] when a reset was
-/// requested. Dry runs and "already at factory" never write.
-///
-/// The state is read back after the call whether it returned success or an error, because an
-/// error does not prove that nothing changed. An error with a factory read-back is reported as
-/// `Confirmed` (with the error text), an error with a non-factory or unreadable state as
-/// `NotConfirmed`; `NotApplied` is reserved for dry runs and "already at factory".
+/// requested.
 pub fn reset_to_factory(
     ctl: &mut dyn FactoryResetControl,
     dry_run: bool,
@@ -492,6 +534,8 @@ pub fn reset_to_factory(
     let mut out = ResetOutcome {
         was_at_factory: was,
         now_at_factory: was,
+        api: ApiResult::NotCalled,
+        api_result_code: None,
         status: OperationStatus::NotApplied,
         rollback: RollbackStatus::NotNeeded,
         error: None,
@@ -501,46 +545,43 @@ pub fn reset_to_factory(
     }
     out.rollback = RollbackStatus::Unsupported;
 
-    // An error return does not prove the driver left the state untouched (a partial or late
-    // reset is possible), so the state is read back after the call whether it succeeded or not and
-    // the result reflects what ADLX reports.
-    let call = ctl.reset();
+    // An error return does not prove the driver left the state untouched, and a success return does
+    // not prove it reached factory state, so the state is read back after every call.
+    let rc = ctl.reset();
+    let accepted = adlx_succeeded(rc);
+    out.api = if accepted {
+        ApiResult::Accepted
+    } else {
+        ApiResult::Rejected
+    };
+    out.api_result_code = Some(rc);
     out.now_at_factory = ctl.is_at_factory();
-    let rejected = call
-        .err()
-        .map(|rc| format!("ResetToFactory returned {}", adlx_result_name(rc)));
-    match (out.now_at_factory, rejected) {
-        (Some(true), None) => out.status = OperationStatus::Confirmed,
-        (Some(true), Some(why)) => {
-            // The call reported an error but ADLX now reports factory tuning: report the state.
+
+    let call = format!(
+        "ResetToFactory returned {} ({})",
+        adlx_result_name(rc),
+        if accepted { "accepted" } else { "rejected" }
+    );
+    match out.now_at_factory {
+        Some(true) => {
             out.status = OperationStatus::Confirmed;
+            if !accepted {
+                // The call reported an error but ADLX now reports factory tuning: report the state.
+                out.error = Some(format!(
+                    "{call}, but ADLX reports the GPU is now at factory settings"
+                ));
+            }
+        }
+        Some(false) => {
+            out.status = OperationStatus::NotConfirmed;
             out.error = Some(format!(
-                "{why}, but ADLX reports the GPU is now at factory settings"
+                "{call}; ADLX still reports non-factory tuning, so the reset is not confirmed"
             ));
         }
-        (Some(false), None) => {
-            out.status = OperationStatus::NotConfirmed;
-            out.error = Some(
-                "ResetToFactory was accepted but ADLX still reports non-factory tuning".to_string(),
-            );
-        }
-        (Some(false), Some(why)) => {
+        None => {
             out.status = OperationStatus::NotConfirmed;
             out.error = Some(format!(
-                "{why} and ADLX still reports non-factory tuning; the reset is not confirmed"
-            ));
-        }
-        (None, None) => {
-            out.status = OperationStatus::Applied;
-            out.error = Some(
-                "the reset was accepted but the factory state could not be read back".to_string(),
-            );
-        }
-        (None, Some(why)) => {
-            // Neither "applied" nor "not applied" can be claimed: the state is unknown.
-            out.status = OperationStatus::NotConfirmed;
-            out.error = Some(format!(
-                "{why} and the factory state could not be read back; whether the reset took effect is unknown"
+                "{call}; the factory state could not be read back, so the reset is not confirmed and the GPU state is unknown"
             ));
         }
     }
@@ -592,7 +633,7 @@ pub struct TuningResetResult {
     pub gpu_name: String,
     pub pci_device_id: Option<u32>,
     pub was_at_factory: Option<bool>,
-    /// The driver accepted a reset request (`status` is not `NotApplied`).
+    /// A reset call was made (`api` is not `NotCalled`). This is a request, not a confirmation.
     pub applied: bool,
     /// State read back after the request, if the read succeeded.
     pub now_at_factory: Option<bool>,
@@ -603,6 +644,13 @@ pub struct TuningResetResult {
     pub status: OperationStatus,
     #[serde(default)]
     pub rollback: RollbackStatus,
+    /// Outcome of the `ResetToFactory` call itself, independent of the GPU state.
+    #[serde(default)]
+    pub api: ApiResult,
+    /// Raw `ADLX_RESULT` returned by `ResetToFactory` (absent when no call was made).
+    #[serde(default)]
+    pub api_result_code: Option<i32>,
+    /// Diagnostics: the returned code by name and what the read-back showed.
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -825,98 +873,104 @@ mod tests {
         assert!(o.error.unwrap().contains("could not be read back"));
     }
 
-    /// Scripted fake factory-reset backend.
+    /// What `is_at_factory()` reports after `reset()` has been called.
+    #[derive(Clone, Copy)]
+    enum After {
+        Factory,
+        NotFactory,
+        Unavailable,
+    }
+
+    /// Scripted fake factory-reset backend: the post-call read-back and the returned ADLX code are
+    /// chosen independently, so every cell of the matrix can be driven.
     struct FakeReset {
-        at_factory: Option<bool>,
+        before: Option<bool>,
+        after: After,
+        rc: i32,
         resets: usize,
-        /// What `reset()` returns.
-        call: Result<(), i32>,
-        /// Whether a `reset()` call (even an erroring one) actually moves the GPU to factory.
-        applies: bool,
-        /// When false, `is_at_factory()` is unreadable once `reset()` has been called.
-        readable_after: bool,
     }
 
     impl FakeReset {
-        fn new(call: Result<(), i32>, applies: bool, readable_after: bool) -> Self {
+        fn new(rc: i32, after: After) -> Self {
             Self {
-                at_factory: Some(false),
+                before: Some(false),
+                after,
+                rc,
                 resets: 0,
-                call,
-                applies,
-                readable_after,
             }
         }
     }
 
     impl FactoryResetControl for FakeReset {
         fn is_at_factory(&mut self) -> Option<bool> {
-            if self.resets > 0 && !self.readable_after {
-                return None;
+            if self.resets == 0 {
+                return self.before;
             }
-            self.at_factory
+            match self.after {
+                After::Factory => Some(true),
+                After::NotFactory => Some(false),
+                After::Unavailable => None,
+            }
         }
-        fn reset(&mut self) -> Result<(), i32> {
+        fn reset(&mut self) -> i32 {
             self.resets += 1;
-            if self.applies {
-                self.at_factory = Some(true);
-            }
-            self.call
+            self.rc
         }
     }
 
-    #[test]
-    fn reset_dry_run_and_already_at_factory_never_reset() {
-        let mut f = FakeReset::new(Ok(()), true, true);
-        let o = reset_to_factory(&mut f, true).unwrap();
-        assert_eq!((f.resets, o.status), (0, OperationStatus::NotApplied));
-        assert_eq!(o.rollback, RollbackStatus::NotNeeded);
-
-        let mut g = FakeReset::new(Ok(()), true, true);
-        g.at_factory = Some(true);
-        let o = reset_to_factory(&mut g, false).unwrap();
-        assert_eq!((g.resets, o.status), (0, OperationStatus::NotApplied));
-        assert!(o.error.is_none());
+    fn run(rc: i32, after: After) -> (ResetOutcome, usize) {
+        let mut f = FakeReset::new(rc, after);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        (o, f.resets)
     }
 
     #[test]
-    fn reset_success_with_factory_readback_is_confirmed() {
-        let mut f = FakeReset::new(Ok(()), true, true);
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_eq!(f.resets, 1);
-        assert_eq!(o.status, OperationStatus::Confirmed);
+    fn reset_success_with_factory_readback_is_accepted_and_confirmed() {
+        let (o, calls) = run(0, After::Factory);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::Accepted, OperationStatus::Confirmed)
+        );
         assert_eq!(o.now_at_factory, Some(true));
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
         assert!(o.error.is_none());
     }
 
     #[test]
-    fn reset_success_but_state_contradicts_is_not_confirmed() {
-        // The driver says OK but the GPU still reports non-factory tuning.
-        let mut f = FakeReset::new(Ok(()), false, true);
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_eq!(o.status, OperationStatus::NotConfirmed);
+    fn reset_success_with_non_factory_readback_is_accepted_but_not_confirmed() {
+        let (o, _) = run(0, After::NotFactory);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::Accepted, OperationStatus::NotConfirmed)
+        );
         assert_eq!(o.now_at_factory, Some(false));
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
         assert!(o.error.unwrap().contains("still reports non-factory"));
     }
 
     #[test]
-    fn reset_success_with_unreadable_state_is_applied_unverified() {
-        let mut f = FakeReset::new(Ok(()), true, false);
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_eq!(o.status, OperationStatus::Applied);
+    fn reset_success_with_unavailable_readback_is_accepted_but_not_confirmed() {
+        // Previously reported as APPLIED (UNVERIFIED), which could be read as success.
+        let (o, _) = run(0, After::Unavailable);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::Accepted, OperationStatus::NotConfirmed)
+        );
         assert_eq!(o.now_at_factory, None);
+        assert_ne!(o.status, OperationStatus::Applied);
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
+        let e = o.error.unwrap();
+        assert!(e.contains("could not be read back") && e.contains("not confirmed"));
     }
 
     #[test]
-    fn reset_error_but_state_became_factory_reports_the_actual_state() {
-        // ResetToFactory returned ADLX_FAIL, yet IsAtFactory now says true.
-        let mut f = FakeReset::new(Err(3), true, true);
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_eq!(f.resets, 1);
-        assert_eq!(o.status, OperationStatus::Confirmed);
+    fn reset_error_with_factory_readback_is_rejected_but_confirmed() {
+        let (o, _) = run(3, After::Factory);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::Rejected, OperationStatus::Confirmed)
+        );
         assert_eq!(o.now_at_factory, Some(true));
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
         let e = o.error.unwrap();
@@ -924,12 +978,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_error_with_unchanged_state_is_not_confirmed_not_not_applied() {
-        // The error does not prove nothing changed: the result must say "not confirmed".
-        let mut f = FakeReset::new(Err(18), false, true);
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_eq!(f.resets, 1);
-        assert_eq!(o.status, OperationStatus::NotConfirmed);
+    fn reset_error_with_non_factory_readback_is_rejected_and_not_confirmed() {
+        let (o, _) = run(18, After::NotFactory);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::Rejected, OperationStatus::NotConfirmed)
+        );
         assert_eq!(o.now_at_factory, Some(false));
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
         let e = o.error.unwrap();
@@ -937,37 +991,177 @@ mod tests {
     }
 
     #[test]
-    fn reset_error_with_unreadable_state_does_not_claim_it_was_not_applied() {
-        let mut f = FakeReset::new(Err(3), true, false);
-        let o = reset_to_factory(&mut f, false).unwrap();
-        assert_ne!(o.status, OperationStatus::NotApplied);
-        assert_eq!(o.status, OperationStatus::NotConfirmed);
+    fn reset_error_with_unavailable_readback_is_rejected_and_not_confirmed() {
+        let (o, _) = run(3, After::Unavailable);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::Rejected, OperationStatus::NotConfirmed)
+        );
         assert_eq!(o.now_at_factory, None);
+        assert_ne!(o.status, OperationStatus::NotApplied);
         assert_eq!(o.rollback, RollbackStatus::Unsupported);
-        assert!(o.error.unwrap().contains("unknown"));
+        assert!(o.error.unwrap().contains("state is unknown"));
     }
 
     #[test]
-    fn reset_results_succeed_only_when_confirmed() {
-        let result = |status, error: Option<&str>| TuningResetResult {
+    fn reset_dry_run_makes_no_call_and_is_not_applied() {
+        let mut f = FakeReset::new(0, After::Factory);
+        let o = reset_to_factory(&mut f, true).unwrap();
+        assert_eq!(f.resets, 0);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::NotCalled, OperationStatus::NotApplied)
+        );
+        assert_eq!(
+            (o.api_result_code, o.rollback),
+            (None, RollbackStatus::NotNeeded)
+        );
+        assert!(o.error.is_none());
+    }
+
+    #[test]
+    fn reset_when_already_at_factory_makes_no_call_and_is_not_applied() {
+        let mut f = FakeReset::new(0, After::Factory);
+        f.before = Some(true);
+        let o = reset_to_factory(&mut f, false).unwrap();
+        assert_eq!(f.resets, 0);
+        assert_eq!(
+            (o.api, o.status),
+            (ApiResult::NotCalled, OperationStatus::NotApplied)
+        );
+        assert_eq!(o.api_result_code, None);
+        assert!(o.error.is_none());
+    }
+
+    #[test]
+    fn reset_preserves_the_raw_adlx_code_and_names_it_in_the_diagnostics() {
+        // Success codes (0, 1, 2) are all "accepted" and are not collapsed into one value.
+        for rc in [0, 1, 2] {
+            let (o, _) = run(rc, After::NotFactory);
+            assert_eq!(o.api, ApiResult::Accepted, "rc {rc}");
+            assert_eq!(o.api_result_code, Some(rc));
+            assert!(o.error.unwrap().contains(&adlx_result_name(rc)));
+        }
+        // Failure codes keep their identity, including unknown and negative values.
+        for rc in [3, 4, 12, 18, 99, -1] {
+            let (o, _) = run(rc, After::Unavailable);
+            assert_eq!(o.api, ApiResult::Rejected, "rc {rc}");
+            assert_eq!(o.api_result_code, Some(rc));
+            assert!(o.error.unwrap().contains(&adlx_result_name(rc)));
+        }
+        let (o, _) = run(18, After::NotFactory);
+        assert!(o.error.unwrap().contains("ADLX_RESET_NEEDED (18)"));
+    }
+
+    #[test]
+    fn reset_matrix_never_reports_an_unknown_state_as_applied_or_confirmed() {
+        // Every API code x every read-back, checked against the specified table.
+        for rc in [0, 1, 2, 3, 4, 12, 18, 99, -1] {
+            let accepted = matches!(rc, 0..=2);
+            for (after, readback) in [
+                (After::Factory, Some(true)),
+                (After::NotFactory, Some(false)),
+                (After::Unavailable, None),
+            ] {
+                let (o, calls) = run(rc, after);
+                assert_eq!(calls, 1);
+                assert_eq!(o.now_at_factory, readback);
+                assert_eq!(
+                    o.api,
+                    if accepted {
+                        ApiResult::Accepted
+                    } else {
+                        ApiResult::Rejected
+                    }
+                );
+                let expected = if readback == Some(true) {
+                    OperationStatus::Confirmed
+                } else {
+                    OperationStatus::NotConfirmed
+                };
+                assert_eq!(o.status, expected, "rc {rc}, readback {readback:?}");
+                // `Applied` / `NotApplied` are never produced once a reset was requested.
+                assert!(!matches!(
+                    o.status,
+                    OperationStatus::Applied | OperationStatus::NotApplied
+                ));
+                assert_eq!(o.rollback, RollbackStatus::Unsupported);
+                // Unknown or contradicting state must carry a diagnostic.
+                assert_eq!(o.error.is_none(), readback == Some(true) && accepted);
+            }
+        }
+    }
+
+    fn reset_result(
+        api: ApiResult,
+        status: OperationStatus,
+        error: Option<&str>,
+    ) -> TuningResetResult {
+        TuningResetResult {
             gpu_name: "g".into(),
-            pci_device_id: None,
+            pci_device_id: Some(0x73AF),
             was_at_factory: Some(false),
-            applied: status != OperationStatus::NotApplied,
+            applied: api != ApiResult::NotCalled,
             now_at_factory: None,
             confirmed: status == OperationStatus::Confirmed,
             status,
             rollback: RollbackStatus::Unsupported,
+            api,
+            api_result_code: (api != ApiResult::NotCalled).then_some(0),
             error: error.map(str::to_string),
-        };
-        assert!(result(OperationStatus::Confirmed, None).succeeded());
-        assert!(result(
-            OperationStatus::Confirmed,
-            Some("call errored but state is factory")
+        }
+    }
+
+    #[test]
+    fn reset_succeeded_is_true_only_for_confirmed_or_a_clean_no_op() {
+        use ApiResult::*;
+        use OperationStatus::*;
+        // Success: confirmed (whatever the API said), or nothing was requested and nothing failed.
+        assert!(reset_result(Accepted, Confirmed, None).succeeded());
+        assert!(reset_result(Rejected, Confirmed, Some("rc but factory")).succeeded());
+        assert!(reset_result(NotCalled, NotApplied, None).succeeded());
+        // Everything else is a failure.
+        assert!(!reset_result(Accepted, NotConfirmed, Some("x")).succeeded());
+        assert!(!reset_result(Rejected, NotConfirmed, Some("x")).succeeded());
+        assert!(!reset_result(Accepted, Applied, None).succeeded());
+        assert!(!reset_result(NotCalled, NotApplied, Some("x")).succeeded());
+        // An accepted API call alone is never success.
+        for status in [NotApplied, Applied, NotConfirmed] {
+            assert!(
+                !reset_result(Accepted, status, Some("e")).succeeded(),
+                "{status:?} must not be success"
+            );
+        }
+    }
+
+    #[test]
+    fn public_status_labels_and_serialization_do_not_read_as_success() {
+        assert_eq!(ApiResult::Accepted.to_string(), "ACCEPTED");
+        assert_eq!(ApiResult::Rejected.to_string(), "REJECTED");
+        assert_eq!(ApiResult::NotCalled.to_string(), "NOT CALLED");
+        assert_eq!(OperationStatus::NotConfirmed.to_string(), "NOT CONFIRMED");
+        assert_eq!(OperationStatus::Confirmed.to_string(), "CONFIRMED");
+
+        // JSON consumers (the desktop UI) see `api` and `status` separately.
+        let r = reset_result(
+            ApiResult::Accepted,
+            OperationStatus::NotConfirmed,
+            Some("e"),
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["api"], "accepted");
+        assert_eq!(v["status"], "not_confirmed");
+        assert_eq!(v["confirmed"], false);
+        assert_eq!(v["api_result_code"], 0);
+        assert_eq!(v["rollback"], "unsupported");
+        // Older payloads without the new fields still deserialize (and read as "not called").
+        let old: TuningResetResult = serde_json::from_str(
+            r#"{"gpu_name":"g","pci_device_id":null,"was_at_factory":null,"applied":false,"now_at_factory":null}"#,
         )
-        .succeeded());
-        assert!(!result(OperationStatus::NotConfirmed, Some("x")).succeeded());
-        assert!(!result(OperationStatus::Applied, None).succeeded());
+        .unwrap();
+        assert_eq!(old.api, ApiResult::NotCalled);
+        assert_eq!(old.api_result_code, None);
+        assert_eq!(old.status, OperationStatus::NotApplied);
     }
 
     #[test]
