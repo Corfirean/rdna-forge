@@ -32,16 +32,24 @@ use forge_runtime::{
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::apply_gate::{
+    gate_key, parse_kv_quant_strict, validate_device_index, validate_model_path,
+    validate_pci_device_id, validate_power_limit, validate_profile_id, ApplyGate,
+};
+
 /// Shared desktop application state synchronizing exclusive GPU/ADLX workloads.
 #[derive(Clone, Default)]
 pub struct AppState {
     gpu_busy: Arc<AtomicBool>,
+    /// Backend-side permission for mutating commands: an apply needs a matching dry-run preview.
+    gate: Arc<ApplyGate>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             gpu_busy: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(ApplyGate::new()),
         }
     }
 
@@ -612,14 +620,21 @@ pub async fn set_power_limit(
     state: State<'_, AppState>,
     request: DesktopPowerLimitRequest,
 ) -> Result<PowerLimitChangeResult, String> {
+    let key = prepare_power_limit(&request)?;
     let guard = state.acquire_gpu("power limit change")?;
-    tauri::async_runtime::spawn_blocking(move || {
+    enforce_gate(&state.gate, &key, request.dry_run)?;
+    let dry_run = request.dry_run;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         set_gpu_power_limit(request.pci_device_id, request.limit_pct, request.dry_run)
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("Power limit task failed: {e}"))?
+    .map_err(|e| format!("Power limit task failed: {e}"))??;
+    if dry_run && result.succeeded() {
+        state.gate.record_preview(&key);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -627,14 +642,21 @@ pub async fn reset_tuning(
     state: State<'_, AppState>,
     request: DesktopResetTuningRequest,
 ) -> Result<TuningResetResult, String> {
+    let key = prepare_reset_tuning(&request)?;
     let guard = state.acquire_gpu("factory tuning reset")?;
-    tauri::async_runtime::spawn_blocking(move || {
+    enforce_gate(&state.gate, &key, request.dry_run)?;
+    let dry_run = request.dry_run;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         reset_gpu_tuning_to_factory(request.pci_device_id, request.dry_run)
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("Tuning reset task failed: {e}"))?
+    .map_err(|e| format!("Tuning reset task failed: {e}"))??;
+    if dry_run && result.succeeded() {
+        state.gate.record_preview(&key);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -692,8 +714,8 @@ pub async fn run_video_decode_benchmark(
 }
 
 fn resolve_desktop_model_path(explicit: Option<&str>) -> Result<PathBuf, String> {
-    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(s));
+    if let Some(path) = validate_model_path(explicit)? {
+        return Ok(path);
     }
     let assets = discover_local_llm_assets();
     assets
@@ -784,75 +806,209 @@ pub async fn run_llm_autotune(
 
 #[tauri::command]
 pub async fn apply_lm_studio_patch(
+    state: State<'_, AppState>,
     request: DesktopLmStudioPatchRequest,
 ) -> Result<LmStudioPatchResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
+    let prepared = prepare_lm_studio_patch(&request)?;
+    enforce_gate(&state.gate, &prepared.key, request.dry_run)?;
+    let dry_run = request.dry_run;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         apply_lm_studio_config(
-            &model_path,
+            &prepared.model_path,
             request.device_index,
-            request.profile_id.as_deref(),
-            request.context_tokens.clamp(512, 262_144),
-            request.safety_margin_mib.clamp(0, 4096),
+            prepared.profile_id.as_deref(),
+            prepared.context_tokens,
+            prepared.safety_margin_mib,
             request.dry_run,
         )
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("LM Studio config patch task failed: {e}"))?
+    .map_err(|e| format!("LM Studio config patch task failed: {e}"))??;
+    if dry_run {
+        state.gate.record_preview(&prepared.key);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn apply_env_and_ollama_patch(
+    state: State<'_, AppState>,
     request: DesktopEnvPatchRequest,
 ) -> Result<EnvAndOllamaPatchResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
-        let kv_quant = match request.kv_quant.as_deref().map(str::trim) {
-            Some("f16") => KvCacheQuant::F16,
-            Some("q4_0") => KvCacheQuant::Q4_0,
-            _ => KvCacheQuant::Q8_0,
-        };
+    let prepared = prepare_env_patch(&request)?;
+    enforce_gate(&state.gate, &prepared.key, request.dry_run)?;
+    let dry_run = request.dry_run;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         apply_windows_and_ollama_env_tweaks(
-            &model_path,
+            &prepared.model_path,
             request.device_index,
-            request.context_tokens.clamp(512, 262_144),
-            kv_quant,
+            prepared.context_tokens,
+            prepared.kv_quant,
             None,
             request.dry_run,
         )
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("Windows/Ollama env patch task failed: {e}"))?
+    .map_err(|e| format!("Windows/Ollama env patch task failed: {e}"))??;
+    if dry_run {
+        state.gate.record_preview(&prepared.key);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn rollback_lm_studio_patch(
+    state: State<'_, AppState>,
     request: DesktopLmStudioRollbackRequest,
 ) -> Result<LmStudioRollbackResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let model_path = request
-            .model_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+    let (model_path, key) = prepare_lm_studio_rollback(&request)?;
+    enforce_gate(&state.gate, &key, request.dry_run)?;
+    let dry_run = request.dry_run;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         rollback_lm_studio_config(model_path.as_deref(), request.dry_run).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("LM Studio rollback task failed: {e}"))?
+    .map_err(|e| format!("LM Studio rollback task failed: {e}"))??;
+    if dry_run {
+        state.gate.record_preview(&key);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn rollback_env_patch(
+    state: State<'_, AppState>,
     request: DesktopEnvRollbackRequest,
 ) -> Result<EnvRollbackResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let key = prepare_env_rollback();
+    enforce_gate(&state.gate, &key, request.dry_run)?;
+    let dry_run = request.dry_run;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         rollback_windows_env_tweaks(request.dry_run).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("Windows/Ollama env rollback task failed: {e}"))?
+    .map_err(|e| format!("Windows/Ollama env rollback task failed: {e}"))??;
+    if dry_run {
+        state.gate.record_preview(&key);
+    }
+    Ok(result)
+}
+
+/// Authorizes a request at the backend: dry runs are always allowed (they change nothing);
+/// an apply requires a matching, unexpired, unused preview. The frontend's `dry_run` flag alone
+/// never grants permission.
+fn enforce_gate(gate: &ApplyGate, key: &str, dry_run: bool) -> Result<(), String> {
+    if dry_run {
+        Ok(())
+    } else {
+        gate.authorize_apply(key)
+    }
+}
+
+/// Validates a power-limit request and returns the gate key for its exact parameters.
+fn prepare_power_limit(request: &DesktopPowerLimitRequest) -> Result<String, String> {
+    validate_power_limit(request.limit_pct, request.pci_device_id)?;
+    Ok(gate_key(
+        "power_limit",
+        &[
+            format!("{:?}", request.pci_device_id),
+            request.limit_pct.to_string(),
+        ],
+    ))
+}
+
+fn prepare_reset_tuning(request: &DesktopResetTuningRequest) -> Result<String, String> {
+    validate_pci_device_id(request.pci_device_id)?;
+    Ok(gate_key(
+        "reset_tuning",
+        &[format!("{:?}", request.pci_device_id)],
+    ))
+}
+
+#[derive(Debug)]
+struct PreparedLmStudioPatch {
+    model_path: PathBuf,
+    profile_id: Option<String>,
+    context_tokens: u32,
+    safety_margin_mib: u64,
+    key: String,
+}
+
+fn prepare_lm_studio_patch(
+    request: &DesktopLmStudioPatchRequest,
+) -> Result<PreparedLmStudioPatch, String> {
+    validate_device_index(request.device_index)?;
+    let profile_id = validate_profile_id(request.profile_id.as_deref())?;
+    let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
+    let context_tokens = request.context_tokens.clamp(512, 262_144);
+    let safety_margin_mib = request.safety_margin_mib.clamp(0, 4096);
+    let key = gate_key(
+        "lm_studio_patch",
+        &[
+            model_path.display().to_string(),
+            format!("{:?}", request.device_index),
+            profile_id.clone().unwrap_or_default(),
+            context_tokens.to_string(),
+            safety_margin_mib.to_string(),
+        ],
+    );
+    Ok(PreparedLmStudioPatch {
+        model_path,
+        profile_id,
+        context_tokens,
+        safety_margin_mib,
+        key,
+    })
+}
+
+#[derive(Debug)]
+struct PreparedEnvPatch {
+    model_path: PathBuf,
+    context_tokens: u32,
+    kv_quant: KvCacheQuant,
+    key: String,
+}
+
+fn prepare_env_patch(request: &DesktopEnvPatchRequest) -> Result<PreparedEnvPatch, String> {
+    validate_device_index(request.device_index)?;
+    let kv_quant = parse_kv_quant_strict(request.kv_quant.as_deref())?;
+    let model_path = resolve_desktop_model_path(request.model_path.as_deref())?;
+    let context_tokens = request.context_tokens.clamp(512, 262_144);
+    let key = gate_key(
+        "env_patch",
+        &[
+            model_path.display().to_string(),
+            format!("{:?}", request.device_index),
+            context_tokens.to_string(),
+            kv_quant.as_cli_str().to_string(),
+        ],
+    );
+    Ok(PreparedEnvPatch {
+        model_path,
+        context_tokens,
+        kv_quant,
+        key,
+    })
+}
+
+fn prepare_lm_studio_rollback(
+    request: &DesktopLmStudioRollbackRequest,
+) -> Result<(Option<PathBuf>, String), String> {
+    let model_path = validate_model_path(request.model_path.as_deref())?;
+    let key = gate_key(
+        "lm_studio_rollback",
+        &[model_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<all>".to_string())],
+    );
+    Ok((model_path, key))
+}
+
+fn prepare_env_rollback() -> String {
+    gate_key("env_rollback", &[])
 }
 
 #[cfg(test)]
@@ -1080,6 +1236,191 @@ mod tests {
             ..valid
         }
         .validate_and_build_config()
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod enforcement_tests {
+    //! The desktop backend, not the frontend, decides whether a change may be applied.
+    //! None of these tests touches hardware, the registry or any user configuration.
+    use super::*;
+
+    fn temp_gguf() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rdna_forge_enforce_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.gguf");
+        std::fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    #[test]
+    fn missing_dry_run_field_defaults_to_dry_run_on_every_mutating_request() {
+        let p: DesktopPowerLimitRequest = serde_json::from_str(r#"{"limit_pct":5}"#).unwrap();
+        assert!(p.dry_run);
+        let r: DesktopResetTuningRequest = serde_json::from_str("{}").unwrap();
+        assert!(r.dry_run);
+        let l: DesktopLmStudioPatchRequest = serde_json::from_str("{}").unwrap();
+        assert!(l.dry_run);
+        let e: DesktopEnvPatchRequest = serde_json::from_str("{}").unwrap();
+        assert!(e.dry_run);
+        let lr: DesktopLmStudioRollbackRequest = serde_json::from_str("{}").unwrap();
+        assert!(lr.dry_run);
+        let er: DesktopEnvRollbackRequest = serde_json::from_str("{}").unwrap();
+        assert!(er.dry_run);
+    }
+
+    #[test]
+    fn dry_run_is_allowed_without_a_preview_and_changes_nothing() {
+        let gate = ApplyGate::new();
+        let req = DesktopPowerLimitRequest {
+            pci_device_id: Some(0x73AF),
+            limit_pct: 5,
+            dry_run: true,
+        };
+        let key = prepare_power_limit(&req).unwrap();
+        assert!(enforce_gate(&gate, &key, req.dry_run).is_ok());
+        // A dry run authorizes nothing by itself: recording happens only after it succeeded.
+        assert!(gate.authorize_apply(&key).is_err());
+    }
+
+    #[test]
+    fn apply_requires_a_matching_preview_and_is_single_use() {
+        let gate = ApplyGate::new();
+        let apply = |limit| DesktopPowerLimitRequest {
+            pci_device_id: Some(0x73AF),
+            limit_pct: limit,
+            dry_run: false,
+        };
+        let key5 = prepare_power_limit(&apply(5)).unwrap();
+        // Frontend says dry_run=false but nothing was previewed: refused.
+        assert!(enforce_gate(&gate, &key5, false)
+            .unwrap_err()
+            .contains("no matching dry-run"));
+
+        gate.record_preview(&key5);
+        // A preview for 5% does not authorize 10%.
+        let key10 = prepare_power_limit(&apply(10)).unwrap();
+        assert!(enforce_gate(&gate, &key10, false).is_err());
+        // The matching apply is allowed once.
+        assert!(enforce_gate(&gate, &key5, false).is_ok());
+        assert!(enforce_gate(&gate, &key5, false).is_err());
+    }
+
+    #[test]
+    fn invalid_power_limit_and_reset_requests_never_reach_the_gate() {
+        for limit in [101, -101, i32::MAX, i32::MIN] {
+            let req = DesktopPowerLimitRequest {
+                pci_device_id: None,
+                limit_pct: limit,
+                dry_run: false,
+            };
+            assert!(prepare_power_limit(&req).is_err(), "accepted {limit}");
+        }
+        let bad_id = DesktopPowerLimitRequest {
+            pci_device_id: Some(0),
+            limit_pct: 5,
+            dry_run: false,
+        };
+        assert!(prepare_power_limit(&bad_id).is_err());
+        let bad_reset = DesktopResetTuningRequest {
+            pci_device_id: Some(0x1_0000),
+            dry_run: false,
+        };
+        assert!(prepare_reset_tuning(&bad_reset).is_err());
+    }
+
+    #[test]
+    fn lm_studio_patch_validates_inputs_and_binds_the_preview_to_exact_parameters() {
+        let model = temp_gguf();
+        let base = DesktopLmStudioPatchRequest {
+            model_path: Some(model.display().to_string()),
+            device_index: Some(0),
+            profile_id: Some("vulkan_wddm_priority".to_string()),
+            context_tokens: 4096,
+            safety_margin_mib: 512,
+            dry_run: false,
+        };
+        let ok = prepare_lm_studio_patch(&base).unwrap();
+
+        // Invalid inputs are rejected before the gate or any write is considered.
+        let bad = |f: &dyn Fn(&mut DesktopLmStudioPatchRequest)| {
+            let mut r = base.clone();
+            f(&mut r);
+            prepare_lm_studio_patch(&r).is_err()
+        };
+        assert!(bad(&|r| r.profile_id = Some("../../evil".into())));
+        assert!(bad(&|r| r.device_index = Some(10_000)));
+        assert!(bad(
+            &|r| r.model_path = Some("C:\\nope\\missing.gguf".into())
+        ));
+        assert!(bad(
+            &|r| r.model_path = Some(model.with_extension("txt").display().to_string())
+        ));
+
+        // A preview binds to model, device, profile, context and margin.
+        let gate = ApplyGate::new();
+        gate.record_preview(&ok.key);
+        let mut other = base.clone();
+        other.context_tokens = 8192;
+        let other = prepare_lm_studio_patch(&other).unwrap();
+        assert_ne!(ok.key, other.key);
+        assert!(enforce_gate(&gate, &other.key, false).is_err());
+        assert!(enforce_gate(&gate, &ok.key, false).is_ok());
+    }
+
+    #[test]
+    fn env_patch_rejects_unknown_kv_quant_instead_of_defaulting() {
+        let model = temp_gguf();
+        let mut req = DesktopEnvPatchRequest {
+            model_path: Some(model.display().to_string()),
+            device_index: None,
+            context_tokens: 4096,
+            kv_quant: Some("q5_1".to_string()),
+            dry_run: false,
+        };
+        assert!(prepare_env_patch(&req)
+            .unwrap_err()
+            .contains("unknown KV cache type"));
+        req.kv_quant = Some("q4_0".to_string());
+        let q4 = prepare_env_patch(&req).unwrap();
+        req.kv_quant = Some("f16".to_string());
+        let f16 = prepare_env_patch(&req).unwrap();
+        assert_ne!(
+            q4.key, f16.key,
+            "different KV types must not share a preview"
+        );
+    }
+
+    #[test]
+    fn rollbacks_are_gated_and_scoped() {
+        let gate = ApplyGate::new();
+        let all = prepare_lm_studio_rollback(&DesktopLmStudioRollbackRequest {
+            model_path: None,
+            dry_run: false,
+        })
+        .unwrap();
+        assert!(enforce_gate(&gate, &all.1, false).is_err());
+        gate.record_preview(&all.1);
+        assert!(enforce_gate(&gate, &all.1, false).is_ok());
+
+        let env_key = prepare_env_rollback();
+        assert!(enforce_gate(&gate, &env_key, false).is_err());
+        // An LM Studio rollback preview never authorizes the registry rollback.
+        gate.record_preview(&all.1);
+        assert!(enforce_gate(&gate, &env_key, false).is_err());
+
+        assert!(prepare_lm_studio_rollback(&DesktopLmStudioRollbackRequest {
+            model_path: Some("not-a-model.txt".into()),
+            dry_run: false,
+        })
         .is_err());
     }
 }
