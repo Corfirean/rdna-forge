@@ -87,14 +87,18 @@ cargo test --workspace -- --ignored --test-threads=1 --nocapture
 .\target\release\forge.exe tune show
 .\target\release\forge.exe tune show --json
 
-# GGUF LLM Inspector, Anti-WDDM-Spill Memory Planner, RDNA2 Empirical Autotuner & Safe LM Studio/Ollama Auto-Patcher
+# Hardware profile discovery & auto-matching
+.\target\release\forge.exe profile list
+.\target\release\forge.exe profile match --device 0
+
+# GGUF LLM Inspector, Anti-WDDM-Spill Memory Planner, Multi-GPU Autotuner & Safe LM Studio/Ollama Auto-Patcher
 .\target\release\forge.exe llm discover
 .\target\release\forge.exe llm inspect
-.\target\release\forge.exe llm plan --context 4096
-.\target\release\forge.exe llm autotune --vulkan-bin ..\llama-vk\llama-bench.exe --hip-bin ..\llama-hip\llama-bench.exe --context-depth 2048 --reps 2 --output ..\llm_autotune.json
+.\target\release\forge.exe llm plan --device 0 --context 4096
+.\target\release\forge.exe llm autotune --device 0 --vulkan-bin ..\llama-vk\llama-bench.exe --hip-bin ..\llama-hip\llama-bench.exe --context-depth 2048 --reps 2 --output ..\llm_autotune.json
 # Safe dry-run preview of LM Studio per-model JSON & Windows/Ollama environment tweaks (pass --apply to commit with .bak backups):
-.\target\release\forge.exe llm apply-lmstudio --profile vulkan_wddm_priority --context 4096
-.\target\release\forge.exe llm apply-env --context 4096 --kv-quant q8-0
+.\target\release\forge.exe llm apply-lmstudio --device 0 --profile vulkan_wddm_priority --context 4096
+.\target\release\forge.exe llm apply-env --device 0 --context 4096 --kv-quant q8-0
 
 # Range-validated power limit & factory reset (SAFE DRY-RUN by default; pass --apply to commit)
 .\target\release\forge.exe tune power-limit 5

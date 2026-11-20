@@ -20,7 +20,11 @@ rdna-forge/
 ├── modules/
 │   └── ai/triton/        # Reproducible PyTorch ROCm + Triton kernel suite (bench_suite.py)
 ├── profiles/
-│   └── gfx1030/          # Declarative hardware target profiles (rx6900xt.toml)
+│   ├── gfx1030/          # RDNA2 Navi 21 profiles (rx6900xt.toml, rx6950xt.toml, rx6800xt.toml)
+│   ├── gfx1031/..gfx1032/ # RDNA2 Navi 22/23 profiles (rx6700xt.toml, rx6600xt.toml)
+│   ├── gfx1100/..gfx1103/ # RDNA3 & 780M profiles (rx7900xtx/xt, pro_w7900, rx7800/7700/7600xt, radeon780m)
+│   ├── gfx1150/..gfx1151/ # RDNA3.5 Strix Point / Strix Halo APU profiles (radeon890m, radeon8060s)
+│   └── gfx1200/..gfx1201/ # RDNA4 profiles (rx9060xt, rx9070, rx9070xt, ai_pro_r9700)
 └── tests/
     ├── integration/      # Hardware-independent workspace integration tests
     └── gpu/              # Ignored live-GPU correctness and stability tests
@@ -33,8 +37,8 @@ Crate dependency flow (`forge-cli`, `forge-desktop` -> `forge-benchmark` -> {`fo
 ## 2. Module Responsibilities
 
 ### `forge-core`
-- **`architecture`**: Defines `GpuArchitecture`, conservative ISA `ArchitectureCapabilities` (`has_wmma`, `has_mfma`, `has_dp4a_i8`, `has_dot8_i4`, `has_native_fp16`, `has_native_bf16`, `has_native_fp8`, wave sizes), `GfxTarget::parse` (`gfx1030`, `gfx1030:xnack-`, `gfx90a`), and explicit PCI ID lookup (`lookup_amd_pci_device`) returning `None` for unknown IDs instead of guessing.
-- **`profile`**: Parses and validates TOML hardware target files (`profiles/gfx1030/rx6900xt.toml`).
+- **`architecture`**: Defines `GpuArchitecture` (with `supports_hipblaslt`, `supports_rocwmma_fattn`, `supports_av1_encode`, `vcn_generation`), conservative ISA `ArchitectureCapabilities` (`has_wmma`, `has_mfma`, `has_dp4a_i8`, `has_dot8_i4`, `has_native_fp16`, `has_native_bf16`, `has_native_fp8`, wave sizes), `GfxTarget::parse` (`gfx1030`, `gfx1030:xnack-`, `gfx90a`), and expanded PCI ID lookup (`lookup_amd_pci_device` covering RDNA1–RDNA4 discrete, Radeon PRO workstation, and Strix Point / Strix Halo / Krackan Point APUs, returning `None` for unknown IDs).
+- **`profile`**: Parses, validates, and embeds all 18 TOML hardware profiles (`BuiltinProfileInfo`, `builtin_profiles`, `builtin_profile_by_id`) plus token/CU/VRAM-disambiguated auto-matching (`match_profile_for_device`).
 - **`policy`**: Enforces `validate_kernel_execution` (checks vendor, `maxBufferSize`, VRAM budget, FP16/BF16/FP8/INT8/WMMA/MFMA flags) and `select_preferred_device` (deterministic ordering: discrete AMD > integrated AMD > other, breaking ties by VRAM).
 - **`error`**: Typed `ForgeError` enum using `thiserror` across all library crates.
 
@@ -62,21 +66,21 @@ Correlates four independent Windows sources without relying on broken `Win32_Vid
 ### `forge-benchmark`
 - **`stats`**: Computes `min`, `median`, `mean`, `p95`, `max`, `MAD`, `IQR`, `stddev`, and `CV%` over warmed, repeated runs.
 - **`memory`**: Captures process peak working set via Win32 `GetProcessMemoryInfo`.
-- **`vulkan_suite`**, **`video`**, **`llama`**, **`llm_optimizer`**, **`triton`**: Orchestrates reproducible compute, VCN hardware video encode (`run_video_benchmark_suite`), GGUF v2/v3 header inspection (including MoE `<arch>.expert_count` & `-ncmoe` calculation), anti-WDDM-spill VRAM planning, 1-click dry-run-safe LM Studio config & Windows/Ollama environment patching (`inspect_gguf_model`, `plan_llm_configuration`, `autotune_llm_model`, `apply_lm_studio_config`, `apply_windows_and_ollama_env_tweaks`), and LLM benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan and AMF VCN; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
+- **`vulkan_suite`**, **`video`**, **`llama`**, **`llm_optimizer`**, **`triton`**: Orchestrates reproducible compute, VCN hardware video encode (`run_video_benchmark_suite`), GGUF v2/v3 header inspection (including MoE `<arch>.expert_count` & `-ncmoe` calculation), multi-GPU anti-WDDM-spill & APU unified-memory VRAM planning (`LlmTargetGpuContext`, `plan_llm_configuration_for_device`, `plan_llm_configuration_for_gpu`), architecture-tailored `llama.cpp` tweaks (including `ROCBLAS_USE_HIPBLASLT=1` on RDNA3/3.5/4 and Vulkan-only guidance on RDNA1), 1-click dry-run-safe LM Studio config & Windows/Ollama environment patching (`inspect_gguf_model`, `plan_llm_configuration`, `autotune_llm_model`, `apply_lm_studio_config`, `apply_windows_and_ollama_env_tweaks`), and LLM benchmarks (with configurable `--batch-dispatches` defaulting to `16` for sub-ms decode/elementwise kernels) and attaches ADLX telemetry (`TelemetryGuard` for native Vulkan and AMF VCN; non-overlapping pre/post snapshots for ROCm/HIP workloads, opt-in via `--telemetry` on `forge bench triton`).
 
 ### `forge-cli`
 Thin CLI boundary (`clap` + `anyhow`) exposing:
 - `forge doctor [--json] [--verify] [--python]`
 - `forge video {caps [--json], bench [--codec all|h264|hevc|hevc10] [--width W] [--height H] [--fps F] [--bitrate-mbps M] [--preset speed|balanced|quality] [--warmup N] [--frames N] [--json] [--output PATH]}`
-- `forge llm {discover [--json], inspect [--model PATH] [--json], plan [--model PATH] [--context N] [--safety-margin-mib M] [--json] [--output PATH], autotune [--model PATH] [--vulkan-bin PATH] [--hip-bin PATH] [--rocm-lib-dir PATH] [--context-depth D] [--reps R] [--json] [--output PATH], apply-lmstudio [--model PATH] [--profile ID] [--context N] [--safety-margin-mib M] [--apply] [--json], apply-env [--model PATH] [--context N] [--kv-quant f16|q8-0|q4-0] [--modelfile-out PATH] [--apply] [--json]}`
+- `forge llm {discover [--json], inspect [--model PATH] [--json], plan [--model PATH] [--device N] [--context N] [--safety-margin-mib M] [--json] [--output PATH], autotune [--model PATH] [--device N] [--vulkan-bin PATH] [--hip-bin PATH] [--rocm-lib-dir PATH] [--context-depth D] [--reps R] [--json] [--output PATH], apply-lmstudio [--model PATH] [--device N] [--profile ID] [--context N] [--safety-margin-mib M] [--apply] [--json], apply-env [--model PATH] [--device N] [--context N] [--kv-quant f16|q8-0|q4-0] [--modelfile-out PATH] [--apply] [--json]}`
 - `forge monitor [--interval-ms N] [--count N] [--duration-secs S] [--device-id HEX] [--format table|jsonl|csv] [--output PATH]` (with Win32 `SetConsoleCtrlHandler` graceful termination and clean `ADLXTerminate`)
 - `forge tune {show [--device-id HEX] [--json], power-limit <PCT> [--device-id HEX] [--apply], reset [--device-id HEX] [--apply]}`
 - `forge bench {vulkan [--batch-dispatches N],llama [--flash-attn] [--hip-disable-graphs],triton [--smoke] [--telemetry]}`
-- `forge profile show`
+- `forge profile {show <PATH> [--json], list [--json], match [--device N] [--json]}`
 
 ### `forge-desktop`
 Optional Windows-native Tauri v2 + Edge WebView2 application (`apps/forge-desktop`) serving embedded vanilla ES assets (`ui/`) with zero `node_modules` dependencies:
-- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics`, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_video_benchmark`, `run_vulkan_benchmark`, `get_llm_assets`, `get_llm_plan`, `run_llm_autotune`, `apply_lm_studio_patch`, `apply_env_and_ollama_patch`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations.
+- **`commands`**: Thread-safe Tauri IPC handlers (`get_diagnostics` with `gpu_metadata` matched profiles & VCN/ISA metadata, `run_live_verification`, `get_telemetry_snapshot`, `get_tuning_report`, `set_power_limit`, `reset_tuning`, `get_video_caps`, `run_video_benchmark`, `run_vulkan_benchmark`, `get_llm_assets`, `get_llm_plan`, `run_llm_autotune`, `apply_lm_studio_patch`, `apply_env_and_ollama_patch`) synchronized via an RAII `BusyGuard` so live ADLX polling pauses automatically during exclusive GPU runs or tuning operations, forwarding selected `device_index` into LLM planning, autotuning, and patching.
 - **`ui`**: Six views (`Overview`, `Monitor` with 4 rolling Canvas 2D strip charts, `Tuning` with active vs factory VBIOS fan-curve plot, external fan manager diagnostics & explicit `Unlock Hardware Writes` confirmation gate, `Video (AMF)` with codec capabilities table & VCN hardware encode benchmark runner, `Benchmarks`, and `LLM Optimizer` with GGUF/MoE header analysis, anti-WDDM-spill VRAM planner, RDNA2 tweak commands, empirical autotuner, and 1-Click LM Studio / Ollama / Windows `HKCU\Environment` Auto-Patcher).
 
 ---

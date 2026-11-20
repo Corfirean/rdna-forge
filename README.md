@@ -1,8 +1,8 @@
 # RDNA Forge
 
-**Windows-native AMD Radeon diagnostics, capability verification, and reproducible GPU compute benchmarking toolkit.**
+**Windows-native AMD Radeon diagnostics, capability verification, multi-GPU hardware profiles, and reproducible GPU compute benchmarking toolkit.**
 
-RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contributors on Windows 11 accurately detect `gfx` targets, audit broken vs working compute backends, and measure kernels and LLM inference against strict numerical correctness and statistical standards—starting with RDNA2 (`gfx1030`, RX 6900 XT).
+RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contributors on Windows 11 accurately detect `gfx` targets, auto-match hardware profiles (`RX 6000`, `RX 7000`, `RX 9000`, `Radeon PRO`, and `Ryzen AI 780M / 890M / 8060S Strix Halo`), audit broken vs working compute backends, and measure kernels and LLM inference against strict numerical correctness and statistical standards—verified first on RDNA2 (`gfx1030`, RX 6900 XT).
 
 ### What Works Today
 - **Multi-source Windows GPU, runtime & live ADLX telemetry (`forge doctor`, `forge monitor`)**: Correlates `RtlGetVersion`, Windows Display Registry (`qwMemorySize`, Adrenalin version), Vulkan (`ash`), AMD HIP (`amdhip64_*.dll` `R0600` ABI), Python ROCm/`triton-windows`, and pure-Rust ADLX `V1.4` live streaming (`table`, `jsonl`, `csv`) with WDDM VRAM pressure alerts.
@@ -13,7 +13,7 @@ RDNA Forge helps AMD Radeon developers, local AI engineers, and GPU kernel contr
 ### Currently Verified Hardware
 - **Primary verified target**: AMD Radeon RX 6900 XT (`gfx1030`, RDNA2, 16 GiB VRAM) on Windows 11 Build `26300` with Adrenalin `26.11.2`.
 - **Detected secondary adapter**: AMD Ryzen 7 7700X integrated Radeon Graphics (`gfx1036`, RDNA2).
-- Other RDNA2, RDNA3, and RDNA4 targets are modeled in capability tables but **not yet tested on physical hardware**.
+- **18 built-in profiles & multi-architecture policy (not yet physically tested)**: `RX 6950 XT`, `RX 6800 XT`, `RX 6700 XT`, `RX 6600 XT`, `RX 7900 XTX`, `RX 7900 XT`, `Radeon PRO W7900`, `RX 7800 XT`, `RX 7700 XT`, `RX 7600 XT`, `Radeon 780M`, `Radeon 890M`, `Radeon 8060S Strix Halo`, `RX 9070 XT`, `RX 9070`, `Radeon AI PRO R9700`, and `RX 9060 XT` (plus PCI mapping for `RDNA1`, `Krackan Point`, and workstation SKUs).
 
 ---
 
@@ -23,7 +23,7 @@ Consumer AMD GPUs on Windows—especially RDNA2 (`gfx1030`)—face fragmented to
 
 RDNA Forge provides an evidence-driven engineering foundation before building custom optimizations: every backend is probed honestly, gated by actual hardware ISA capabilities, and measured with reproducible baselines.
 
-**Current Project Status:** Milestone 5 complete (ADLX active vs factory VBIOS fan curve diagnostics + external `FanControl.exe` override detection, plus pure-Rust GGUF v2/v3 Model Inspector, Anti-WDDM-Spill VRAM Planner & RDNA2 `llama.cpp` Autotuner `forge llm {discover,inspect,plan,autotune}` and `Forge Desktop` **LLM Optimizer** tab — verified on `Qwen3.8-27B` `UD-IQ4_XS` `13.41 GiB` with **`+108%` prefill (`343.20 tok/s`)** and **`+63%` token generation (`26.81 tok/s`)** at 2K context via `GGML_VK_ENABLE_MEMORY_PRIORITY=1`), building on Milestone 4C (pure-Rust AMF VCN 3.0 DX11 video encode benchmark at **`412.85–417.74 FPS`** `1080p` and **`116.46–120.30 FPS`** `4K`), Milestone 4B (Wave32 GGUF `Q4_K` GEMV at **`239.14 GB/s`** and `16 KiB` LDS tiled causal FlashAttention at **`1125.66 GFLOP/s`**), Milestone 4A (**Forge Desktop**), Milestone 3C, Milestone 3B, Milestone 3A, and Milestone 2.
+**Current Project Status:** Milestone 6 complete (Multi-GPU AMD Radeon support across **RDNA1, RDNA2, RDNA3, RDNA3.5 APUs & RDNA4**: 18 validated hardware profiles, automatic PCI/CU/VRAM profile matching via `forge profile {list,match}`, architecture-tailored `llama.cpp` planning including `ROCBLAS_USE_HIPBLASLT=1` on RDNA3/3.5/4, APU unified-memory budgets, `--device` targeting, and `Forge Desktop` multi-GPU/auto-patcher fixes), building on Milestone 5 (`Qwen3.8-27B` `UD-IQ4_XS` `+108%` prefill / `+63%` decode & LM Studio/Ollama auto-patcher), Milestone 4C (`AMF` VCN encode bench), Milestone 4B (`Q4_K` GEMV & FlashAttention), Milestone 4A (**Forge Desktop**), Milestone 3C, Milestone 3B, Milestone 3A, and Milestone 2.
 
 ---
 
@@ -32,9 +32,12 @@ RDNA Forge provides an evidence-driven engineering foundation before building cu
 | Target | Architecture | OS | Status | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | AMD Radeon RX 6900 XT (`gfx1030`) | RDNA2 | Windows 11 (`26300`) | **Verified** | Full discovery, Vulkan compute, HIP runtime, PyTorch ROCm 10.2, `triton-windows` 3.9, `llama.cpp` `b12532` |
-| AMD Radeon Graphics (`gfx1036`, Raphael iGPU) | RDNA2 | Windows 11 (`26300`) | **Partially verified** | Enumerated across Vulkan, HIP, and Registry; compute not separately benchmarked |
-| Other RDNA2 / RDNA3 / RDNA3.5 / RDNA4 | RDNA1–4 | Windows 11 | **Not tested** | Profile/PCI tables present; no hardcoded RX 6900 XT assumptions |
-| Linux | — | Linux | **Deferred** | Future milestone; Windows-native is the Milestone 1 priority |
+| AMD Radeon Graphics (`gfx1036`, Raphael iGPU) | RDNA2 | Windows 11 (`26300`) | **Partially verified** | Enumerated across Vulkan, HIP, and Registry; multi-GPU `--device 1` LLM planning tested; compute not separately benchmarked |
+| RX 6950/6800/6700/6600 XT (`gfx1030`–`gfx1032`) | RDNA2 | Windows 11 | **Not tested** | Built-in TOML profiles (`profiles/gfx1030`..`gfx1032`), PCI/CU disambiguation, and RDNA2 WDDM LLM planner |
+| RX 7900/7800/7700/7600 XT, PRO W7900, 780M (`gfx1100`–`gfx1103`) | RDNA3 | Windows 11 | **Not tested** | Built-in TOML profiles (`profiles/gfx1100`..`gfx1103`), WMMA/BF16 gating, `VCN 4.0`, and `ROCBLAS_USE_HIPBLASLT=1` planner |
+| Radeon 890M (`gfx1150`) & 8060S Strix Halo (`gfx1151`) | RDNA3.5 | Windows 11 | **Not tested** | Built-in APU profiles (`profiles/gfx1150`..`gfx1151`), `0x150E`/`0x1586` PCI mapping, and unified-RAM / BIOS UMA planner |
+| RX 9070 XT / 9070 / AI PRO R9700 (`gfx1201`), RX 9060 XT (`gfx1200`) | RDNA4 | Windows 11 | **Not tested** | Built-in TOML profiles (`profiles/gfx1200`..`gfx1201`), native FP8/BF16/WMMA gating, `VCN 5.0`, and `hipBLASLt` planner |
+| Linux | — | Linux | **Deferred** | Future milestone; Windows-native is the active priority |
 
 ---
 
@@ -155,9 +158,14 @@ Machine-readable output is supported via `forge doctor --json`, `forge video cap
 # Pass --apply only when intentionally modifying GPU tuning:
 # .\target\release\forge.exe tune power-limit 5 --apply
 
-# Probe AMD AMF hardware video encode/decode codec support & run VCN 3.0 hardware encode benchmark
+# Probe AMD AMF hardware video encode/decode codec support & run VCN hardware encode benchmark
 .\target\release\forge.exe video caps
 .\target\release\forge.exe video bench --codec all --width 1920 --height 1080 --fps 60 --bitrate-mbps 12 --preset speed --warmup 15 --frames 120
+
+# List built-in AMD Radeon hardware profiles, auto-match active GPU, and plan LLM memory for a target device
+.\target\release\forge.exe profile list
+.\target\release\forge.exe profile match --device 0
+.\target\release\forge.exe llm plan --device 0 --context 4096
 ```
 
 ---
@@ -195,13 +203,13 @@ Full dispersion metrics, WDDM VRAM diagnosis, ADLX telemetry, model SHA-256, and
 
 RDNA Forge separates Rust orchestration and safety policy from GPU compute backends:
 
-- [`crates/forge-core`](crates/forge-core): Target parser (`GfxTarget`), PCI ID table, capability policy, hardware profile schema ([rx6900xt.toml](profiles/gfx1030/rx6900xt.toml)).
+- [`crates/forge-core`](crates/forge-core): Target parser (`GfxTarget`), PCI ID table, capability policy, 18 built-in TOML profiles ([profiles](profiles)), and GPU auto-matcher (`match_profile_for_device`).
 - [`crates/forge-device`](crates/forge-device): Windows OS, Registry, Vulkan (`ash`), HIP `R0600` ABI, and dynamic ADLX device correlation.
 - [`crates/forge-profiler`](crates/forge-profiler): Dynamic ADLX `V1.4` COM telemetry & tuning (`IADLXGPUTuningServices`, clocks, temps, power, fan curves, WDDM VRAM contention checks).
 - [`crates/forge-runtime`](crates/forge-runtime): Backend probing, pure-Rust dynamic AMF DX11 COM video capability probing (`amfrt64.dll`), pure-Rust WGSL->SPIR-V (`naga`), RAII Vulkan compute engine with multi-dispatch batching (`gemm_f32_tiled_vec4`, `gemm_i8_dp4a`, Wave32 `gemv_w8a32` / `gemv_q4_0` / `gemv_q4_k`, `rmsnorm_rope_f32_subgroup`, `flash_attention_f32_wave32`), FP64/`i64` CPU references, HIP transfer verifier, and shared live capability verification.
-- [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, ADLX telemetry integration, and `llama-bench` / Triton adapters.
-- [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `video`, `monitor`, `tune`, `bench`, `profile`).
-- [`apps/forge-desktop`](apps/forge-desktop): Optional Tauri v2 + WebView2 Windows GUI (`Overview`, live `Monitor`, `Tuning`, `Video (AMF)`, and Vulkan `Benchmarks` with shared `BusyGuard` mutual exclusion).
+- [`crates/forge-benchmark`](crates/forge-benchmark): Statistical harness, process RSS tracking, ADLX telemetry integration, multi-GPU GGUF/LLM planner (`llm_optimizer`), and `llama-bench` / Triton adapters.
+- [`apps/forge-cli`](apps/forge-cli): `forge` binary (`doctor`, `video`, `monitor`, `tune`, `bench`, `llm`, `profile`).
+- [`apps/forge-desktop`](apps/forge-desktop): Optional Tauri v2 + WebView2 Windows GUI (`Overview`, live `Monitor`, `Tuning`, `Video (AMF)`, Vulkan `Benchmarks`, and `LLM Optimizer` with shared `BusyGuard` mutual exclusion).
 - [`modules/ai/triton`](modules/ai/triton): Reproducible PyTorch ROCm + Triton kernel suite.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points.
@@ -234,7 +242,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for module contracts and extension points
 - **Milestone 5 (Complete):**
   - Upgraded `forge-profiler` ADLX fan tuning inspection to query both active (`GetFanTuningStates`) and VBIOS factory default (`GetDefaultFanTuningStates`) 5-point curves and automatically detect external fan controllers (`FanControl.exe`) driving RDNA2 in flat-PWM override mode.
   - Added pure-Rust GGUF v2/v3 Model Inspector (including MoE `<arch>.expert_count` & `-ncmoe` offload calculation), Anti-WDDM-Spill Memory Planner, RDNA2 `llama.cpp` Empirical Autotuner, and 1-Click dry-run-safe LM Studio / Ollama / Windows `HKCU\Environment` Auto-Patcher (`forge llm {discover,inspect,plan,autotune,apply-lmstudio,apply-env}` + `Forge Desktop` **LLM Optimizer** tab), verified on `Qwen3.8-27B` `UD-IQ4_XS` (`13.41 GiB`, 65 layers) with **`+108%` prefill (`343.20 tok/s`)** and **`+63%` token generation (`26.81 tok/s`)** at 2K context (`GGML_VK_ENABLE_MEMORY_PRIORITY=1`, `GGML_VK_VISIBLE_DEVICES=0`, `HIP_VISIBLE_DEVICES=0`, and `-ctk q4_0 -ctv q4_0`).
-- **Future:** AMF VCN 3.0 hardware decode pipeline benchmarking, FidelityFX SDK evaluation, RDNA3/RDNA4 verification, Linux support.
+- **Milestone 6 (Complete):**
+  - Expanded AMD Radeon support across **RDNA1, RDNA2, RDNA3, RDNA3.5 APUs (`Strix Point` / `Strix Halo`), RDNA4, and Radeon PRO workstation cards**: fixed `0x150E` (`gfx1150` 890M) vs `0x1586` (`gfx1151` 8060S) PCI mapping, added workstation/Krackan/refresh PCI IDs and `GpuArchitecture::{supports_hipblaslt, supports_rocwmma_fattn, supports_av1_encode, vcn_generation}`, and shipped 18 validated TOML hardware profiles with token/CU/VRAM-aware `match_profile_for_device` + `forge profile {list,match}`.
+  - Refactored `llm_optimizer` (`LlmTargetGpuContext`, `plan_llm_configuration_for_device`) to support multi-GPU `--device N` / Desktop GPU selector targeting, APU unified-memory budgets with BIOS UMA / Adrenalin VGM guidance, `ROCBLAS_USE_HIPBLASLT=1` + `rocm_wmma_hipblaslt` profiles on RDNA3/3.5/4, Vulkan-only guidance on RDNA1, dynamic `disabledGpus` / `EnvVarChange.purpose`, and fixed Desktop LLM Auto-Patcher field bindings.
+- **Future:** Physical hardware verification on RDNA3 / RDNA3.5 / RDNA4, AMF VCN hardware decode pipeline benchmarking, FidelityFX SDK evaluation, Linux support.
 
 ---
 

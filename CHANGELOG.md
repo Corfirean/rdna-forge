@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Milestone 6 (Multi-GPU AMD Radeon Support: RDNA1–RDNA4, APUs & Radeon PRO)
+- Expanded `crates/forge-core` hardware database and profile registry:
+  - Fixed `0x150E` (`gfx1150` Strix Point 890M/880M) vs `0x1586` (`gfx1151` Strix Halo 8060S/8050S) PCI mapping and added Krackan Point (`0x1114`), `RX 6950 XT`, `RX 6650 XT`, `Radeon AI PRO R9700` (`0x7551`), `PRO W6800/W6600M/W6400/W7900/W7700/W7500`, and `RX 7600M` PCI device IDs.
+  - Added `GpuArchitecture::{supports_hipblaslt, supports_rocwmma_fattn, supports_av1_encode, vcn_generation}` capability helpers.
+  - Created 17 additional TOML profiles under `profiles/` (18 total across `gfx1030`, `gfx1031`, `gfx1032`, `gfx1100`–`gfx1103`, `gfx1150`–`gfx1151`, `gfx1200`–`gfx1201`) plus `BuiltinProfileInfo`, `builtin_profiles()`, `builtin_profile_by_id()`, and shared-PCI-ID disambiguating `match_profile_for_device()` in `crates/forge-core/src/profile.rs`.
+- Removed RDNA2-only assumptions across `crates/forge-profiler/src/adlx_tuning.rs` and `crates/forge-runtime/src/probe.rs` (Triton summary now reports community RDNA1/2 vs native RDNA3/3.5/4 support dynamically).
+- Upgraded `crates/forge-benchmark/src/llm_optimizer.rs` (`LlmTargetGpuContext`, `plan_llm_configuration_for_gpu`, `plan_llm_configuration_for_device`):
+  - Targets any GPU selected via `--device N` or Desktop GPU dropdown with exact Vulkan and HIP visible-device indices (`vk_visible_device`, `hip_visible_device`, `disabled_gpu_indices`).
+  - Handles integrated APU unified memory pools (`is_apu_unified_memory`, half-RAM ceiling when BIOS UMA carveout < 2 GiB, and BIOS UMA / Adrenalin Variable Graphics Memory guidance).
+  - Emits RDNA3/RDNA3.5/RDNA4 `rocm_wmma_hipblaslt` profiles (`ROCBLAS_USE_HIPBLASLT=1` + `q8_0`/`q4_0` KV cache), Vulkan-only guidance on RDNA1, dynamic VRAM headroom / scratch sizing, populated `EnvVarChange.purpose`, and safe per-GPU `ngl` caps inside `autotune_llm_model`.
+- Extended `forge-cli` and `tests/integration/workspace_tests.rs` with `forge profile {list,match}`, `--device` flags on `forge llm {plan,autotune,apply-lmstudio,apply-env}`, matched-profile & VCN output in `forge doctor`, and full profile validation tests (`all_profiles_on_disk_load_and_validate_and_match_builtin_registry`).
+- Updated `apps/forge-desktop` with `gpu_metadata` in Overview (`Matched Profile` & `ISA & Media` VCN/WMMA/FP8 row), multi-GPU LLM dropdown reactivity, unified APU VRAM tiles, and fixed Milestone 5B field bindings (`selected_lmstudio_backend`, `model_config_backup_path`, `backend_prefs_backup_path`, `patched_model_json_preview`, `ollama_create_cmd`, `c.key`, `c.purpose`, `ollama_modelfile_content`) in `ui/views.js`.
+
 ### Added — Milestone 5 (ADLX Fan Curve Diagnostics + GGUF Inspector, Anti-WDDM-Spill Memory Planner & RDNA2 LLM Autotuner)
 - Upgraded `crates/forge-profiler/src/adlx_tuning.rs` and `tuning.rs` (`FanTuningInfo`):
   - Added `IADLXManualFanTuning1::GetDefaultFanTuningStates` (vtable slot `[23]`) to read the GPU VBIOS factory 5-point fan curve (`default_fan_curve`, verified on RX 6900 XT as `30C->20%, 50C->30%, 61C->40%, 72C->50%, 80C->70%`) alongside active ADLX states (`GetFanTuningStates`).
