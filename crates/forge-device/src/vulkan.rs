@@ -280,8 +280,8 @@ fn inspect_physical_device(
     let mut rebar_bytes = 0u64;
     let heap_count = mem_props.memory_heap_count as usize;
 
-    for heap_idx in 0..heap_count {
-        let heap = mem_props.memory_heaps[heap_idx];
+    // `take` bounds the walk by the driver-reported count (never past the fixed-size array).
+    for heap in mem_props.memory_heaps.iter().take(heap_count) {
         if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
             device_local_bytes = device_local_bytes.saturating_add(heap.size);
         }
