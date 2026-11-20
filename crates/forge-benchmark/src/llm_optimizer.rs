@@ -296,6 +296,47 @@ pub struct EnvAndOllamaPatchResult {
     pub ollama_create_cmd: String,
 }
 
+/// Environment variable names in `HKCU\Environment` managed by RDNA Forge LLM tweaks.
+pub const RDNA_FORGE_MANAGED_ENV_KEYS: &[&str] = &[
+    "GGML_VK_ENABLE_MEMORY_PRIORITY",
+    "GGML_VK_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCBLAS_USE_HIPBLASLT",
+    "OLLAMA_FLASH_ATTENTION",
+    "OLLAMA_KV_CACHE_TYPE",
+    "OLLAMA_NUM_PARALLEL",
+];
+
+/// Single LM Studio JSON config file restore action from its `.bak` backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackFileAction {
+    pub target_path: String,
+    pub backup_path: String,
+    pub restored: bool,
+}
+
+/// Result of previewing (`dry_run = true`) or restoring (`dry_run = false`) LM Studio `.json.bak` backups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LmStudioRollbackResult {
+    pub applied: bool,
+    pub actions: Vec<RollbackFileAction>,
+}
+
+/// Status of a single RDNA Forge-managed `HKCU\Environment` variable during rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvRollbackItem {
+    pub key: String,
+    pub current_value: Option<String>,
+    pub removed: bool,
+}
+
+/// Result of previewing (`dry_run = true`) or deleting (`dry_run = false`) RDNA Forge `HKCU\Environment` variables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvRollbackResult {
+    pub applied: bool,
+    pub keys: Vec<EnvRollbackItem>,
+}
+
 #[derive(Debug, Clone)]
 enum GgufValue {
     UInt(u64),
@@ -2361,5 +2402,149 @@ pub fn apply_windows_and_ollama_env_tweaks(
         ollama_modelfile_content,
         ollama_modelfile_path: written_path,
         ollama_create_cmd,
+    })
+}
+
+fn collect_json_bak_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_json_bak_files(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".json.bak"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn target_path_from_json_bak(bak_path: &Path) -> Option<PathBuf> {
+    let raw = bak_path.to_string_lossy();
+    raw.strip_suffix(".bak").map(PathBuf::from)
+}
+
+/// Previews (`dry_run = true`) or restores (`dry_run = false`) LM Studio `.json.bak` backups
+/// under the provided LM Studio root directory (typically `%USERPROFILE%\.lmstudio`).
+pub fn rollback_lm_studio_config_in_dir(
+    lms_root: &Path,
+    model_path: Option<&Path>,
+    dry_run: bool,
+) -> ForgeResult<LmStudioRollbackResult> {
+    let internal_dir = lms_root.join(".internal");
+    if !internal_dir.is_dir() {
+        return Err(ForgeError::RuntimeUnavailable {
+            runtime: "LM Studio".to_string(),
+            reason: format!(
+                "LM Studio config directory not found at '{}'",
+                internal_dir.display()
+            ),
+        });
+    }
+
+    let mut backups: Vec<PathBuf> = Vec::new();
+    let backend_bak = internal_dir.join("backend-preferences-v2.json.bak");
+    if backend_bak.is_file() {
+        backups.push(backend_bak);
+    }
+
+    let model_cfg_root = internal_dir.join("user-concrete-model-default-config");
+    if let Some(mp) = model_path {
+        let models_root = lms_root.join("models");
+        let file_name = mp
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let rel = mp
+            .strip_prefix(&models_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| PathBuf::from(&file_name));
+        let candidate = model_cfg_root.join(format!("{}.json.bak", rel.display()));
+        if candidate.is_file() {
+            backups.push(candidate);
+        } else if !file_name.is_empty() {
+            let flat = model_cfg_root.join(format!("{file_name}.json.bak"));
+            if flat.is_file() {
+                backups.push(flat);
+            }
+        }
+    } else {
+        collect_json_bak_files(&model_cfg_root, &mut backups);
+    }
+    backups.sort();
+    backups.dedup();
+
+    let mut actions = Vec::with_capacity(backups.len());
+    for bak in backups {
+        let Some(target) = target_path_from_json_bak(&bak) else {
+            continue;
+        };
+        let restored = if !dry_run {
+            std::fs::copy(&bak, &target).map_err(ForgeError::Io)?;
+            true
+        } else {
+            false
+        };
+        actions.push(RollbackFileAction {
+            target_path: target.display().to_string(),
+            backup_path: bak.display().to_string(),
+            restored,
+        });
+    }
+
+    Ok(LmStudioRollbackResult {
+        applied: !dry_run,
+        actions,
+    })
+}
+
+/// Previews (`dry_run = true`) or restores (`dry_run = false`) LM Studio `.json.bak` backups
+/// under `%USERPROFILE%\.lmstudio`.
+pub fn rollback_lm_studio_config(
+    model_path: Option<&Path>,
+    dry_run: bool,
+) -> ForgeResult<LmStudioRollbackResult> {
+    let home = std::env::var("USERPROFILE").map_err(|_| ForgeError::RuntimeUnavailable {
+        runtime: "LM Studio".to_string(),
+        reason: "USERPROFILE environment variable is not set".to_string(),
+    })?;
+    let lms_root = PathBuf::from(home).join(".lmstudio");
+    rollback_lm_studio_config_in_dir(&lms_root, model_path, dry_run)
+}
+
+/// Previews (`dry_run = true`) or deletes (`dry_run = false`) RDNA Forge-managed keys
+/// from `HKCU\Environment` (`GGML_VK_*`, `HIP_VISIBLE_DEVICES`, `ROCBLAS_USE_HIPBLASLT`, `OLLAMA_*`).
+pub fn rollback_windows_env_tweaks(dry_run: bool) -> ForgeResult<EnvRollbackResult> {
+    let mut keys = Vec::with_capacity(RDNA_FORGE_MANAGED_ENV_KEYS.len());
+    for &key in RDNA_FORGE_MANAGED_ENV_KEYS {
+        let current_value = query_hkcu_env_var(key);
+        let removed = if !dry_run && current_value.is_some() {
+            let status = Command::new("reg.exe")
+                .args(["delete", r"HKCU\Environment", "/v", key, "/f"])
+                .status()
+                .map_err(ForgeError::Io)?;
+            if !status.success() {
+                return Err(ForgeError::ExecutionFailed(format!(
+                    "reg.exe failed to delete HKCU\\Environment\\{key}"
+                )));
+            }
+            true
+        } else {
+            false
+        };
+        keys.push(EnvRollbackItem {
+            key: key.to_string(),
+            current_value,
+            removed,
+        });
+    }
+
+    Ok(EnvRollbackResult {
+        applied: !dry_run,
+        keys,
     })
 }

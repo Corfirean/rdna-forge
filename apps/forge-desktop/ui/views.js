@@ -242,6 +242,32 @@ export function renderOverview(root, state, actions) {
         ? `FP16=${gpu.vulkan_fp16}  INT8=${gpu.vulkan_int8}  DP4A=${gpu.vulkan_int8_dot_product}  CoopMat=${gpu.vulkan_cooperative_matrix}`
         : "n/a",
     ],
+    [
+      "HAGS (HwSchMode)",
+      report.windows_audit
+        ? report.windows_audit.hags_enabled === true
+          ? `ENABLED (HwSchMode=${report.windows_audit.hags_mode ?? 2})`
+          : report.windows_audit.hags_enabled === false
+            ? `DISABLED (HwSchMode=${report.windows_audit.hags_mode ?? 1})`
+            : "Windows Default (Unset)"
+        : "n/a",
+    ],
+    [
+      "WDDM TdrDelay",
+      report.windows_audit
+        ? report.windows_audit.tdr_delay_secs != null
+          ? `${report.windows_audit.tdr_delay_secs}s (registry override)`
+          : `${report.windows_audit.effective_tdr_delay_secs}s (Windows default)`
+        : "n/a",
+    ],
+    [
+      "Win32 Long Paths",
+      report.windows_audit
+        ? report.windows_audit.long_paths_enabled === true
+          ? "ENABLED (=1)"
+          : "DISABLED (MAX_PATH=260)"
+        : "n/a",
+    ],
   ];
 
   root.appendChild(
@@ -252,6 +278,23 @@ export function renderOverview(root, state, actions) {
       makePanel("Host & Runtime Flags", report.system.architecture, makeKvTable(hostRows))
     )
   );
+
+  if (report.windows_audit) {
+    const advisories = report.windows_audit.advisories || [];
+    root.appendChild(
+      makePanel(
+        "Windows GPU & Compute Health Audit",
+        advisories.length ? `${advisories.length} advisory item(s)` : "All audited flags healthy",
+        advisories.length
+          ? el(
+              "div",
+              { style: "display:flex;flex-direction:column;gap:6px" },
+              advisories.map((adv) => el("div", { className: "banner banner-warn", style: "margin:0" }, adv))
+            )
+          : el("div", { className: "banner banner-ok", style: "margin:0" }, "ReBAR, TdrDelay, HAGS, and LongPathsEnabled are all optimal for AMD Radeon compute & local LLMs.")
+      )
+    );
+  }
 
   // Backends Table
   const backendRows = report.backends.map((b) =>
@@ -2054,6 +2097,50 @@ export function renderLlmOptimizer(root, state, actions) {
         },
         "Apply Windows & Ollama Env (HKCU)"
       )
+    ),
+    el(
+      "div",
+      { className: "toolbar-group", style: "flex-wrap:wrap" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: state.patchingLlm,
+          onClick: () => actions.rollbackLmStudioPatch(true),
+        },
+        "Preview LM Studio Rollback"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-danger",
+          disabled: state.patchingLlm || !form.unlockConfigWrites,
+          onClick: () => actions.rollbackLmStudioPatch(false),
+        },
+        "Restore LM Studio .bak"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn",
+          disabled: state.patchingLlm,
+          onClick: () => actions.rollbackEnvPatch(true),
+        },
+        "Preview Env Reset"
+      ),
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-danger",
+          disabled: state.patchingLlm || !form.unlockConfigWrites,
+          onClick: () => actions.rollbackEnvPatch(false),
+        },
+        "Reset HKCU Env Tweaks"
+      )
     )
   );
 
@@ -2160,6 +2247,108 @@ export function renderLlmOptimizer(root, state, actions) {
               "margin:0;padding:8px 10px;background:#111214;border:1px solid #24272d;font-size:11px;max-height:180px;overflow:auto;color:#cfd4dc",
           },
           d.ollama_modelfile_content
+        )
+      );
+    } else if (pr.kind === "rollback_lms") {
+      const d = pr.data;
+      const actionsList = d.actions || [];
+      patchPanelBody.appendChild(
+        el(
+          "div",
+          {
+            className: `banner ${d.applied ? "banner-ok" : "banner-warn"} mono`,
+            style: "margin-bottom:0",
+          },
+          `[${d.applied ? "RESTORED FROM .BAK" : "DRY-RUN ROLLBACK PREVIEW"}] ${actionsList.length} LM Studio backup file(s) found`
+        )
+      );
+      if (actionsList.length > 0) {
+        patchPanelBody.appendChild(
+          el(
+            "table",
+            { className: "data-table" },
+            el(
+              "thead",
+              {},
+              el(
+                "tr",
+                {},
+                el("th", {}, "Target Config (.json)"),
+                el("th", {}, "Backup Source (.json.bak)"),
+                el("th", {}, "Action")
+              )
+            ),
+            el(
+              "tbody",
+              {},
+              actionsList.map((a) =>
+                el(
+                  "tr",
+                  {},
+                  el("td", { className: "mono" }, a.target_path),
+                  el("td", { className: "mono muted-text" }, a.backup_path),
+                  el(
+                    "td",
+                    {},
+                    a.restored
+                      ? el("span", { className: "badge badge-ok" }, "RESTORED")
+                      : el("span", { className: "badge badge-warn" }, "WOULD RESTORE")
+                  )
+                )
+              )
+            )
+          )
+        );
+      }
+    } else if (pr.kind === "rollback_env") {
+      const d = pr.data;
+      const keys = d.keys || [];
+      patchPanelBody.appendChild(
+        el(
+          "div",
+          {
+            className: `banner ${d.applied ? "banner-ok" : "banner-warn"} mono`,
+            style: "margin-bottom:0",
+          },
+          `[${d.applied ? "HKCU ENV RESET APPLIED" : "DRY-RUN ENV ROLLBACK PREVIEW"}] ${keys.filter((k) => k.current_value != null).length}/${keys.length} RDNA Forge keys active`
+        )
+      );
+      patchPanelBody.appendChild(
+        el(
+          "table",
+          { className: "data-table" },
+          el(
+            "thead",
+            {},
+            el(
+              "tr",
+              {},
+              el("th", {}, "Variable (HKCU\\Environment)"),
+              el("th", {}, "Current Value"),
+              el("th", {}, "Rollback Status")
+            )
+          ),
+          el(
+            "tbody",
+            {},
+            keys.map((k) =>
+              el(
+                "tr",
+                {},
+                el("td", { className: "mono" }, k.key),
+                el("td", { className: "mono muted-text" }, k.current_value ?? "(unset)"),
+                el(
+                  "td",
+                  {},
+                  k.removed
+                    ? el("span", { className: "badge badge-ok" }, "DELETED")
+                    : k.current_value != null
+                      ? el("span", { className: "badge badge-warn" }, "WOULD DELETE")
+                      : el("span", { className: "badge badge-idle" }, "NO-OP")
+                )
+              )
+            )
+          )
         )
       );
     }

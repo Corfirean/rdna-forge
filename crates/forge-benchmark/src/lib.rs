@@ -14,10 +14,13 @@ pub use llm_optimizer::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     build_lm_studio_model_config_json, discover_local_llm_assets, estimate_kv_and_state_bytes,
     gguf_file_type_name, inspect_gguf_model, plan_llm_configuration,
-    plan_llm_configuration_for_device, plan_llm_configuration_for_gpu, EnvAndOllamaPatchResult,
-    EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget, KvCacheQuant, LlmAutotuneCandidateResult,
-    LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LlmTargetGpuContext,
-    LlmTweakProfile, LmStudioPatchResult, LocalLlmAssets, ProcessVramImpact,
+    plan_llm_configuration_for_device, plan_llm_configuration_for_gpu, rollback_lm_studio_config,
+    rollback_lm_studio_config_in_dir, rollback_windows_env_tweaks, EnvAndOllamaPatchResult,
+    EnvRollbackItem, EnvRollbackResult, EnvVarChange, GgufModelMetadata, KvCacheMemoryBudget,
+    KvCacheQuant, LlmAutotuneCandidateResult, LlmAutotuneConfig, LlmAutotuneReport,
+    LlmOptimizationPlan, LlmTargetGpuContext, LlmTweakProfile, LmStudioPatchResult,
+    LmStudioRollbackResult, LocalLlmAssets, ProcessVramImpact, RollbackFileAction,
+    RDNA_FORGE_MANAGED_ENV_KEYS,
 };
 pub use memory::peak_process_rss_bytes;
 pub use stats::{compute_latency_stats, BenchmarkResult, LatencyStats, StabilityResult};
@@ -486,5 +489,59 @@ mod tests {
             .recommended_profiles
             .iter()
             .any(|p| p.backend == "hip"));
+    }
+
+    #[test]
+    fn lm_studio_rollback_previews_and_restores_bak_safely() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rdna_forge_lms_rollback_{uniq}"));
+        let internal = root.join(".internal");
+        let model_dir = internal
+            .join("user-concrete-model-default-config")
+            .join("vendor");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        let prefs = internal.join("backend-preferences-v2.json");
+        let prefs_bak = internal.join("backend-preferences-v2.json.bak");
+        std::fs::write(&prefs, r#"{"patched":true}"#).unwrap();
+        std::fs::write(&prefs_bak, r#"{"original":true}"#).unwrap();
+
+        let model_cfg = model_dir.join("qwen3.gguf.json");
+        let model_bak = model_dir.join("qwen3.gguf.json.bak");
+        std::fs::write(&model_cfg, r#"{"ctx":4096}"#).unwrap();
+        std::fs::write(&model_bak, r#"{"ctx":8192}"#).unwrap();
+
+        // Dry-run must preview both restorations without touching files on disk.
+        let dry = rollback_lm_studio_config_in_dir(&root, None, true).unwrap();
+        assert!(!dry.applied);
+        assert_eq!(dry.actions.len(), 2);
+        assert!(dry.actions.iter().all(|a| !a.restored));
+        assert_eq!(
+            std::fs::read_to_string(&prefs).unwrap(),
+            r#"{"patched":true}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&model_cfg).unwrap(),
+            r#"{"ctx":4096}"#
+        );
+
+        // Apply must copy .json.bak contents back over .json cleanly.
+        let applied = rollback_lm_studio_config_in_dir(&root, None, false).unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.actions.len(), 2);
+        assert!(applied.actions.iter().all(|a| a.restored));
+        assert_eq!(
+            std::fs::read_to_string(&prefs).unwrap(),
+            r#"{"original":true}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&model_cfg).unwrap(),
+            r#"{"ctx":8192}"#
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

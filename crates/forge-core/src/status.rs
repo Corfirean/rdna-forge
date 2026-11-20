@@ -123,6 +123,18 @@ pub struct SystemInfo {
     pub total_ram_bytes: u64,
 }
 
+/// Windows WDDM driver/registry health settings that affect compute & local LLM stability.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsSystemAudit {
+    pub hags_mode: Option<u32>,
+    pub hags_enabled: Option<bool>,
+    pub tdr_delay_secs: Option<u32>,
+    pub effective_tdr_delay_secs: u32,
+    pub long_paths_enabled: Option<bool>,
+    #[serde(default)]
+    pub advisories: Vec<String>,
+}
+
 /// Complete diagnostic output emitted by `forge doctor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticReport {
@@ -131,4 +143,6 @@ pub struct DiagnosticReport {
     pub backends: Vec<BackendStatus>,
     pub capabilities: Vec<CapabilityResult>,
     pub missing_dependencies: Vec<String>,
+    #[serde(default)]
+    pub windows_audit: Option<WindowsSystemAudit>,
 }

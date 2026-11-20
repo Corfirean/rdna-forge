@@ -672,6 +672,8 @@ const actions = {
   runLlmAutotune,
   applyLmStudioPatch,
   applyEnvPatch,
+  rollbackLmStudioPatch,
+  rollbackEnvPatch,
   copyLlmCommand: (cmdText) => {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
       navigator.clipboard.writeText(cmdText).then(
@@ -822,6 +824,70 @@ async function applyEnvPatch(dryRun) {
       res.applied
         ? "Applied HKCU\\Environment variables for llama.cpp / LM Studio / Ollama."
         : "Windows & Ollama environment dry-run preview ready."
+    );
+  } catch (err) {
+    state.llmPatchError = String(err);
+  } finally {
+    state.patchingLlm = false;
+    renderActiveView();
+  }
+}
+
+async function rollbackLmStudioPatch(dryRun) {
+  if (state.patchingLlm) return;
+  state.patchingLlm = true;
+  state.llmPatchError = null;
+  setStatusNote(
+    dryRun
+      ? "Scanning LM Studio .json.bak backups (dry-run preview)..."
+      : "Restoring LM Studio configs from .json.bak backups..."
+  );
+  renderActiveView();
+
+  try {
+    const res = await invokeCommand("rollback_lm_studio_patch", {
+      request: {
+        model_path: null,
+        dry_run: Boolean(dryRun),
+      },
+    });
+    state.llmPatchResult = { kind: "rollback_lms", data: res };
+    setStatusNote(
+      res.applied
+        ? `Restored ${res.actions?.length || 0} LM Studio config file(s) from .bak backups.`
+        : `LM Studio rollback preview: ${res.actions?.length || 0} backup file(s) found.`
+    );
+  } catch (err) {
+    state.llmPatchError = String(err);
+  } finally {
+    state.patchingLlm = false;
+    renderActiveView();
+  }
+}
+
+async function rollbackEnvPatch(dryRun) {
+  if (state.patchingLlm) return;
+  state.patchingLlm = true;
+  state.llmPatchError = null;
+  setStatusNote(
+    dryRun
+      ? "Inspecting RDNA Forge HKCU\\Environment variables (dry-run preview)..."
+      : "Removing RDNA Forge-managed keys from HKCU\\Environment..."
+  );
+  renderActiveView();
+
+  try {
+    const res = await invokeCommand("rollback_env_patch", {
+      request: {
+        dry_run: Boolean(dryRun),
+      },
+    });
+    state.llmPatchResult = { kind: "rollback_env", data: res };
+    const activeCount = (res.keys || []).filter((k) => k.current_value != null).length;
+    setStatusNote(
+      res.applied
+        ? `Removed RDNA Forge HKCU\\Environment variables (${activeCount} active key(s) reset).`
+        : `Environment rollback preview: ${activeCount} RDNA Forge key(s) currently set.`
     );
   } catch (err) {
     state.llmPatchError = String(err);

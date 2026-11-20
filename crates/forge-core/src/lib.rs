@@ -16,7 +16,7 @@ pub use profile::{
 };
 pub use status::{
     BackendKind, BackendStatus, CapabilityResult, DiagnosticReport, GpuDeviceInfo, SupportStatus,
-    SystemInfo,
+    SystemInfo, WindowsSystemAudit,
 };
 
 #[cfg(test)]

@@ -5,9 +5,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     discover_local_llm_assets, inspect_gguf_model, peak_process_rss_bytes,
-    plan_llm_configuration_for_device, resolve_default_triton_script, run_llama_comparison,
-    run_triton_suite, run_video_benchmark_suite, run_vulkan_suite, KvCacheQuant, LlamaBenchConfig,
-    LlmAutotuneConfig, TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig,
+    plan_llm_configuration_for_device, resolve_default_triton_script, rollback_lm_studio_config,
+    rollback_windows_env_tweaks, run_llama_comparison, run_triton_suite, run_video_benchmark_suite,
+    run_vulkan_suite, EnvRollbackResult, KvCacheQuant, LlamaBenchConfig, LlmAutotuneConfig,
+    LmStudioRollbackResult, TritonBenchConfig, VideoBenchSuiteConfig, VulkanBenchConfig,
     VulkanKernelSelection,
 };
 use forge_core::{
@@ -363,6 +364,26 @@ enum LlmSubcommand {
     ApplyLmstudio(LlmApplyLmstudioArgs),
     /// Preview (dry-run default) or apply Windows/Ollama user environment variables (HKCU\Environment) & Modelfile.
     ApplyEnv(LlmApplyEnvArgs),
+    /// Preview (dry-run default) or restore LM Studio .bak backups and reset RDNA Forge HKCU env vars.
+    Rollback(LlmRollbackArgs),
+}
+
+#[derive(Debug, Args)]
+struct LlmRollbackArgs {
+    /// Optional GGUF model path to restore only its specific LM Studio config backup (default: all backups).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Roll back LM Studio JSON configurations from .json.bak backups.
+    #[arg(long)]
+    lmstudio: bool,
+    /// Roll back RDNA Forge-managed keys from HKCU\Environment.
+    #[arg(long)]
+    env: bool,
+    /// Actually restore backup files and delete HKCU env keys. Defaults to dry-run preview.
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -526,6 +547,7 @@ fn main() -> Result<()> {
             LlmSubcommand::Autotune(args) => cmd_llm_autotune(&args),
             LlmSubcommand::ApplyLmstudio(args) => cmd_llm_apply_lmstudio(&args),
             LlmSubcommand::ApplyEnv(args) => cmd_llm_apply_env(&args),
+            LlmSubcommand::Rollback(args) => cmd_llm_rollback(&args),
         },
         Commands::Profile { action } => match action {
             ProfileSubcommand::Show { path, json } => cmd_profile_show(&path, json),
@@ -571,6 +593,7 @@ fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
         backends,
         capabilities,
         missing_dependencies,
+        windows_audit: Some(snapshot.windows_audit),
     };
 
     if args.json {
@@ -680,6 +703,39 @@ fn print_doctor_report(report: &DiagnosticReport, telemetry: Option<&[GpuTelemet
         match &cap.detail {
             Some(detail) => println!("  {}: {} ({detail})", cap.name, cap.status),
             None => println!("  {}: {}", cap.name, cap.status),
+        }
+    }
+
+    if let Some(ref audit) = report.windows_audit {
+        println!();
+        println!("WINDOWS GPU HEALTH AUDIT");
+        let hags = match audit.hags_enabled {
+            Some(true) => format!("ENABLED (HwSchMode={})", audit.hags_mode.unwrap_or(2)),
+            Some(false) => format!("DISABLED (HwSchMode={})", audit.hags_mode.unwrap_or(1)),
+            None => "Windows default (unset / disabled on RDNA2)".to_string(),
+        };
+        let tdr = match audit.tdr_delay_secs {
+            Some(sec) => format!("{sec}s (custom registry override)"),
+            None => format!(
+                "{}s (Windows default; unset in HKLM)",
+                audit.effective_tdr_delay_secs
+            ),
+        };
+        let lp = match audit.long_paths_enabled {
+            Some(true) => "ENABLED (LongPathsEnabled=1)",
+            _ => "DISABLED (260-char MAX_PATH)",
+        };
+        println!("  HAGS (HwSchMode)   : {hags}");
+        println!("  WDDM TdrDelay      : {tdr}");
+        println!("  LongPathsEnabled   : {lp}");
+        if audit.advisories.is_empty() {
+            println!(
+                "  Status             : All audited Windows GPU & filesystem settings healthy"
+            );
+        } else {
+            for adv in &audit.advisories {
+                println!("  ADVISORY           : {adv}");
+            }
         }
     }
 
@@ -1619,6 +1675,85 @@ fn cmd_llm_apply_env(args: &LlmApplyEnvArgs) -> Result<()> {
     if !res.applied {
         println!();
         println!("  No registry variable or file was modified (dry-run preview). Pass --apply to commit.");
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CombinedRollbackReport {
+    lmstudio: Option<LmStudioRollbackResult>,
+    env: Option<EnvRollbackResult>,
+}
+
+fn cmd_llm_rollback(args: &LlmRollbackArgs) -> Result<()> {
+    let do_lms = args.lmstudio || !args.env;
+    let do_env = args.env || !args.lmstudio;
+    let dry_run = !args.apply;
+
+    let lmstudio = if do_lms {
+        match rollback_lm_studio_config(args.model.as_deref(), dry_run) {
+            Ok(res) => Some(res),
+            Err(forge_core::ForgeError::RuntimeUnavailable { .. }) if !args.lmstudio => None,
+            Err(e) => return Err(e).context("failed to inspect/restore LM Studio backups"),
+        }
+    } else {
+        None
+    };
+
+    let env = if do_env {
+        Some(
+            rollback_windows_env_tweaks(dry_run)
+                .context("failed to inspect/rollback HKCU\\Environment variables")?,
+        )
+    } else {
+        None
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CombinedRollbackReport { lmstudio, env })?
+        );
+        return Ok(());
+    }
+
+    let mode = if args.apply { "APPLIED" } else { "DRY-RUN" };
+    println!("[{mode}] RDNA FORGE SAFE ROLLBACK (RESTORE / UNDO)");
+    if let Some(ref lms) = lmstudio {
+        println!();
+        println!("LM STUDIO BACKUPS (.json.bak -> .json)");
+        if lms.actions.is_empty() {
+            println!("  No LM Studio .json.bak backup files found.");
+        } else {
+            for a in &lms.actions {
+                println!(
+                    "  [{}] {} <- {}",
+                    if a.restored {
+                        "RESTORED"
+                    } else {
+                        "WOULD RESTORE"
+                    },
+                    a.target_path,
+                    a.backup_path
+                );
+            }
+        }
+    }
+    if let Some(ref env_res) = env {
+        println!();
+        println!("WINDOWS USER ENVIRONMENT (HKCU\\Environment)");
+        for k in &env_res.keys {
+            let status = match (&k.current_value, k.removed) {
+                (None, _) => "unset (no-op)".to_string(),
+                (Some(val), true) => format!("DELETED (was '{val}')"),
+                (Some(val), false) => format!("WOULD DELETE (currently '{val}')"),
+            };
+            println!("  {:<34} : {status}", k.key);
+        }
+    }
+    if dry_run {
+        println!();
+        println!("  No file or registry variable was modified (dry-run preview). Pass --apply to restore/delete.");
     }
     Ok(())
 }

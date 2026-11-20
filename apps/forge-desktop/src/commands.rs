@@ -5,9 +5,10 @@ use std::sync::Arc;
 use forge_benchmark::{
     apply_lm_studio_config, apply_windows_and_ollama_env_tweaks, autotune_llm_model,
     discover_local_llm_assets, inspect_gguf_model, plan_llm_configuration_for_device,
-    run_video_benchmark_suite, run_vulkan_suite, EnvAndOllamaPatchResult, KvCacheQuant,
-    LlmAutotuneConfig, LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult, LocalLlmAssets,
-    VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
+    rollback_lm_studio_config, rollback_windows_env_tweaks, run_video_benchmark_suite,
+    run_vulkan_suite, EnvAndOllamaPatchResult, EnvRollbackResult, KvCacheQuant, LlmAutotuneConfig,
+    LlmAutotuneReport, LlmOptimizationPlan, LmStudioPatchResult, LmStudioRollbackResult,
+    LocalLlmAssets, VideoBenchReport, VideoBenchSuiteConfig, VulkanBenchConfig, VulkanBenchReport,
     VulkanKernelSelection,
 };
 use forge_core::{
@@ -319,6 +320,21 @@ pub struct DesktopEnvPatchRequest {
     pub dry_run: bool,
 }
 
+/// Request payload for previewing or restoring LM Studio `.json.bak` backups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopLmStudioRollbackRequest {
+    pub model_path: Option<String>,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+/// Request payload for previewing or deleting RDNA Forge-managed `HKCU\Environment` keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopEnvRollbackRequest {
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
 fn default_context_tokens() -> u32 {
     4096
 }
@@ -388,6 +404,7 @@ pub async fn get_diagnostics(
             backends,
             capabilities,
             missing_dependencies,
+            windows_audit: Some(snapshot.windows_audit),
         };
         Ok(DesktopDiagnosticsResponse {
             report,
@@ -673,6 +690,34 @@ pub async fn apply_env_and_ollama_patch(
     .map_err(|e| format!("Windows/Ollama env patch task failed: {e}"))?
 }
 
+#[tauri::command]
+pub async fn rollback_lm_studio_patch(
+    request: DesktopLmStudioRollbackRequest,
+) -> Result<LmStudioRollbackResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let model_path = request
+            .model_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        rollback_lm_studio_config(model_path.as_deref(), request.dry_run).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("LM Studio rollback task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn rollback_env_patch(
+    request: DesktopEnvRollbackRequest,
+) -> Result<EnvRollbackResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rollback_windows_env_tweaks(request.dry_run).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Windows/Ollama env rollback task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +832,13 @@ mod tests {
         assert!(env_patch.dry_run);
         assert_eq!(env_patch.device_index, None);
         assert_eq!(env_patch.context_tokens, 4096);
+
+        let lms_rb: DesktopLmStudioRollbackRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(lms_rb.dry_run);
+        assert!(lms_rb.model_path.is_none());
+
+        let env_rb: DesktopEnvRollbackRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(env_rb.dry_run);
     }
 
     #[test]

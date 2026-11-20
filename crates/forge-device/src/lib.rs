@@ -6,12 +6,12 @@ pub mod vulkan;
 
 use forge_core::{
     lookup_amd_pci_device, select_preferred_device, GfxTarget, GpuArchitecture, GpuDeviceInfo,
-    SystemInfo, AMD_PCI_VENDOR_ID,
+    SystemInfo, WindowsSystemAudit, AMD_PCI_VENDOR_ID,
 };
 
 pub use adlx::{probe_adlx, AdlxProbeReport};
 pub use hip::{probe_hip, HipDeviceProbe, HipDevicePropR0600, HipProbeReport};
-pub use os::detect_system_info;
+pub use os::{build_windows_system_audit, detect_system_info, detect_windows_system_audit};
 pub use registry::{query_amd_registry_adapters, RegistryAdapterInfo};
 pub use vulkan::{probe_vulkan, VulkanDeviceProbe, VulkanProbeReport};
 
@@ -24,6 +24,7 @@ pub struct DiscoverySnapshot {
     pub hip: HipProbeReport,
     pub adlx: AdlxProbeReport,
     pub registry_adapters: Vec<RegistryAdapterInfo>,
+    pub windows_audit: WindowsSystemAudit,
 }
 
 /// Discovers host OS/CPU/RAM metadata.
@@ -45,6 +46,8 @@ pub fn discover_all() -> DiscoverySnapshot {
     let registry_adapters = query_amd_registry_adapters();
 
     let gpus = correlate_devices(&vulkan.devices, &hip, &registry_adapters);
+    let primary_rebar = gpus.first().and_then(|g| g.rebar_enabled);
+    let windows_audit = detect_windows_system_audit(primary_rebar);
 
     DiscoverySnapshot {
         system,
@@ -53,6 +56,7 @@ pub fn discover_all() -> DiscoverySnapshot {
         hip,
         adlx,
         registry_adapters,
+        windows_audit,
     }
 }
 
