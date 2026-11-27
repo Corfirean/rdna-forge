@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — dependency advisories
+- Updated `url` to `2.5.9` (RUSTSEC-2026-0592, stack overflow in `Url::origin()` on nested `blob:` URLs) and `cookie` to `0.18.3` (RUSTSEC-2026-0594, private-cookie nonce reuse after `fork()`; Windows is not affected). Both are pulled in through Tauri; `Cargo.lock` only.
+
 ### Fixed — Final closure follow-ups
 - **Power-limit status**: the ambiguous `APPLIED (UNVERIFIED)` status no longer exists (the variant was removed, so it cannot be produced). An accepted write whose read-back is unavailable is now `NOT CONFIRMED`, the original value is written back, and the rollback is `ATTEMPTED` (restore not readable) or `CONFIRMED` (restore read back). `succeeded()` and the CLI exit code are unchanged: only `CONFIRMED` is success.
 - **Hardware check (power limit)**: one controlled `forge tune power-limit --apply` round trip on an RX 6900 XT (`0%` -> `-1%` -> `0%`) was `CONFIRMED` by read-back at both steps; the original value was restored and re-read. Not exercised on hardware: the rollback path, `ResetToFactory`, other GPUs.
