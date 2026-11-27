@@ -1053,6 +1053,11 @@ fn resolve_hip_visible_index(
 
 const MIB: u64 = 1024 * 1024;
 
+/// Appended to profile rationales whose defaults come from one reference setup. Planner output
+/// must never quote measured speeds: they belong to one GPU and one model (see `BENCHMARKS.md`)
+/// and would read as a prediction for whatever the user is planning.
+const STARTING_POINT_NOTE: &str = "This is a starting point, not a measurement of this GPU and model; compare profiles with `forge llm autotune`.";
+
 /// Weight-memory model used by the planner.
 ///
 /// With GGUF tensor metadata it uses exact per-layer sizes and llama.cpp layer-offload
@@ -1433,17 +1438,10 @@ pub fn plan_llm_configuration_for_gpu(
             ctx.architecture,
             GpuArchitecture::Rdna1 | GpuArchitecture::Rdna2
         ) {
-        if ctx.architecture == GpuArchitecture::Rdna2 {
-            format!(
-                "Activates VK_EXT_memory_priority (1.0) so Windows WDDM keeps weights resident in {} ({}) VRAM, pins Vulkan device {}, and disables Vulkan FlashAttention (-fa off) which suffers a severe prefill slowdown at depth on hybrid qwen35 layers. Verified on RX 6900 XT (RDNA2) + Qwen3.8-27B: 343.2 tok/s prefill (+108%) and 26.81 tok/s generation (+63%) at 2048 context.",
-                ctx.gpu_name, ctx.gfx_target, vk_dev_str
-            )
-        } else {
-            format!(
-                "Activates VK_EXT_memory_priority (1.0) on {} ({}), pins Vulkan device {}, and disables Vulkan FlashAttention (-fa off) for hybrid SSM/attention layers.",
-                ctx.gpu_name, ctx.gfx_target, vk_dev_str
-            )
-        }
+        format!(
+            "Activates VK_EXT_memory_priority (1.0) on {} ({}), pins Vulkan device {}, and disables Vulkan FlashAttention (-fa off) for hybrid SSM/attention layers. {STARTING_POINT_NOTE}",
+            ctx.gpu_name, ctx.gfx_target, vk_dev_str
+        )
     } else {
         format!(
             "Activates VK_EXT_memory_priority (1.0) to prevent Windows WDDM from paging LLM weights out to system RAM and isolates execution strictly to {} ({}, Vulkan index {}).",
@@ -1534,17 +1532,10 @@ pub fn plan_llm_configuration_for_gpu(
                     .strict_zero_spill_ngl
                     .max(q4_budget.memory_priority_ngl.saturating_sub(2))
             };
-            let rocm_rationale = if ctx.architecture == GpuArchitecture::Rdna2 {
-                format!(
-                    "Pins HIP execution to {} ({}) via HIP_VISIBLE_DEVICES={} (preventing any integrated GPU shared-RAM layer split), enables native ROCm FlashAttention (-fa on), and compresses the KV cache 3.5x (-ctk q4_0 -ctv q4_0). Verified on RX 6900 XT (RDNA2) + Qwen3.8-27B: 522.6 tok/s initial prefill and 246.2 tok/s prefill at 4096 context (20.3x faster than Vulkan -fa 1).",
-                    ctx.gpu_name, ctx.gfx_target, hip_dev_str
-                )
-            } else {
-                format!(
-                    "Pins HIP execution to {} ({}) via HIP_VISIBLE_DEVICES={}, enables native ROCm FlashAttention (-fa on), and uses Q4_0 KV cache quantization (-ctk q4_0 -ctv q4_0) to fit 4K-16K context cleanly.",
-                    ctx.gpu_name, ctx.gfx_target, hip_dev_str
-                )
-            };
+            let rocm_rationale = format!(
+                "Pins HIP execution to {} ({}) via HIP_VISIBLE_DEVICES={} (so an integrated GPU does not take a shared-RAM layer split), enables native ROCm FlashAttention (-fa on), and uses Q4_0 KV cache quantization (-ctk q4_0 -ctv q4_0) to reduce the KV cache footprint at 4K-16K context. {STARTING_POINT_NOTE}",
+                ctx.gpu_name, ctx.gfx_target, hip_dev_str
+            );
             recommended_profiles.push(LlmTweakProfile {
                 id: "rocm_q4_kv_long_ctx".to_string(),
                 title: "ROCm / HIP FlashAttention + Q4_0 KV Cache (Fastest Prefill & 4K-16K Context)".to_string(),
@@ -1570,17 +1561,10 @@ pub fn plan_llm_configuration_for_gpu(
     }
 
     // Profile 3: Vulkan Long-Context Decode with Q4_0 KV Cache
-    let vk_q4_rationale = if ctx.architecture == GpuArchitecture::Rdna2 {
-        format!(
-            "Combines VK_EXT_memory_priority with 4-bit KV cache quantization (-ctk q4_0 -ctv q4_0 -fa on) on {} ({}, Vulkan index {}) to keep 4K+ context inside VRAM. Verified on RX 6900 XT (RDNA2) + Qwen3.8-27B: sustains 25.63 tok/s token generation at 4096 context (+61% vs f16 KV).",
-            ctx.gpu_name, ctx.gfx_target, vk_dev_str
-        )
-    } else {
-        format!(
-            "Combines VK_EXT_memory_priority with 4-bit KV cache quantization (-ctk q4_0 -ctv q4_0 -fa on) on {} ({}, Vulkan index {}) to keep 4K+ context inside VRAM.",
-            ctx.gpu_name, ctx.gfx_target, vk_dev_str
-        )
-    };
+    let vk_q4_rationale = format!(
+        "Combines VK_EXT_memory_priority with 4-bit KV cache quantization (-ctk q4_0 -ctv q4_0 -fa on) on {} ({}, Vulkan index {}) to reduce the KV cache footprint at 4K+ context. {STARTING_POINT_NOTE}",
+        ctx.gpu_name, ctx.gfx_target, vk_dev_str
+    );
     recommended_profiles.push(LlmTweakProfile {
         id: "vulkan_q4_kv_decode".to_string(),
         title: "Vulkan WDDM Priority + Q4_0 KV Cache (Max Token Generation Speed at 4K+ Context)"
@@ -1700,7 +1684,7 @@ pub fn plan_llm_configuration_for_gpu(
             if is_apu_unified_memory { "unified" } else { "physical" }
         ),
         if is_hybrid_ssm && matches!(ctx.architecture, GpuArchitecture::Rdna1 | GpuArchitecture::Rdna2) {
-            "3. Flash Attention & KV Cache (hybrid SSM+Attention architecture): On RDNA1/RDNA2 Vulkan at <= 3072 context, turn Flash Attention OFF to avoid prefill slowdowns. For >= 4096 context, use ROCm with Flash Attention ON + Q4_0 KV Cache, or Vulkan with Flash Attention ON + Q4_0 KV Cache.".to_string()
+            "3. Flash Attention & KV Cache (hybrid SSM+Attention architecture): On RDNA1/RDNA2 Vulkan, try Flash Attention OFF at <= 3072 context. For >= 4096 context, try Flash Attention ON + Q4_0 KV Cache (ROCm or Vulkan). The best choice depends on the model and GPU; compare with `forge llm autotune`.".to_string()
         } else {
             "3. Flash Attention & KV Cache: Enable Flash Attention and set K/V Cache Quantization to Q8_0 (or Q4_0 for very long contexts) to save 50%-72% of context VRAM.".to_string()
         },

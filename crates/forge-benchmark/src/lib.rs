@@ -288,6 +288,90 @@ mod tests {
     }
 
     #[test]
+    fn planner_text_never_quotes_measurements_from_a_reference_setup() {
+        use forge_core::GpuArchitecture;
+
+        // A different model and GPUs than the reference setup in BENCHMARKS.md.
+        for full_attention_interval in [None, Some(4)] {
+            for architecture in [
+                GpuArchitecture::Rdna1,
+                GpuArchitecture::Rdna2,
+                GpuArchitecture::Rdna3,
+                GpuArchitecture::Rdna4,
+            ] {
+                let model = GgufModelMetadata {
+                    file_path: "other-8b.gguf".to_string(),
+                    file_name: "other-8b.gguf".to_string(),
+                    file_size_bytes: 4_900_000_000,
+                    gguf_version: 3,
+                    tensor_count: 291,
+                    kv_count: 30,
+                    architecture: "llama".to_string(),
+                    model_name: Some("Other-8B".to_string()),
+                    size_label: Some("8B".to_string()),
+                    quantized_by: None,
+                    file_type_code: Some(15),
+                    quantization_name: "Q4_K_M".to_string(),
+                    block_count: 32,
+                    nextn_predict_layers: 0,
+                    declared_context_length: 8192,
+                    embedding_length: 4096,
+                    feed_forward_length: Some(14336),
+                    head_count: 32,
+                    head_count_kv: 8,
+                    key_length: 128,
+                    value_length: 128,
+                    full_attention_interval,
+                    ssm_state_size: None,
+                    ssm_inner_size: None,
+                    ssm_group_count: None,
+                    expert_count: None,
+                    expert_used_count: None,
+                    expert_feed_forward_length: None,
+                    is_moe: false,
+                    bytes_per_layer: 4_900_000_000 / 32,
+                    tensor_layout: None,
+                    split_count: None,
+                    assumed_defaults: Vec::new(),
+                };
+                let ctx = LlmTargetGpuContext {
+                    gpu_index: 0,
+                    gpu_name: "Test GPU".to_string(),
+                    gfx_target: "gfxtest".to_string(),
+                    architecture,
+                    discrete: true,
+                    matched_profile_id: None,
+                    matched_profile_name: None,
+                    vk_visible_device: 0,
+                    hip_visible_device: 0,
+                    disabled_gpu_indices: vec![],
+                    secondary_igpu_name: None,
+                    physical_cpu_cores: 6,
+                    total_ram_mib: 32_768,
+                    total_vram_mib: 8_176,
+                    used_vram_mib: 800,
+                };
+                let plan = plan_llm_configuration_for_gpu(&model, &ctx, 4096, 512);
+                assert!(!plan.recommended_profiles.is_empty());
+                let texts = plan
+                    .recommended_profiles
+                    .iter()
+                    .flat_map(|p| [p.title.as_str(), p.rationale.as_str()])
+                    .chain(plan.lm_studio_tips.iter().map(String::as_str))
+                    .chain(plan.warnings.iter().map(String::as_str));
+                for text in texts {
+                    for forbidden in ["tok/s", "Verified on", "6900", "Qwen", "x faster", "+6"] {
+                        assert!(
+                            !text.contains(forbidden),
+                            "{architecture:?}: planner text quotes a reference measurement ({forbidden:?}): {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn multi_architecture_llm_planner_tailors_profiles_for_rdna1_2_3_35_and_4() {
         use forge_core::GpuArchitecture;
 

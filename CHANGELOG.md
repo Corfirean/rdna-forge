@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — planner text and hardware-status docs
+- **`forge llm plan`** (CLI and desktop) no longer quotes speeds measured on one reference setup (RX 6900 XT + `Qwen3.8-27B`) in the profile rationales shown for other RDNA2 GPUs and models. The affected profiles now say they are starting points and point to `forge llm autotune`; the hybrid-model Flash Attention tip is worded as something to try. The measurements stay in `BENCHMARKS.md`. Profile settings and commands are unchanged.
+- `README.md` and `COMPATIBILITY.md` now state the real-hardware tuning coverage (one power-limit round trip; rollback and `ResetToFactory` not exercised).
+
 ### Security — dependency advisories
 - Updated `url` to `2.5.9` (RUSTSEC-2026-0592, stack overflow in `Url::origin()` on nested `blob:` URLs) and `cookie` to `0.18.3` (RUSTSEC-2026-0594, private-cookie nonce reuse after `fork()`; Windows is not affected). Both are pulled in through Tauri; `Cargo.lock` only.
 
