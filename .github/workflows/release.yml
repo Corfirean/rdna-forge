@@ -60,6 +60,8 @@ jobs:
         shell: pwsh
         run: |
           $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          # A manual run on a branch has a ref name such as "feat/x", which is not a file name.
+          $tag = $tag -replace '[^A-Za-z0-9._-]', '-'
           $bundleName = "RDNA-Forge-$tag-win-x64"
           $stage = Join-Path $env:RUNNER_TEMP $bundleName
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
