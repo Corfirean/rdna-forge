@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-28
+
+Hardening release: secure native-library loading, tensor-based GGUF memory planning, verified GPU tuning results, a backend-enforced preview-before-apply gate in the desktop app, and non-destructive LM Studio / Ollama patching.
+
+### Upgrade notes (behavior changes since 0.1.0)
+- **Desktop Apply needs a preview.** Apply is refused unless the same settings were previewed (dry run) in the last 15 minutes, for the same physical GPU.
+- **Tuning results are strict.** Only a change confirmed by read-back is a success (`CONFIRMED`); otherwise the CLI exits non-zero and the desktop shows an error. JSON results gain status, rollback and confirmation fields.
+- **Native DLLs** are loaded only from System32 or trusted vendor locations; the bare-name HIP fallback was removed.
+- **Stricter input.** An unknown `kv_quant` is rejected, `--python` must be an existing executable or a bare name on `PATH` (`.bat` / `.cmd` are refused on Windows), and malformed LM Studio configs are not overwritten.
+- **Different numbers.** VRAM estimates now come from GGUF tensor metadata, kernel bandwidth is labelled `GB/s (logical)`, and autotune speedups are relative to a fixed baseline profile.
+- **Building from source** needs Rust 1.88 (libraries and CLI) or 1.90 (desktop).
+
+### Known limitations
+- Hardware-tested on one GPU (RX 6900 XT, `gfx1030`). Other RDNA generations are untested.
+- Of the tuning writes, only the power limit has been exercised on hardware; rollback and `ResetToFactory` are tested against a fake backend only.
+- The VRAM planner was compared with `llama.cpp` on one model (Vulkan only).
+- The Windows binaries are not code-signed.
+- The binaries need the Microsoft Visual C++ 2015-2022 Redistributable (x64); the desktop app also needs the Edge WebView2 runtime.
+
 ### Fixed — planner text and hardware-status docs
 - **`forge llm plan`** (CLI and desktop) no longer quotes speeds measured on one reference setup (RX 6900 XT + `Qwen3.8-27B`) in the profile rationales shown for other RDNA2 GPUs and models. The affected profiles now say they are starting points and point to `forge llm autotune`; the hybrid-model Flash Attention tip is worded as something to try. The measurements stay in `BENCHMARKS.md`. Profile settings and commands are unchanged.
 - `README.md` and `COMPATIBILITY.md` now state the real-hardware tuning coverage (one power-limit round trip; rollback and `ResetToFactory` not exercised).

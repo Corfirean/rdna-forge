@@ -1014,7 +1014,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge-benchmark"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forge-core",
  "forge-device",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading 0.9.1",
  "serde",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "forge-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forge-benchmark",
  "forge-core",
@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "forge-device"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "forge-core",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "forge-profiler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forge-core",
  "libloading 0.9.1",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "forge-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "forge-core",

@@ -69,7 +69,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete 11-repository upstream
 ## 4. Installation & Build Instructions
 
 ### Prebuilt Portable Windows x64 Bundle (Recommended for End Users)
-Download the latest `RDNA-Forge-v0.1.0-win-x64.zip` archive from [GitHub Releases](https://github.com/Corfirean/rdna-forge/releases), extract it anywhere, and launch `forge-desktop.exe` (GUI) or `forge.exe` (CLI) — no Rust toolchain or Visual Studio Build Tools required.
+Download the latest `RDNA-Forge-v<version>-win-x64.zip` archive from [GitHub Releases](https://github.com/Corfirean/rdna-forge/releases), extract it anywhere, and launch `forge-desktop.exe` (GUI) or `forge.exe` (CLI) — no Rust toolchain or Visual Studio Build Tools required. The binaries do need the Microsoft Visual C++ 2015-2022 Redistributable (x64) for `VCRUNTIME140.dll`, and the desktop app needs the Edge WebView2 runtime (included with Windows 11).
 
 ### Prerequisites
 - Windows 11 (x64) with AMD Adrenalin driver (`26.11.2` tested)
